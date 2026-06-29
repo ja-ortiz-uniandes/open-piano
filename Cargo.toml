@@ -1,0 +1,28 @@
+[package]
+name = "open-piano"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time, networked, peer-to-peer acoustic piano visualizer"
+
+[dependencies]
+# GUI
+eframe = "0.29"
+egui = "0.29"
+
+# Audio capture (WASAPI host on Windows) — used only as the fallback input.
+cpal = "0.15"
+# USB / class-compliant MIDI input (WinMM on Windows). Preferred input source:
+# a connected digital piano gives exact note events with no transcription.
+midir = "0.10"
+# ONNX Runtime. `load-dynamic` links the ONNX Runtime shared library at runtime
+# (onnxruntime.dll) instead of downloading/static-linking it at build time, so
+# the project always compiles cleanly even on networks that block the binary
+# CDN. See MODEL.md for obtaining onnxruntime.dll + model.onnx.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-24"] }
+# WAV writing for the training-data capture harness (see record.rs). Pure-Rust,
+# no system deps; writes float32 mono WAV at the mic's native sample rate.
+hound = "3"
+
+[profile.dev]
+# Optimize the audio / pitch-detection math loops even in dev builds.
+opt-level = 1

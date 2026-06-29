@@ -1,0 +1,22 @@
+# open-piano cargo configuration
+#
+# NOTE on opt-level:
+#   Cargo only reads `[profile.*]` tables from `Cargo.toml` on the stable
+#   toolchain. Placing `[profile.dev]` here errors out with
+#   "config profiles require the `-Z config-profile` flag", so the real
+#   setting lives in Cargo.toml:
+#
+#       [profile.dev]
+#       opt-level = 1
+#
+# That gives the audio/pitch-detection math loops -O1 in dev builds, which is
+# what we want on the Surface 9. The block below documents the intent; the
+# effective copy is in Cargo.toml.
+#
+# [profile.dev]
+# opt-level = 1
+
+[build]
+# Surface 9 is x86_64; let codegen use the native CPU features for the
+# tight DSP loops.
+rustflags = ["-C", "target-cpu=native"]

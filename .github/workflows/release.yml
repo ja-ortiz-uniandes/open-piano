@@ -1,0 +1,71 @@
+name: release
+
+# Build a portable Windows package and publish it as a GitHub Release whenever a
+# version tag is pushed. To cut a release:
+#
+#     git tag v0.1.0
+#     git push origin v0.1.0
+#
+# The release page then has `open-piano-v0.1.0-win-x64.zip` — a self-contained
+# folder (exe + ONNX Runtime + model). Your professor downloads it, unzips it
+# anywhere, and runs `open-piano.exe`. No installer, no admin rights. Updating is
+# just replacing the folder with a newer release's zip.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Needed for the job to create a Release with the GitHub-provided token.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set up Python (for the model/runtime downloader)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Fetch model.onnx + onnxruntime.dll
+        run: python download_model.py
+
+      - name: Stage portable package
+        shell: pwsh
+        run: |
+          $name = "open-piano-${{ github.ref_name }}-win-x64"
+          New-Item -ItemType Directory -Force $name | Out-Null
+          Copy-Item target/release/open-piano.exe $name/
+          Copy-Item onnxruntime.dll $name/
+          Copy-Item model.onnx $name/
+          Copy-Item README.md $name/
+          Copy-Item MODEL.md $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip" -Force
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ github.ref_name }}
+          "open-piano-${{ github.ref_name }}-win-x64.zip"
+          --title ${{ github.ref_name }}
+          --generate-notes
