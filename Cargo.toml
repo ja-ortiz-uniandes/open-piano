@@ -22,6 +22,13 @@ ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "l
 # WAV writing for the training-data capture harness (see record.rs). Pure-Rust,
 # no system deps; writes float32 mono WAV at the mic's native sample rate.
 hound = "3"
+# In-app auto-update against GitHub Releases (see update.rs). Checks the Releases
+# API on launch and, if a newer `vX.Y.Z` exists, downloads the matching portable
+# zip and self-replaces the running exe. We keep self_update's default features:
+# that gives reqwest with native TLS (schannel — Windows' built-in TLS, so no
+# OpenSSL and no extra C/assembly crypto crate to build). We only add the two zip
+# features needed to unpack the Compress-Archive (deflate) output of the workflow.
+self_update = { version = "0.44", features = ["archive-zip", "compression-zip-deflate"] }
 
 [profile.dev]
 # Optimize the audio / pitch-detection math loops even in dev builds.

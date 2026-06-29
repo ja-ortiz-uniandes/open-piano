@@ -74,13 +74,70 @@ neither** — if you only ever use a MIDI keyboard, you can skip step 1.
 > GitHub Actions runner is unaffected) and use the portable zip. Don't
 > `cargo clean` on a SAC machine unless you can rebuild elsewhere.
 
-### Connecting two computers
+## Connecting two instances
 
-1. Both people launch the app.
-2. Each sets **Local Port** (e.g. `9000`) and the **Remote IP / Port** of the
-   other machine, then clicks **Connect**. (Across the internet you'll need to
-   forward the UDP port or be on the same LAN/VPN.)
-3. Pick your color. Play.
+The two instances talk **directly to each other over UDP** — there's no server
+and no "host". The setup is symmetric: each side binds a **Local Port** to listen
+on and aims at the other side's **Remote IP** and **Remote Port**. The one rule
+that ties it together:
+
+> **Your Remote Port must equal their Local Port, and their Remote Port must
+> equal your Local Port.** The two ports are crossed.
+
+Fill in the three fields in the top bar, click **Connect** on *both* sides, then
+pick your color and play. Order doesn't matter — colors and keys sync once both
+are connected (a 1 s color heartbeat keeps them in sync regardless of who
+connected first), and you can click **Connect** again at any time to re-bind.
+
+### 1. Two instances on one machine (quick local test)
+
+Run the app twice and point each copy at the other over loopback, with the ports
+crossed:
+
+| Field       | Instance A    | Instance B    |
+| ----------- | ------------- | ------------- |
+| Local Port  | `9000`        | `9001`        |
+| Remote IP   | `127.0.0.1`   | `127.0.0.1`   |
+| Remote Port | `9001`        | `9000`        |
+
+(They can't share a Local Port — two programs can't bind the same UDP port on the
+same machine.)
+
+### 2. Same LAN / Wi-Fi
+
+Each person needs the other's **local IP address** (on Windows, run `ipconfig`
+and read the *IPv4 Address*, typically `192.168.x.x`). Because the two instances
+are on different machines, they can use the **same** Local Port:
+
+| Field       | Alice (`192.168.1.10`) | Bob (`192.168.1.20`) |
+| ----------- | ---------------------- | -------------------- |
+| Local Port  | `9000`                 | `9000`               |
+| Remote IP   | `192.168.1.20`         | `192.168.1.10`       |
+| Remote Port | `9000`                 | `9000`               |
+
+### 3. Across the internet
+
+UDP has to reach you from outside your network, so one of these is required:
+
+- **Port forwarding:** each person forwards their chosen UDP Local Port on their
+  router to their machine, and exchanges their **public** IP (whatismyip.com).
+  Then it's the LAN setup above with public IPs.
+- **A VPN / overlay network** (e.g. [Tailscale](https://tailscale.com),
+  WireGuard) is much easier: it gives both machines stable private IPs as if they
+  were on one LAN, then you use scenario 2 with those addresses — no router
+  config.
+
+### If nothing lights up
+
+- **Crossed ports?** Re-check the rule above — this is the usual mistake.
+- **Firewall:** the first time you Connect, Windows may prompt to allow
+  `open-piano` through the firewall — say yes (allow it on the relevant network).
+  If you dismissed it, add an inbound rule for the UDP Local Port.
+- **Right IP?** On a LAN use the `192.168.x.x` address, not `127.0.0.1`. Across
+  the internet you need the *public* IP plus port forwarding (or a VPN).
+- Notes are sent as fire-and-forget datagrams (lowest latency over guaranteed
+  delivery), so an occasional dropped packet is expected and harmless; a key that
+  never lights at all is a config/firewall issue, not packet loss.
 
 ## Distribution & updates
 
@@ -96,10 +153,18 @@ That produces `open-piano-v0.1.0-win-x64.zip` on the repo's **Releases** page: a
 **portable** folder containing `open-piano.exe`, `onnxruntime.dll`, `model.onnx`,
 and the docs.
 
-**To install or update** (e.g. on your professor's machine): download the latest
-zip, unzip it anywhere (Desktop, a USB stick, wherever), and run
-`open-piano.exe`. Updating is just replacing the old folder with the new one — no
+**To install** (e.g. on your professor's machine): download the latest zip, unzip
+it anywhere (Desktop, a USB stick, wherever), and run `open-piano.exe`. No
 installer, no admin rights, no settings to migrate.
+
+**Updating is automatic.** On launch the app checks the GitHub Releases API; if a
+newer version exists it quietly downloads it and swaps in the new
+`open-piano.exe`, then shows an **"Update ready — Restart now"** banner. Click it
+(or just reopen the app later) to land on the new build. Only the executable is
+auto-updated; `onnxruntime.dll` and `model.onnx` rarely change, so on the rare
+release that needs a new runtime or model you still grab the full zip by hand
+(the manual folder-replacement above always works). A failed check (offline,
+rate-limited) is silent — the app just runs the current build.
 
 ### Windows security / Smart App Control — read this
 
@@ -139,14 +204,10 @@ collecting a lot of data. See `src/record.rs` for the file formats.
 
 Near-term, in rough order:
 
-1. **In-app auto-update.** Add the [`self_update`](https://crates.io/crates/self_update)
-   crate to check the GitHub Releases API on launch, download a newer portable
-   build, and self-replace — so the professor's copy updates itself instead of
-   needing a manual re-download. (Manual zip-replacement works today.)
-2. **Code signing** so signed releases clear SmartScreen silently and satisfy
+1. **Code signing** so signed releases clear SmartScreen silently and satisfy
    enforced Smart App Control. An EV certificate gets instant reputation; a
    cheaper OV cert builds reputation over time.
-3. **Train the fast piano model.** Collect 2–10 hours of aligned audio+MIDI,
+2. **Train the fast piano model.** Collect 2–10 hours of aligned audio+MIDI,
    then train a small **causal/streaming** transcription network (so it doesn't
    need a look-ahead window like Basic Pitch) — optionally distilling from Basic
    Pitch plus the captured labels. Export to ONNX and drop it into
@@ -156,4 +217,5 @@ Near-term, in rough order:
    offset and rendering per-frame onset/sustain targets) is the next script to
    write once a real session exists.
 
-See [CLAUDE.md](CLAUDE.md) for architecture details and contributor notes.
+See [CHANGELOG.md](CHANGELOG.md) for the release history, and
+[CLAUDE.md](CLAUDE.md) for architecture details and contributor notes.

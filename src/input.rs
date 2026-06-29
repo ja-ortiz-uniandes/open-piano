@@ -81,6 +81,14 @@ impl InputEngine {
     pub fn switch_epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
     }
+
+    /// Whether a MIDI device is *actually connected right now* — as opposed to
+    /// the mic fallback or the brief initial "detecting" state. Distinct from
+    /// [`Self::source`], which reports "detecting" as MIDI-ish; callers reacting
+    /// to a real plug/unplug (e.g. auto-muting the on-screen synth) want this.
+    pub fn midi_connected(&self) -> bool {
+        self.source.load(Ordering::Relaxed) == SRC_MIDI
+    }
 }
 
 impl Drop for InputEngine {

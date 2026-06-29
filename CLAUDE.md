@@ -47,6 +47,10 @@ audio transcribed by an ONNX model. See README for the product goal.
 - **`record.rs`** — `Recorder` handle + background writer thread. Writes
   `recordings/session_<unix>/{audio.wav, midi.jsonl, meta.json}`. All disk I/O is
   off the realtime callbacks.
+- **`update.rs`** — in-app auto-update via `self_update`. A background thread
+  checks GitHub Releases on launch and, if a newer tag exists, downloads the
+  portable zip and self-replaces `open-piano.exe`; the UI polls `UpdateState` and
+  offers a one-click restart. Only the exe is swapped (not the DLL/model).
 
 ## Threading model (important)
 
@@ -58,6 +62,7 @@ audio transcribed by an ONNX model. See README for the product goal.
 - MIDI callback thread: `midir` — cheap (parse + channel send + recorder tee).
 - Recorder writer thread: all file writes.
 - UDP listener thread: blocking `recv_from`.
+- Auto-update thread: one-shot GitHub API check + download + self-replace.
 
 The non-`Send` `midir` connection never crosses threads — it's owned by the
 supervisor. Cross-thread timing uses `std::time::Instant` (one process-wide
@@ -71,8 +76,9 @@ monotonic clock), which is how the recorder aligns audio and MIDI.
   explanatory comment style (see `inference.rs` for the bar).
 - Prefer adding a typed channel message over sharing mutable state across
   threads.
-- **Python** (tooling like `verify_alignment.py`): type-hint every signature,
-  including `-> None` (per the global guideline).
+- **Python** (tooling like `verify_alignment.py`): always add type hints to all
+  Python code — type-hint every function signature (parameters and return type,
+  including `-> None`) and add variable annotations where helpful.
 - Don't commit `model.onnx`, `onnxruntime.dll`, or `recordings/` (gitignored).
 
 ## Build / run / test
@@ -122,11 +128,8 @@ the Windows SmartScreen/Smart App Control situation are documented in the README
 
 ## Next steps (see README Roadmap for context)
 
-1. **In-app auto-update** via the `self_update` crate against GitHub Releases
-   (the CI already publishes compatible assets). Compare against
-   `env!("CARGO_PKG_VERSION")`.
-2. **Code signing** in the release workflow for SmartScreen/SAC.
-3. **Training pipeline**: `sessions → framed (input, label) tensors` — apply the
+1. **Code signing** in the release workflow for SmartScreen/SAC.
+2. **Training pipeline**: `sessions → framed (input, label) tensors` — apply the
    `verify_alignment.py` offset, render per-frame onset/sustain targets from
    `midi.jsonl` (account for CC64 pedal sustaining notes past key-up), optionally
    add Basic Pitch offline outputs as distillation targets. Then train a small
