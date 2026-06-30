@@ -219,3 +219,12 @@ Near-term, in rough order:
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history, and
 [CLAUDE.md](CLAUDE.md) for architecture details and contributor notes.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at
+your option. Unless you explicitly state otherwise, any contribution you submit
+for inclusion is dual-licensed as above, without additional terms.
+
+The bundled ONNX Runtime and Basic Pitch model are third-party components under
+their own permissive licenses — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
