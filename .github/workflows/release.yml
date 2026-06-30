@@ -61,11 +61,28 @@ jobs:
           Copy-Item MODEL.md $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip" -Force
 
+      # 0.x.x tags are still pre-1.0 previews: publish them as GitHub
+      # pre-releases (never "Latest") and mark the title accordingly. Once we tag
+      # v1.0.0+ this branch falls through to a normal latest release.
+      - name: Decide release flags
+        id: flags
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match '^v0\.') {
+            "title=$tag (preview)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "extra=--prerelease --latest=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "title=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "extra=--latest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create ${{ github.ref_name }}
           "open-piano-${{ github.ref_name }}-win-x64.zip"
-          --title ${{ github.ref_name }}
+          --title "${{ steps.flags.outputs.title }}"
+          ${{ steps.flags.outputs.extra }}
           --generate-notes
