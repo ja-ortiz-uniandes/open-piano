@@ -1,0 +1,110 @@
+# =============================================================================
+# SIGNED release workflow — STAGED, NOT YET ACTIVE.
+#
+# This is a copy of release.yml with a SignPath code-signing step added. It is
+# intentionally named `*.yml.disabled` so GitHub Actions ignores it (only `.yml`
+# / `.yaml` files run). Activate it ONLY after the SignPath Foundation approves
+# the project (https://signpath.org/), in three steps:
+#
+#   1. Fill in the three placeholders below (<SIGNPATH_ORG_ID>, project-slug,
+#      signing-policy-slug) with the values from your SignPath project.
+#   2. In the repo: Settings → Secrets and variables → Actions → add a secret
+#      named SIGNPATH_API_TOKEN (a CI user token created in SignPath).
+#   3. Replace the live workflow with this one so only ONE runs per tag:
+#         git rm .github/workflows/release.yml
+#         git mv .github/workflows/release-signed.yml.disabled \
+#                .github/workflows/release.yml
+#      (Don't leave both active — two workflows would both try to create the
+#      same Release for one tag and the second would fail.)
+#
+# NOTE: verify the exact `signpath/github-action-submit-signing-request` input
+# names against the current docs when you activate — the action's inputs have
+# evolved across major versions. https://github.com/signpath/github-action-submit-signing-request
+# =============================================================================
+
+name: release (signed)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the Release
+  id-token: write # OIDC, used by SignPath to verify the build's origin
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set up Python (for the model/runtime downloader)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # --- Sign the exe with SignPath ----------------------------------------
+      # SignPath signs an artifact produced by THIS workflow run (it verifies the
+      # build origin before signing), so we upload the unsigned exe, submit it,
+      # and download the signed result back into signed/.
+      - name: Upload unsigned exe
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-piano-unsigned
+          path: target/release/open-piano.exe
+          if-no-files-found: error
+
+      - name: Sign via SignPath
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: <SIGNPATH_ORG_ID> # TODO: from your SignPath org
+          project-slug: open-piano # TODO: confirm your project slug
+          signing-policy-slug: release-signing # TODO: e.g. release-signing
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          output-artifact-directory: signed/
+      # signed/open-piano.exe now exists and is code-signed.
+
+      - name: Fetch model.onnx + onnxruntime.dll
+        run: python download_model.py
+
+      - name: Stage portable package
+        shell: pwsh
+        run: |
+          $name = "open-piano-${{ github.ref_name }}-win-x64"
+          New-Item -ItemType Directory -Force $name | Out-Null
+          # Use the SIGNED exe, not target/release/open-piano.exe.
+          Copy-Item signed/open-piano.exe $name/
+          Copy-Item onnxruntime.dll $name/
+          Copy-Item model.onnx $name/
+          Copy-Item README.md $name/
+          Copy-Item MODEL.md $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip" -Force
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create ${{ github.ref_name }}
+          "open-piano-${{ github.ref_name }}-win-x64.zip"
+          --title ${{ github.ref_name }}
+          --generate-notes

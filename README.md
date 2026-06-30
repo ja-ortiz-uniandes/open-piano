@@ -180,10 +180,18 @@ off antivirus or UAC. But be aware of code-signing reality:
   satisfied by a validly **code-signed** binary — there is no portable trick
   around it. Most machines have SAC off or in evaluation mode, so this usually
   isn't hit; if your professor's machine enforces SAC, the real fix is signing
-  (see [Roadmap](#roadmap)), not asking them to weaken security.
+  (in progress — see below), not asking them to weaken security.
 
 In short: portable + unsigned clears SmartScreen with one click and never touches
 security settings; only *enforced SAC* would require code signing.
+
+**Code signing (in progress).** open-piano is applying to the
+[SignPath Foundation](https://signpath.org/) free code-signing program for open
+source. Once approved, release binaries will be signed automatically in CI — at
+which point this section will be updated and the line below goes live:
+
+> *Free code signing provided by [SignPath.io](https://signpath.io/), certificate
+> by [SignPath Foundation](https://signpath.org/).*
 
 ## Capturing training data
 
@@ -205,8 +213,11 @@ collecting a lot of data. See `src/record.rs` for the file formats.
 Near-term, in rough order:
 
 1. **Code signing** so signed releases clear SmartScreen silently and satisfy
-   enforced Smart App Control. An EV certificate gets instant reputation; a
-   cheaper OV cert builds reputation over time.
+   enforced Smart App Control. Being set up for free via the
+   [SignPath Foundation](https://signpath.org/) OSS program (the project's dual
+   MIT/Apache-2.0 license and CI build qualify); the signing step plugs into the
+   release workflow once approved (staged in
+   `.github/workflows/release-signed.yml.disabled`).
 2. **Train the fast piano model.** Collect 2–10 hours of aligned audio+MIDI,
    then train a small **causal/streaming** transcription network (so it doesn't
    need a look-ahead window like Basic Pitch) — optionally distilling from Basic
