@@ -6,10 +6,12 @@ name: release
 #     git tag v0.1.0
 #     git push origin v0.1.0
 #
-# The release page then has `open-piano-v0.1.0-win-x64.zip` — a self-contained
-# folder (exe + ONNX Runtime + model). Your professor downloads it, unzips it
-# anywhere, and runs `open-piano.exe`. No installer, no admin rights. Updating is
-# just replacing the folder with a newer release's zip.
+# The release page then has `open-piano-v0.1.0-win-x64.zip` — a single
+# self-contained exe (the ONNX model and ONNX Runtime are embedded at build
+# time; see src/bundle.rs) plus the README. Your professor downloads it, unzips
+# it anywhere, and runs `open-piano.exe`. No installer, no admin rights.
+# Updating is just replacing the exe with a newer release's (or letting the
+# in-app auto-updater do exactly that).
 
 on:
   push:
@@ -43,6 +45,11 @@ jobs:
         with:
           python-version: "3.x"
 
+      # Must run before the build: both files are embedded into the exe via
+      # include_bytes! (src/bundle.rs), so they're compile-time inputs now.
+      - name: Fetch model.onnx + onnxruntime.dll
+        run: python download_model.py
+
       - name: Build (release)
         # The checked-in .cargo/config.toml sets `-C target-cpu=native` for local
         # dev builds. On a CI runner that bakes the *runner's* CPU features (e.g.
@@ -55,19 +62,13 @@ jobs:
           RUSTFLAGS: -C target-cpu=x86-64-v2
         run: cargo build --release
 
-      - name: Fetch model.onnx + onnxruntime.dll
-        run: python download_model.py
-
       - name: Stage portable package
         shell: pwsh
         run: |
           $name = "open-piano-${{ github.ref_name }}-win-x64"
           New-Item -ItemType Directory -Force $name | Out-Null
           Copy-Item target/release/open-piano.exe $name/
-          Copy-Item onnxruntime.dll $name/
-          Copy-Item model.onnx $name/
           Copy-Item README.md $name/
-          Copy-Item MODEL.md $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip" -Force
 
       # 0.x.x tags are still pre-1.0 previews: publish them as GitHub

@@ -4,6 +4,23 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-07-02
+
+### Added
+
+- **About window.** The status bar now shows a version chip (e.g. `v0.2.2`);
+  clicking it opens an About dialog with the running version, live update
+  status, and a link to the project. The window title shows the version too.
+
+### Changed
+
+- **Single self-contained exe.** The ML model and ONNX Runtime are now embedded
+  inside `open-piano.exe`; the release zip is just the exe plus the README. On
+  first launch the app unpacks its runtime to `%LOCALAPPDATA%\open-piano\`
+  (self-cleaning across versions). Because updates swap the exe — and the exe
+  now contains everything — auto-updates always carry the exactly-matching
+  model and runtime; nothing beside the exe can go stale.
+
 ## [0.2.1] - 2026-07-02
 
 ### Changed

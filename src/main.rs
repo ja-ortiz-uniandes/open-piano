@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod bundle;
 mod inference;
 mod input;
 mod midi;
@@ -52,24 +53,25 @@ fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     suppress_dll_error_dialogs();
 
-    // Point ONNX Runtime at the local `onnxruntime.dll` via env var only — do
-    // NOT load it here. Loading ONNX Runtime spins up its own threads during
-    // initialisation; doing that from the main thread before the event loop
-    // deadlocks against the Windows loader lock and freezes the app before any
-    // window appears. ort loads the DLL lazily the first time a Session is
-    // built — which happens on the dedicated inference thread (see inference.rs)
-    // where a slow or failing load can't block the GUI.
-    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
-        if let Ok(abs) = std::fs::canonicalize("onnxruntime.dll") {
-            std::env::set_var("ORT_DYLIB_PATH", abs);
-        }
-    }
+    // Extract the embedded ONNX Runtime and point ORT_DYLIB_PATH at it — file
+    // I/O only, do NOT load the DLL here. Loading ONNX Runtime spins up its
+    // own threads during initialisation; doing that from the main thread
+    // before the event loop deadlocks against the Windows loader lock and
+    // freezes the app before any window appears. ort loads the DLL lazily the
+    // first time a Session is built — which happens on the dedicated
+    // inference thread (see inference.rs) where a slow or failing load can't
+    // block the GUI.
+    bundle::prepare_ort_dylib();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 380.0])
             .with_min_inner_size([640.0, 300.0])
-            .with_title("open-piano — P2P acoustic piano visualizer"),
+            .with_title(concat!(
+                "open-piano v",
+                env!("CARGO_PKG_VERSION"),
+                " — P2P acoustic piano visualizer"
+            )),
         ..Default::default()
     };
 
@@ -79,6 +81,11 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Ok(Box::new(PianoApp::new()))),
     )
 }
+
+/// The version compiled into this build (from Cargo.toml) — what the About
+/// dialog and window title report, and what the auto-updater compares against
+/// GitHub Releases.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Default model posterior probability above which a note counts as "on".
 /// 0.3 matches Basic Pitch's own default frame threshold; lower = more
@@ -168,6 +175,9 @@ struct PianoApp {
 
     // --- in-app auto-update (checks GitHub Releases on launch) ---
     updater: update::Updater,
+
+    // Whether the About window is open (toggled from the status bar).
+    show_about: bool,
 }
 
 impl PianoApp {
@@ -200,6 +210,7 @@ impl PianoApp {
             // Kick off the background GitHub Releases check; the UI polls its
             // state each frame (see `update_controls`).
             updater: update::start(),
+            show_about: false,
         }
     }
 
@@ -503,6 +514,41 @@ impl PianoApp {
         }
     }
 
+    /// The About window: running version, update status, and project links.
+    /// Opened from the version chip in the status bar; the titlebar ✕ (wired
+    /// through `.open()`) closes it.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        // Resolved before `.open()` takes its mutable borrow of `show_about`.
+        let update_line = match self.updater.state() {
+            update::UpdateState::Checking => "Checking for updates…".to_string(),
+            update::UpdateState::UpToDate => "Up to date — this is the latest release".to_string(),
+            update::UpdateState::Ready { version } => {
+                format!("Update ready: v{version} (restart to apply)")
+            }
+            update::UpdateState::Failed { reason } => format!("Update check failed: {reason}"),
+        };
+        egui::Window::new("About")
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading(format!("open-piano v{VERSION}"));
+                ui.label("Real-time, peer-to-peer acoustic piano visualizer.");
+                ui.add_space(6.0);
+                ui.label(update_line);
+                ui.add_space(6.0);
+                ui.hyperlink_to(
+                    "Source & releases (GitHub)",
+                    "https://github.com/ja-ortiz-uniandes/open-piano",
+                );
+                ui.label("License: MIT or Apache-2.0");
+            });
+    }
+
     /// Drain the network event channel: session status (invite code ready,
     /// connect/disconnect) plus the peer's packets (notes, color).
     fn pump_network(&mut self) {
@@ -666,9 +712,21 @@ impl eframe::App for PianoApp {
                 ui.label(model);
                 ui.separator();
                 ui.label(&self.net_status);
+                // Version chip pinned to the right edge; opens the About window.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button(format!("v{VERSION}"))
+                        .on_hover_text("About open-piano")
+                        .clicked()
+                    {
+                        self.show_about = true;
+                    }
+                });
             });
             ui.add_space(2.0);
         });
+
+        self.about_window(ctx);
 
         // ---- Center: the 88-key keyboard (also playable with the mouse) ----
         egui::CentralPanel::default().show(ctx, |ui| {

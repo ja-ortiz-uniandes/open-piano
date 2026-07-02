@@ -28,9 +28,6 @@ use ort::value::Tensor;
 use crate::audio::{EngineStatus, Threshold};
 use crate::note::{NoteMsg, KEY_COUNT, MIDI_LOW};
 
-/// Path to the model, relative to the working directory (project root).
-const MODEL_PATH: &str = "model.onnx";
-
 /// Model input sample rate (Hz).
 const TARGET_SR: u32 = 22050;
 
@@ -119,14 +116,13 @@ pub fn run(
     // ---- Load the ONNX model on this background thread. ----
     let mut session = match load_model() {
         Ok(s) => {
-            set_model_status(&status, format!("Model: loaded {MODEL_PATH}"));
+            set_model_status(&status, "Model: loaded (built-in)".to_string());
             s
         }
         Err(e) => {
-            set_model_status(
-                &status,
-                format!("Model load FAILED: {e}  — place '{MODEL_PATH}' in the project root (see MODEL.md)"),
-            );
+            // The model is embedded, so this is an ONNX Runtime problem (the
+            // extracted DLL failed to load), not a missing file.
+            set_model_status(&status, format!("Model load FAILED: {e}"));
             // Drain audio so the sender never blocks, but emit nothing.
             while raw_rx.recv().is_ok() {}
             return;
@@ -241,7 +237,8 @@ fn load_model() -> ort::Result<Session> {
     let mut builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_intra_threads(2)?;
-    builder.commit_from_file(MODEL_PATH)
+    // The model ships inside the exe (see bundle.rs); nothing to find on disk.
+    builder.commit_from_memory(crate::bundle::MODEL)
 }
 
 /// Per-key probabilities for one inference pass (index 0 == MIDI_LOW). `note`
@@ -525,5 +522,21 @@ impl Resampler {
 fn set_model_status(status: &Arc<Mutex<EngineStatus>>, msg: String) {
     if let Ok(mut s) = status.lock() {
         s.model = msg;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end check of the self-contained-exe chain (`bundle.rs`): extract
+    /// the embedded ONNX Runtime, point `ORT_DYLIB_PATH` at it, load it, and
+    /// parse the embedded model into a Session. Loading ort on the test thread
+    /// is fine — the loader-lock hazard is specific to a GUI main thread
+    /// (see `main.rs`).
+    #[test]
+    fn embedded_model_and_runtime_load() {
+        crate::bundle::prepare_ort_dylib();
+        load_model().expect("embedded model should load via the extracted runtime");
     }
 }

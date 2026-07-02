@@ -1,17 +1,20 @@
 # Getting the model + ONNX Runtime
 
 `open-piano` does **machine-learning** note transcription with Spotify's
-**Basic Pitch** model, run via ONNX Runtime. Because the project links ONNX
-Runtime *dynamically* (so `cargo build` never depends on a binary-download CDN),
-you must place **two** files in the project root before running:
+**Basic Pitch** model, run via ONNX Runtime. Both are **embedded into the
+executable at build time** (`src/bundle.rs`, via `include_bytes!`), so you must
+place **two** files in the project root before **building**:
 
 | File              | What it is                                       |
 |-------------------|--------------------------------------------------|
 | `model.onnx`      | Basic Pitch polyphonic piano transcription model |
 | `onnxruntime.dll` | ONNX Runtime shared library (Windows x64)        |
 
-The app looks for both in the current working directory (the project root when
-you `cargo run`).
+Every `cargo build` needs them (the build fails with a clear `include_bytes!`
+error if they're missing). End users never see these files — the shipped exe is
+self-contained; at startup it unpacks the runtime to `%LOCALAPPDATA%\open-piano\`
+(a DLL must be a real file for Windows to load it) and loads the model straight
+from memory.
 
 ---
 
@@ -73,16 +76,16 @@ cargo run
 
 The status bar at the bottom of the window shows model state:
 
-* `Model: loaded model.onnx` — success.
-* `Model load FAILED: ...` — the message includes the real cause (missing
-  `model.onnx`, missing/incompatible `onnxruntime.dll`, etc.). The UI stays
-  fully responsive either way; you just won't see detected notes until both
-  files are in place.
+* `Model: loaded (built-in)` — success.
+* `Model load FAILED: ...` — the message includes the real cause (an
+  incompatible ONNX Runtime version, a failed unpack to `%LOCALAPPDATA%`,
+  etc.). The UI stays fully responsive either way; you just won't see detected
+  notes.
 
 ### Pointing elsewhere
 
-If you keep `onnxruntime.dll` somewhere else, set `ORT_DYLIB_PATH` to its full
-path instead of copying it into the project root:
+To test against a different ONNX Runtime build without recompiling, set
+`ORT_DYLIB_PATH` to its full path — it takes precedence over the embedded copy:
 
 ```powershell
 $env:ORT_DYLIB_PATH = "C:\path\to\onnxruntime.dll"

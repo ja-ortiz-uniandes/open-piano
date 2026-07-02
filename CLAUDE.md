@@ -45,7 +45,8 @@ audio transcribed by an ONNX model. See README for the product goal.
   when possible, n0's public relays as fallback, so no port forwarding ever.
   The code is normally the bare `EndpointId` (64 hex chars; dial info comes
   from n0 discovery, which the `N0` preset publishes to), falling back to a
-  full `EndpointTicket` when the host is offline/LAN-only; join accepts both. Each session runs a dedicated "net" thread with a
+  full `EndpointTicket` when the host is offline/LAN-only; join accepts both.
+  Each session runs a dedicated "net" thread with a
   current-thread tokio runtime; the UI receives `NetEvent`s (ticket, status,
   connect/disconnect, packets) on an mpsc channel and queues outgoing `Packet`s
   on an unbounded sender. Packets ride *unreliable QUIC datagrams* — the same
@@ -59,7 +60,15 @@ audio transcribed by an ONNX model. See README for the product goal.
 - **`update.rs`** — in-app auto-update via `self_update`. A background thread
   checks GitHub Releases on launch and, if a newer tag exists, downloads the
   portable zip and self-replaces `open-piano.exe`; the UI polls `UpdateState` and
-  offers a one-click restart. Only the exe is swapped (not the DLL/model).
+  offers a one-click restart. Only the exe is swapped — sufficient, because the
+  exe embeds the model and runtime (see `bundle.rs`).
+- **`bundle.rs`** — the exe is **self-contained**: `model.onnx` and
+  `onnxruntime.dll` are `include_bytes!`-embedded at build time. The model is
+  loaded from memory; the DLL is extracted on startup to
+  `%LOCALAPPDATA%\open-piano\onnxruntime-<hash>.dll` (content-hash-named so
+  concurrent old/new versions never clobber each other) and `ORT_DYLIB_PATH`
+  points at it. Consequence: `python download_model.py` is a prerequisite for
+  **every** build, not just the mic path.
 
 ## Threading model (important)
 
@@ -94,10 +103,11 @@ monotonic clock), which is how the recorder aligns audio and MIDI.
 ## Build / run / test
 
 ```powershell
+python download_model.py # fetch model.onnx + onnxruntime.dll — REQUIRED first:
+                         # they're include_bytes!-embedded into every build
 cargo build              # dev (opt-level 1 for the DSP loops)
 cargo build --release    # release; what the CI release workflow ships
 cargo run --release      # run the app
-python download_model.py # fetch model.onnx + onnxruntime.dll (mic path only)
 ```
 
 `cargo test` runs the one automated test: `net::tests::host_join_exchange_notes`

@@ -56,20 +56,21 @@ path does not have this problem.
 
 ## Build & run from source
 
-Requires a [Rust toolchain](https://rustup.rs/) and (for the microphone path)
-Python 3.8+.
+Requires a [Rust toolchain](https://rustup.rs/) and Python 3.8+.
 
 ```powershell
 # 1. Get the ML model + ONNX Runtime DLL into the project root (see MODEL.md).
+#    Required for every build: both files are compiled INTO the exe.
 python download_model.py
 
 # 2. Build and run.
 cargo run --release
 ```
 
-The microphone path needs `model.onnx` and `onnxruntime.dll` in the working
-directory; the status bar reports whether they loaded. **The MIDI path needs
-neither** — if you only ever use a MIDI keyboard, you can skip step 1.
+The model and ONNX Runtime are **embedded in the executable at build time**
+(`src/bundle.rs`), which is why step 1 is mandatory — `include_bytes!` needs
+the files present. The resulting exe is fully self-contained: nothing to ship
+or place beside it.
 
 > **Building under Smart App Control:** if your machine has Windows Smart App
 > Control *enforcing*, a from-scratch build fails with `os error 4551` — `cargo`
@@ -142,22 +143,25 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-That produces `open-piano-v0.1.0-win-x64.zip` on the repo's **Releases** page: a
-**portable** folder containing `open-piano.exe`, `onnxruntime.dll`, `model.onnx`,
-and the docs.
+That produces `open-piano-v0.1.0-win-x64.zip` on the repo's **Releases** page:
+a **single self-contained `open-piano.exe`** (the ML model and ONNX Runtime are
+embedded inside it) plus this README.
 
 **To install** (e.g. on your professor's machine): download the latest zip, unzip
 it anywhere (Desktop, a USB stick, wherever), and run `open-piano.exe`. No
 installer, no admin rights, no settings to migrate.
 
-**Updating is automatic.** On launch the app checks the GitHub Releases API; if a
-newer version exists it quietly downloads it and swaps in the new
-`open-piano.exe`, then shows an **"Update ready — Restart now"** banner. Click it
-(or just reopen the app later) to land on the new build. Only the executable is
-auto-updated; `onnxruntime.dll` and `model.onnx` rarely change, so on the rare
-release that needs a new runtime or model you still grab the full zip by hand
-(the manual folder-replacement above always works). A failed check (offline,
-rate-limited) is silent — the app just runs the current build.
+**Updating is automatic and complete.** On launch the app checks the GitHub
+Releases API; if a newer version exists it quietly downloads it and swaps in the
+new `open-piano.exe`, then shows an **"Update ready — Restart now"** banner.
+Click it (or just reopen the app later) to land on the new build. Because the
+exe embeds the model and runtime, an update carries *everything* — there are no
+side-files that can go stale. A failed check (offline, rate-limited) is silent —
+the app just runs the current build.
+
+(First-run detail: the app unpacks its embedded ONNX Runtime to
+`%LOCALAPPDATA%\open-piano\` so Windows can load it; that cache cleans itself
+up across versions and can always be deleted — it's recreated on next launch.)
 
 ### Windows security / Smart App Control — read this
 

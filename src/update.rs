@@ -11,11 +11,10 @@
 //! copy updates itself instead of needing a manual zip-replacement (which still
 //! works — see the README).
 //!
-//! Only the **executable** is replaced. `onnxruntime.dll` and `model.onnx` ship
-//! in the same zip, but `self_update` touches just the binary; those files
-//! change across releases only rarely, and a code update never *requires* a new
-//! model. If a release ever needs a new runtime/model, fall back to the manual
-//! zip-replacement documented in the README.
+//! Only the **executable** is replaced — which since v0.2.2 is the whole
+//! program: the ONNX model and ONNX Runtime are embedded in the exe (see
+//! `bundle.rs`), so an exe swap atomically updates the code *and* its matching
+//! model/runtime. Nothing beside the exe can go stale.
 //!
 //! Everything here runs **off the GUI thread** — the GitHub API call, the
 //! download, and the file swap are all blocking I/O that would freeze the window
