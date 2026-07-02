@@ -7,8 +7,8 @@ pub const MIDI_HIGH: u8 = 108; // C8
 pub const KEY_COUNT: usize = (MIDI_HIGH - MIDI_LOW + 1) as usize; // 88
 
 /// A note-on / note-off transition. This is the unit of communication on every
-/// channel in the app: audio-thread -> UI, network-listener -> UI, and the
-/// 2-byte wire format sent over UDP.
+/// channel in the app: audio-thread -> UI, net-thread -> UI, and the
+/// 2-byte wire format sent to the peer (as an unreliable QUIC datagram).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteMsg {
     On(u8),

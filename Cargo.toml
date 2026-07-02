@@ -30,6 +30,20 @@ hound = "3"
 # OpenSSL and no extra C/assembly crypto crate to build). We only add the two zip
 # features needed to unpack the Compress-Archive (deflate) output of the workflow.
 self_update = { version = "0.44", features = ["archive-zip", "compression-zip-deflate"] }
+# P2P transport (see net.rs). iroh gives us NAT traversal for free: peers are
+# dialed by public key, hole punching is attempted automatically, and n0's
+# public relay servers carry the traffic when punching fails (VPN/CGNAT peers),
+# so nobody ever forwards a port. The QUIC connection's *unreliable datagrams*
+# preserve the old UDP fire-and-forget semantics for note packets.
+iroh = "1"
+# One-string session invites: an `EndpointTicket` serializes the host's id +
+# relay + direct addresses into a copy-pasteable code (Display/FromStr).
+iroh-tickets = "1"
+# Async runtime for iroh, confined to the dedicated net thread (current-thread
+# runtime; see net.rs). The GUI and the realtime threads stay sync.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# `Connection::send_datagram` takes `bytes::Bytes` payloads.
+bytes = "1"
 
 [profile.dev]
 # Optimize the audio / pitch-detection math loops even in dev builds.

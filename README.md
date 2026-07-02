@@ -25,9 +25,14 @@ Working today:
 - **Dual input, auto-selected.** Plug in a MIDI device and it's used instantly;
   unplug it and the app falls back to the microphone. Hot-plug is handled live.
   (`src/input.rs`, `src/midi.rs`, `src/audio.rs`)
-- **P2P networking over UDP.** Each side binds a local port and targets the
-  other's IP\:port. Note events are 2-byte datagrams sent the instant they
-  happen — chosen for lowest latency over guaranteed delivery. (`src/net.rs`)
+- **P2P networking with one-string invites.** One player clicks **Host** and
+  sends the other a copy-pasteable invite code; the other pastes it and clicks
+  **Join** — no IPs, no port forwarding, no router config. Under the hood it's
+  [iroh](https://github.com/n0-computer/iroh): NAT hole punching when possible,
+  a relay as fallback (so it works behind VPNs and CGNAT), authenticated by the
+  host's public key. Note events still ride *unreliable datagrams* sent the
+  instant they happen — chosen for lowest latency over guaranteed delivery.
+  (`src/net.rs`)
 - **Per-player colors.** You pick *your* color; it's sent over the wire so it
   shows up as your color on your partner's screen, and vice-versa. When you
   **both press the same key at once**, that key splits diagonally — your color in
@@ -76,68 +81,49 @@ neither** — if you only ever use a MIDI keyboard, you can skip step 1.
 
 ## Connecting two instances
 
-The two instances talk **directly to each other over UDP** — there's no server
-and no "host". The setup is symmetric: each side binds a **Local Port** to listen
-on and aims at the other side's **Remote IP** and **Remote Port**. The one rule
-that ties it together:
+One side hosts, the other joins — three steps, works the same on one machine,
+one LAN, or across the internet:
 
-> **Your Remote Port must equal their Local Port, and their Remote Port must
-> equal your Local Port.** The two ports are crossed.
+1. **Player A** clicks **Host session**, waits a moment for the invite code,
+   then clicks **📋 Copy invite code** and sends the code to Player B (chat,
+   email, anything).
+2. **Player B** pastes it into the **Invite code** box and clicks **Join**.
+3. Pick your colors and play. The status bar on both sides shows
+   `Connected to peer …` once the link is up.
 
-Fill in the three fields in the top bar, click **Connect** on *both* sides, then
-pick your color and play. Order doesn't matter — colors and keys sync once both
-are connected (a 1 s color heartbeat keeps them in sync regardless of who
-connected first), and you can click **Connect** again at any time to re-bind.
+There are no IPs or ports to exchange and **no router configuration**: the
+invite code contains everything needed to find the host. Connections are
+carried by [iroh](https://github.com/n0-computer/iroh) — the two machines
+rendezvous through a public relay server, hole-punch a direct connection when
+the networks allow it, and silently fall back to the relay when they don't
+(strict NATs, VPNs, CGNAT). Traffic is end-to-end encrypted (QUIC/TLS) and the
+host is authenticated by the public key baked into the invite code, so a leaked
+code is the only way for a stranger to join — generate a fresh one per session.
 
-### 1. Two instances on one machine (quick local test)
+Details worth knowing:
 
-Run the app twice and point each copy at the other over loopback, with the ports
-crossed:
-
-| Field       | Instance A    | Instance B    |
-| ----------- | ------------- | ------------- |
-| Local Port  | `9000`        | `9001`        |
-| Remote IP   | `127.0.0.1`   | `127.0.0.1`   |
-| Remote Port | `9001`        | `9000`        |
-
-(They can't share a Local Port — two programs can't bind the same UDP port on the
-same machine.)
-
-### 2. Same LAN / Wi-Fi
-
-Each person needs the other's **local IP address** (on Windows, run `ipconfig`
-and read the *IPv4 Address*, typically `192.168.x.x`). Because the two instances
-are on different machines, they can use the **same** Local Port:
-
-| Field       | Alice (`192.168.1.10`) | Bob (`192.168.1.20`) |
-| ----------- | ---------------------- | -------------------- |
-| Local Port  | `9000`                 | `9000`               |
-| Remote IP   | `192.168.1.20`         | `192.168.1.10`       |
-| Remote Port | `9000`                 | `9000`               |
-
-### 3. Across the internet
-
-UDP has to reach you from outside your network, so one of these is required:
-
-- **Port forwarding:** each person forwards their chosen UDP Local Port on their
-  router to their machine, and exchanges their **public** IP (whatismyip.com).
-  Then it's the LAN setup above with public IPs.
-- **A VPN / overlay network** (e.g. [Tailscale](https://tailscale.com),
-  WireGuard) is much easier: it gives both machines stable private IPs as if they
-  were on one LAN, then you use scenario 2 with those addresses — no router
-  config.
+- **Invite codes are per-session.** The code encodes the host's *current*
+  addresses; it stays valid while that instance is hosting, and a new **Host
+  session** click mints a new one. If the peer drops off (network blip), the
+  host keeps listening — the joiner just presses **Join** again with the same
+  code.
+- **Order doesn't matter for colors.** A 1 s color heartbeat syncs colors
+  whenever both ends are up (it also keeps the connection warm).
+- **Quick local test:** run the app twice on one machine, Host in one, paste
+  the code in the other.
 
 ### If nothing lights up
 
-- **Crossed ports?** Re-check the rule above — this is the usual mistake.
-- **Firewall:** the first time you Connect, Windows may prompt to allow
-  `open-piano` through the firewall — say yes (allow it on the relevant network).
-  If you dismissed it, add an inbound rule for the UDP Local Port.
-- **Right IP?** On a LAN use the `192.168.x.x` address, not `127.0.0.1`. Across
-  the internet you need the *public* IP plus port forwarding (or a VPN).
+- **Firewall:** the first time you host/join, Windows may prompt to allow
+  `open-piano` through the firewall — say yes.
+- **Status bar says "Contacting relay…" forever:** the machine can't reach the
+  relay servers (offline, or a network blocking them). On a shared LAN it still
+  works — the invite code carries direct addresses too.
+- **"Could not reach host":** the host closed the app (or clicked Host again,
+  which invalidates the old code). Ask for a fresh code.
 - Notes are sent as fire-and-forget datagrams (lowest latency over guaranteed
-  delivery), so an occasional dropped packet is expected and harmless; a key that
-  never lights at all is a config/firewall issue, not packet loss.
+  delivery), so an occasional dropped packet is expected and harmless; a key
+  that never lights at all is a connection issue, not packet loss.
 
 ## Distribution & updates
 

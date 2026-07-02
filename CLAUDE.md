@@ -17,9 +17,9 @@ audio transcribed by an ONNX model. See README for the product goal.
  input.rs ──┤                                         ├─→ mpsc<NoteMsg> ─→ UI
  (supervisor)└─ mic (cpal) ─→ inference.rs (ONNX) ────┘                    (main.rs)
                                                                             │  ▲
- record.rs ←── tee: mic audio + raw MIDI (when armed)                       │  │ Packet
+ record.rs ←── tee: mic audio + raw MIDI (when armed)                       │  │ NetEvent
                                                                             ▼  │
-                                                              net.rs (UDP) ─┴──┘ peer
+                                                             net.rs (iroh) ─┴──┘ peer
 ```
 
 - **`main.rs`** — eframe app + all rendering. Owns key state (`local`/`remote`
@@ -40,8 +40,15 @@ audio transcribed by an ONNX model. See README for the product goal.
   window → posteriorgram → thresholding/hysteresis → `NoteMsg`. Heavy with
   hand-tuned constants compensating for the model being offline (see roadmap —
   these go away with a causal model).
-- **`net.rs`** — one UDP socket; listener thread decodes `Packet`s to an mpsc
-  channel; `send` transmits a `Packet` immediately (no batching).
+- **`net.rs`** — P2P over iroh (QUIC + NAT traversal). One side `host()`s and
+  gets a one-string invite code (an iroh `EndpointTicket`); the other `join()`s
+  with it — hole punching when possible, n0's public relays as fallback, so no
+  port forwarding ever. Each session runs a dedicated "net" thread with a
+  current-thread tokio runtime; the UI receives `NetEvent`s (ticket, status,
+  connect/disconnect, packets) on an mpsc channel and queues outgoing `Packet`s
+  on an unbounded sender. Packets ride *unreliable QUIC datagrams* — the same
+  fire-and-forget latency model (and identical wire bytes) as the original
+  raw-UDP transport.
 - **`note.rs`** — `NoteMsg` (On/Off), MIDI helpers, and the **wire protocol**
   (`Packet`): note bytes `[0x90|0x80, note]`, color `[0xC0, r, g, b]`.
 - **`record.rs`** — `Recorder` handle + background writer thread. Writes
@@ -61,7 +68,8 @@ audio transcribed by an ONNX model. See README for the product goal.
   send only).
 - MIDI callback thread: `midir` — cheap (parse + channel send + recorder tee).
 - Recorder writer thread: all file writes.
-- UDP listener thread: blocking `recv_from`.
+- Net thread (one per host/join session): a current-thread tokio runtime
+  driving the iroh endpoint; shuts down when the UI drops its `Peer` handle.
 - Auto-update thread: one-shot GitHub API check + download + self-replace.
 
 The non-`Send` `midir` connection never crosses threads — it's owned by the
@@ -90,7 +98,10 @@ cargo run --release      # run the app
 python download_model.py # fetch model.onnx + onnxruntime.dll (mic path only)
 ```
 
-There is no automated test suite yet. The capture harness was validated against
+`cargo test` runs the one automated test: `net::tests::host_join_exchange_notes`
+hosts and joins over real iroh (loopback + relay) and asserts packets flow both
+ways — run it after touching `net.rs`; it needs a network stack and takes a few
+seconds. Everything else is manual. The capture harness was validated against
 a synthetic session; `verify_alignment.py` recovers a known injected offset to
 within ~1 ms. When changing the recorder or alignment math, re-validate with a
 synthetic session (sine tones at known times + a matching `midi.jsonl`).
@@ -113,6 +124,9 @@ the Windows SmartScreen/Smart App Control situation are documented in the README
   on its poll interval.
 - Colors are re-broadcast on a 1 s heartbeat so they sync regardless of who
   connects first; don't "optimize" that away without another sync mechanism.
+  (It also keeps the QUIC connection from idling out.)
+- iroh needs tokio, but only the net thread runs a runtime — never block the
+  GUI thread on async work; talk to the net thread via the existing channels.
 - `painter.rect` returns a `ShapeIdx` in egui 0.29 — match arms that mix it with
   unit need explicit `;`/blocks.
 - **Smart App Control blocks local builds.** On a machine with Windows Smart App

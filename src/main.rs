@@ -5,8 +5,8 @@
 //!   or, as a fallback, **microphone** audio captured via cpal and transcribed
 //!   by an ONNX model (Spotify Basic Pitch) on a dedicated inference thread.
 //!   Either way the resulting note transitions arrive on one mpsc channel.
-//! * Notes played locally light up RED; notes arriving over UDP from the remote
-//!   peer light up BLUE (both -> purple).
+//! * Notes played locally light up RED; notes arriving over the p2p connection
+//!   from the remote peer light up BLUE (both -> purple).
 //!
 //! See `input.rs`, `midi.rs`, `audio.rs`, `inference.rs`, `net.rs` and
 //! `note.rs` for the subsystems.
@@ -24,14 +24,12 @@ mod record;
 mod synth;
 mod update;
 
-use std::net::SocketAddr;
-
 use eframe::egui;
 
 use std::time::{Duration, Instant};
 
 use input::{InputEngine, Source};
-use net::Peer;
+use net::{NetEvent, Peer};
 use note::{is_black_key, midi_to_key_index, NoteMsg, Packet, KEY_COUNT, MIDI_HIGH, MIDI_LOW};
 
 // Defensive: when ONNX Runtime later probes for optional execution-provider
@@ -159,10 +157,12 @@ struct PianoApp {
     remote_color: [u8; 3], // the peer's notes; received from the peer
     last_color_send: Instant,
 
-    // --- networking config (UI fields) ---
-    local_port: String,
-    remote_ip: String,
-    remote_port: String,
+    // --- networking (see net.rs: host/join with a one-string invite code) ---
+    // Our invite code, once the net thread reports it (hosting only). Shown
+    // with a Copy button so it can be pasted to the other player.
+    my_ticket: Option<String>,
+    // The paste box for an invite code received from a host.
+    join_ticket: String,
     peer: Option<Peer>,
     net_status: String,
 
@@ -193,9 +193,8 @@ impl PianoApp {
             local_color: DEFAULT_LOCAL_COLOR,
             remote_color: DEFAULT_REMOTE_COLOR,
             last_color_send: Instant::now(),
-            local_port: "9000".to_string(),
-            remote_ip: "127.0.0.1".to_string(),
-            remote_port: "9001".to_string(),
+            my_ticket: None,
+            join_ticket: String::new(),
             peer: None,
             net_status: "Not connected".to_string(),
             // Kick off the background GitHub Releases check; the UI polls its
@@ -212,43 +211,39 @@ impl PianoApp {
         self.last_color_send = Instant::now();
     }
 
-    /// Try to (re)bind the local port and target the remote peer.
-    fn connect(&mut self) {
-        let local_port: u16 = match self.local_port.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.net_status = "Invalid local port".into();
-                return;
-            }
-        };
-        let remote_port: u16 = match self.remote_port.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.net_status = "Invalid remote port".into();
-                return;
-            }
-        };
-        let ip = self.remote_ip.trim();
-        let remote: SocketAddr = match format!("{ip}:{remote_port}").parse() {
-            Ok(a) => a,
-            Err(_) => {
-                self.net_status = format!("Invalid remote address: {ip}:{remote_port}");
-                return;
-            }
-        };
+    /// Start hosting a session. Replaces any existing session (dropping the
+    /// old `Peer` shuts its net thread down); the invite code arrives async
+    /// as a `NetEvent::Ticket`.
+    fn host(&mut self) {
+        self.my_ticket = None;
+        self.clear_remote_keys();
+        self.net_status = "Starting…".into();
+        self.peer = Some(net::host());
+    }
 
-        match Peer::connect(local_port, remote) {
-            Ok(peer) => {
-                self.net_status = format!("Listening on :{local_port} → {remote}");
-                self.peer = Some(peer);
-                // A fresh bind means remote state is unknown; clear remote keys.
-                self.remote = [false; KEY_COUNT];
-                // Announce our color right away so the peer can render us.
-                self.send_color();
-            }
-            Err(e) => {
-                self.net_status = format!("Bind failed: {e}");
-                self.peer = None;
+    /// Join a host from the pasted invite code. Progress and errors (bad
+    /// code, unreachable host) come back as `NetEvent::Status`.
+    fn join(&mut self) {
+        let code = self.join_ticket.trim().to_string();
+        if code.is_empty() {
+            self.net_status = "Paste an invite code first".into();
+            return;
+        }
+        self.my_ticket = None;
+        self.clear_remote_keys();
+        self.net_status = "Joining…".into();
+        self.peer = Some(net::join(code));
+    }
+
+    /// Unlight every remote key and stop the synth voicing it. Needed whenever
+    /// remote state becomes unknown (connect, disconnect, new session): the
+    /// matching note-offs will never arrive, so keys — and synth voices —
+    /// would otherwise be stuck on.
+    fn clear_remote_keys(&mut self) {
+        for idx in 0..KEY_COUNT {
+            if self.remote[idx] {
+                self.remote[idx] = false;
+                self.synth_note_off(MIDI_LOW + idx as u8, synth::Channel::Peer);
             }
         }
     }
@@ -508,22 +503,32 @@ impl PianoApp {
         }
     }
 
-    /// Drain the network channel: update remote keys and the peer's color.
+    /// Drain the network event channel: session status (invite code ready,
+    /// connect/disconnect) plus the peer's packets (notes, color).
     fn pump_network(&mut self) {
-        let mut packets = Vec::new();
+        let mut events = Vec::new();
         if let Some(peer) = &self.peer {
-            while let Ok(packet) = peer.incoming.try_recv() {
-                packets.push(packet);
+            while let Ok(event) = peer.events.try_recv() {
+                events.push(event);
             }
         }
-        for packet in packets {
-            match packet {
-                Packet::Note(msg) => {
+        for event in events {
+            match event {
+                NetEvent::Ticket(code) => self.my_ticket = Some(code),
+                NetEvent::Status(s) => self.net_status = s,
+                NetEvent::Connected => {
+                    // Fresh connection: remote state is unknown (this may be a
+                    // reconnect mid-chord), and the peer needs our color.
+                    self.clear_remote_keys();
+                    self.send_color();
+                }
+                NetEvent::Disconnected => self.clear_remote_keys(),
+                NetEvent::Packet(Packet::Note(msg)) => {
                     apply(&mut self.remote, msg);
                     // The peer's notes have no local sound source, so voice them.
                     self.play_synth(msg, synth::Channel::Peer);
                 }
-                Packet::Color(rgb) => self.remote_color = rgb,
+                NetEvent::Packet(Packet::Color(rgb)) => self.remote_color = rgb,
             }
         }
     }
@@ -570,16 +575,37 @@ impl eframe::App for PianoApp {
             if drawn {
                 ui.separator();
             }
+            // ---- Play together: host a session or join one with an invite
+            // code. No IPs or ports — iroh handles NAT traversal (net.rs). ----
             ui.horizontal(|ui| {
-                ui.label("Local Port:");
-                ui.add(egui::TextEdit::singleline(&mut self.local_port).desired_width(70.0));
+                if ui
+                    .button("Host session")
+                    .on_hover_text("Create an invite code to send to the other player")
+                    .clicked()
+                {
+                    self.host();
+                }
+                if let Some(code) = &self.my_ticket {
+                    if ui
+                        .button("📋 Copy invite code")
+                        .on_hover_text("Copy the code to the clipboard, then send it to the other player")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(code.clone());
+                    }
+                    // The full code is long (~250 chars); show just enough to
+                    // see it exists. The Copy button is the real interface.
+                    ui.weak(format!("{}…", &code[..code.len().min(12)]));
+                }
                 ui.separator();
-                ui.label("Remote Target IP:");
-                ui.add(egui::TextEdit::singleline(&mut self.remote_ip).desired_width(120.0));
-                ui.label("Remote Port:");
-                ui.add(egui::TextEdit::singleline(&mut self.remote_port).desired_width(70.0));
-                if ui.button("Connect").clicked() {
-                    self.connect();
+                ui.label("Invite code:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.join_ticket)
+                        .desired_width(180.0)
+                        .hint_text("paste code from the host"),
+                );
+                if ui.button("Join").clicked() {
+                    self.join();
                 }
             });
             // The detection threshold only affects ONNX transcription, so it's
