@@ -4,6 +4,22 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-02
+
+### Changed
+
+- **Invite codes are ~4× shorter** — 64 characters instead of ~250. The code is
+  now just the host's public key; the joiner looks up the host's relay and
+  addresses automatically through iroh's discovery service. A host with no
+  internet (LAN-only play) still falls back to the long self-contained code,
+  and joining accepts both forms — including codes from v0.2.0 hosts.
+- Joining now retries for a few seconds with live status ("Not reachable yet,
+  retrying…") instead of failing outright, which covers joining immediately
+  after the host started.
+
+Note: v0.2.0 can't read the new short codes — if your partner's app says
+"Invalid invite code", have them restart it so it auto-updates.
+
 ## [0.2.0] - 2026-07-02
 
 ### Changed

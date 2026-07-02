@@ -92,21 +92,28 @@ one LAN, or across the internet:
    `Connected to peer …` once the link is up.
 
 There are no IPs or ports to exchange and **no router configuration**: the
-invite code contains everything needed to find the host. Connections are
-carried by [iroh](https://github.com/n0-computer/iroh) — the two machines
-rendezvous through a public relay server, hole-punch a direct connection when
-the networks allow it, and silently fall back to the relay when they don't
-(strict NATs, VPNs, CGNAT). Traffic is end-to-end encrypted (QUIC/TLS) and the
-host is authenticated by the public key baked into the invite code, so a leaked
-code is the only way for a stranger to join — generate a fresh one per session.
+invite code is the host's public key (64 characters), and everything else is
+looked up automatically. Connections are carried by
+[iroh](https://github.com/n0-computer/iroh) — the two machines rendezvous
+through a public relay server, hole-punch a direct connection when the
+networks allow it, and silently fall back to the relay when they don't (strict
+NATs, VPNs, CGNAT). Traffic is end-to-end encrypted (QUIC/TLS) and the host is
+authenticated by that same key, so a leaked code is the only way for a
+stranger to join — generate a fresh one per session.
 
 Details worth knowing:
 
-- **Invite codes are per-session.** The code encodes the host's *current*
-  addresses; it stays valid while that instance is hosting, and a new **Host
-  session** click mints a new one. If the peer drops off (network blip), the
-  host keeps listening — the joiner just presses **Join** again with the same
-  code.
+- **Invite codes are per-session.** A code stays valid while that instance is
+  hosting, and a new **Host session** click mints a new one. If the peer drops
+  off (network blip), the host keeps listening — the joiner just presses
+  **Join** again with the same code.
+- **Joining right after hosting may take a few extra seconds.** The host's
+  address is published to a lookup service when it starts; a joiner who pastes
+  the code within seconds can race that. The app retries automatically
+  ("Not reachable yet, retrying…" in the status bar).
+- **No internet?** A host that can't reach the relay servers falls back to a
+  longer (~250-character) invite code with its LAN addresses baked in, so
+  same-network play works fully offline. Joining accepts both code forms.
 - **Order doesn't matter for colors.** A 1 s color heartbeat syncs colors
   whenever both ends are up (it also keeps the connection warm).
 - **Quick local test:** run the app twice on one machine, Host in one, paste

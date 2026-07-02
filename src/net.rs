@@ -1,12 +1,19 @@
 //! Peer-to-peer transport over iroh (QUIC with NAT traversal).
 //!
-//! One player clicks **Host** and gets a one-string *invite code* (an iroh
-//! [`EndpointTicket`]: the host's public key + relay + direct addresses); the
-//! other pastes it and clicks **Join**. iroh rendezvouses the two through a
-//! relay server, attempts UDP hole punching in the background, and hands us a
-//! QUIC connection — direct when punching succeeds, relayed when it can't
-//! (VPNs, CGNAT). Neither side configures ports or IPs, and the connection is
+//! One player clicks **Host** and gets a one-string *invite code*; the other
+//! pastes it and clicks **Join**. iroh rendezvouses the two through a relay
+//! server, attempts UDP hole punching in the background, and hands us a QUIC
+//! connection — direct when punching succeeds, relayed when it can't (VPNs,
+//! CGNAT). Neither side configures ports or IPs, and the connection is
 //! authenticated by the host's key, so strangers can't inject notes.
+//!
+//! The invite code is normally the host's bare [`EndpointId`] — 64 hex chars —
+//! and the joiner resolves the actual dial info (relay + addresses) through
+//! n0's discovery service, which the `N0` preset both publishes to and reads
+//! from. When the host can't reach a relay (offline / LAN-only), discovery
+//! would have nothing to serve, so it falls back to a full [`EndpointTicket`]
+//! (~4× longer) that carries the direct addresses inline. Joining accepts
+//! either form, which also keeps codes from older versions working.
 //!
 //! Latency model is unchanged from the old raw-UDP transport: every [`Packet`]
 //! rides an *unreliable QUIC datagram*, sent immediately, no batching, no
@@ -29,7 +36,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh::endpoint::presets;
 use iroh::endpoint::Connection;
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -43,6 +50,14 @@ const ALPN: &[u8] = b"open-piano/0";
 /// invite code anyway. Without a relay the code still carries the direct
 /// (LAN) addresses, so same-network play keeps working fully offline.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many times a joiner dials before giving up, and the pause between
+/// tries. Retrying matters most for short (id-only) invite codes: the host
+/// publishes its relay address to n0's discovery service asynchronously, so a
+/// joiner who is very quick off the mark can look the id up before the record
+/// has propagated. A couple of spaced retries papers over that window.
+const JOIN_ATTEMPTS: u32 = 4;
+const JOIN_RETRY_PAUSE: Duration = Duration::from_secs(3);
 
 /// Everything the net thread reports back to the UI, drained once per frame.
 #[derive(Debug, Clone)]
@@ -130,15 +145,19 @@ async fn run(role: Role, mut outgoing: UnboundedReceiver<Packet>, events: Sender
     };
 
     // Parse the invite code first (join only) so a typo fails fast, before
-    // any network work.
-    let target = match &role {
+    // any network work. Short form (bare endpoint id) is tried first; the
+    // long form (full ticket: LAN-only hosts, older versions) second.
+    let target: Option<EndpointAddr> = match &role {
         Role::Host => None,
-        Role::Join(code) => match code.parse::<EndpointTicket>() {
-            Ok(t) => Some(t),
-            Err(e) => {
-                status(format!("Invalid invite code: {e}"));
-                return;
-            }
+        Role::Join(code) => match code.parse::<EndpointId>() {
+            Ok(id) => Some(id.into()),
+            Err(_) => match code.parse::<EndpointTicket>() {
+                Ok(t) => Some(t.endpoint_addr().clone()),
+                Err(e) => {
+                    status(format!("Invalid invite code: {e}"));
+                    return;
+                }
+            },
         },
     };
 
@@ -159,7 +178,7 @@ async fn run(role: Role, mut outgoing: UnboundedReceiver<Packet>, events: Sender
 
     match target {
         None => run_host(&endpoint, &mut outgoing, &events).await,
-        Some(ticket) => run_join(&endpoint, ticket, &mut outgoing, &events).await,
+        Some(addr) => run_join(&endpoint, addr, &mut outgoing, &events).await,
     }
 
     // Graceful close tells the peer immediately instead of leaving it to the
@@ -176,18 +195,21 @@ async fn run_host(
         let _ = events.send(NetEvent::Status(s));
     };
 
-    // Wait for relay contact so the ticket is dialable from anywhere — but
-    // don't wait forever: offline/LAN-only hosts still get a working
-    // (direct-addresses-only) code after the timeout.
+    // Wait for relay contact, then hand out the short code (bare endpoint
+    // id): once we're online, discovery serves the joiner everything else.
+    // Offline/LAN-only hosts get no relay and no discovery, so after the
+    // timeout fall back to the long code with the direct addresses inline.
     status("Contacting relay…".into());
-    if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
+    let code = if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
         .await
-        .is_err()
+        .is_ok()
     {
+        endpoint.id().to_string()
+    } else {
         status("No relay reachable — invite code will only work on this network".into());
-    }
-    let ticket = EndpointTicket::from(endpoint.addr());
-    if events.send(NetEvent::Ticket(ticket.to_string())).is_err() {
+        EndpointTicket::from(endpoint.addr()).to_string()
+    };
+    if events.send(NetEvent::Ticket(code)).is_err() {
         return; // UI dropped the session.
     }
 
@@ -220,7 +242,7 @@ async fn run_host(
 
 async fn run_join(
     endpoint: &Endpoint,
-    ticket: EndpointTicket,
+    addr: EndpointAddr,
     outgoing: &mut UnboundedReceiver<Packet>,
     events: &Sender<NetEvent>,
 ) {
@@ -228,20 +250,36 @@ async fn run_join(
         let _ = events.send(NetEvent::Status(s));
     };
 
-    status("Connecting to host…".into());
-    let conn = tokio::select! {
-        conn = endpoint.connect(ticket.endpoint_addr().clone(), ALPN) => match conn {
-            Ok(conn) => conn,
-            Err(e) => {
-                status(format!("Could not reach host: {e}"));
+    for attempt in 1..=JOIN_ATTEMPTS {
+        if attempt == 1 {
+            status("Connecting to host…".into());
+        } else {
+            status(format!(
+                "Connecting to host… (attempt {attempt}/{JOIN_ATTEMPTS})"
+            ));
+        }
+        let result = tokio::select! {
+            conn = endpoint.connect(addr.clone(), ALPN) => conn,
+            _ = discard_until_closed(outgoing) => return,
+        };
+        match result {
+            Ok(conn) => {
+                if relay_session(&conn, outgoing, events).await == SessionEnd::PeerGone {
+                    status("Disconnected — press Join to reconnect".into());
+                }
                 return;
             }
-        },
-        _ = discard_until_closed(outgoing) => return,
-    };
-
-    if relay_session(&conn, outgoing, events).await == SessionEnd::PeerGone {
-        status("Disconnected — press Join to reconnect".into());
+            Err(e) if attempt < JOIN_ATTEMPTS => {
+                // Most likely the host's discovery record hasn't propagated
+                // yet (id-only code, host just started); pause and retry.
+                status(format!("Not reachable yet ({e}); retrying…"));
+                tokio::select! {
+                    _ = tokio::time::sleep(JOIN_RETRY_PAUSE) => {}
+                    _ = discard_until_closed(outgoing) => return,
+                }
+            }
+            Err(e) => status(format!("Could not reach host: {e}")),
+        }
     }
 }
 

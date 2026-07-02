@@ -593,8 +593,9 @@ impl eframe::App for PianoApp {
                     {
                         ui.ctx().copy_text(code.clone());
                     }
-                    // The full code is long (~250 chars); show just enough to
-                    // see it exists. The Copy button is the real interface.
+                    // The code is 64 hex chars (or ~250 for the LAN-only
+                    // fallback ticket); show just enough to see it exists.
+                    // The Copy button is the real interface.
                     ui.weak(format!("{}…", &code[..code.len().min(12)]));
                 }
                 ui.separator();

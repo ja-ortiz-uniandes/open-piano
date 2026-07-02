@@ -41,9 +41,11 @@ audio transcribed by an ONNX model. See README for the product goal.
   hand-tuned constants compensating for the model being offline (see roadmap —
   these go away with a causal model).
 - **`net.rs`** — P2P over iroh (QUIC + NAT traversal). One side `host()`s and
-  gets a one-string invite code (an iroh `EndpointTicket`); the other `join()`s
-  with it — hole punching when possible, n0's public relays as fallback, so no
-  port forwarding ever. Each session runs a dedicated "net" thread with a
+  gets a one-string invite code; the other `join()`s with it — hole punching
+  when possible, n0's public relays as fallback, so no port forwarding ever.
+  The code is normally the bare `EndpointId` (64 hex chars; dial info comes
+  from n0 discovery, which the `N0` preset publishes to), falling back to a
+  full `EndpointTicket` when the host is offline/LAN-only; join accepts both. Each session runs a dedicated "net" thread with a
   current-thread tokio runtime; the UI receives `NetEvent`s (ticket, status,
   connect/disconnect, packets) on an mpsc channel and queues outgoing `Packet`s
   on an unbounded sender. Packets ride *unreliable QUIC datagrams* — the same
