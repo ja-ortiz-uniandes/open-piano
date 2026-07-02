@@ -4,6 +4,32 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-02
+
+### Changed
+
+- **Connecting is now a one-string invite code — no more IPs, ports, or router
+  config.** One player clicks **Host session** and sends the copied invite code
+  to the other, who pastes it and clicks **Join**. Connections are carried by
+  [iroh](https://github.com/n0-computer/iroh): the peers meet through a public
+  relay server, hole-punch a direct connection when the networks allow it, and
+  fall back to the relay when they don't — so it works behind VPNs, CGNAT, and
+  strict NATs with zero setup. Note events still travel as fire-and-forget
+  datagrams, so the latency model is unchanged. The old Local Port / Remote IP /
+  Remote Port fields are gone.
+
+### Security
+
+- Sessions are end-to-end encrypted and authenticated by the host's key (baked
+  into the invite code). The previous transport accepted UDP packets from any
+  sender that found the port.
+
+### Fixed
+
+- Notes the peer was holding no longer keep sounding on the built-in synth after
+  a disconnect; remote keys and synth voices are released whenever the
+  connection state resets.
+
 ## [0.1.1] - 2026-07-02
 
 ### Fixed
