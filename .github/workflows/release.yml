@@ -44,6 +44,15 @@ jobs:
           python-version: "3.x"
 
       - name: Build (release)
+        # The checked-in .cargo/config.toml sets `-C target-cpu=native` for local
+        # dev builds. On a CI runner that bakes the *runner's* CPU features (e.g.
+        # AVX-512 on Azure Ice Lake) into the shipped exe, which then dies
+        # instantly with STATUS_ILLEGAL_INSTRUCTION (0xC000001D) — no window, no
+        # error — on any consumer CPU without them. The RUSTFLAGS env var
+        # overrides the config file; x86-64-v2 (SSE4.2-era baseline, ~2009+)
+        # keeps the DSP loops reasonably fast while running everywhere.
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v2
         run: cargo build --release
 
       - name: Fetch model.onnx + onnxruntime.dll

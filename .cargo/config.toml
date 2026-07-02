@@ -19,4 +19,10 @@
 [build]
 # Surface 9 is x86_64; let codegen use the native CPU features for the
 # tight DSP loops.
+#
+# WARNING: `native` means "the CPU of whatever machine runs the build". A binary
+# built on one machine with this flag can crash with STATUS_ILLEGAL_INSTRUCTION
+# on another. The release workflow overrides this via the RUSTFLAGS env var
+# (which takes precedence over this file) to a portable x86-64-v2 baseline —
+# keep that override if you touch the CI build step.
 rustflags = ["-C", "target-cpu=native"]

@@ -4,6 +4,17 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-02
+
+### Fixed
+
+- **v0.1.0 release binary crashed instantly on launch** (no window, no error) on
+  most machines. The checked-in `.cargo/config.toml` builds with
+  `-C target-cpu=native`, so the CI-built exe contained instructions specific to
+  the GitHub Actions runner's server CPU (e.g. AVX-512) and died with
+  `STATUS_ILLEGAL_INSTRUCTION` on consumer hardware. Release builds now target
+  the portable `x86-64-v2` baseline; local dev builds keep native codegen.
+
 ## [0.1.0] - 2026-06-29
 
 First release: a working real-time, peer-to-peer acoustic-piano visualizer.
@@ -60,4 +71,5 @@ First release: a working real-time, peer-to-peer acoustic-piano visualizer.
 - Release binaries are unsigned, so Windows SmartScreen warns on first run and
   enforced Smart App Control blocks them outright. Code signing is on the roadmap.
 
+[0.1.1]: https://github.com/ja-ortiz-uniandes/open-piano/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ja-ortiz-uniandes/open-piano/releases/tag/v0.1.0
