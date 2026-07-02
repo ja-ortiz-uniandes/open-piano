@@ -77,12 +77,47 @@ jobs:
             "extra=--latest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
+      # Pull the human-written section for this version out of CHANGELOG.md and
+      # use it as the release body. The tag `vX.Y.Z` maps to the `## [X.Y.Z]`
+      # heading; we capture everything up to (but not including) the next
+      # top-level `## [` heading. If there's no matching section we fall back to
+      # GitHub's auto-generated notes alone.
+      - name: Extract changelog section
+        id: notes
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $lines = Get-Content CHANGELOG.md
+          $start = $null
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match "^## \[$([regex]::Escape($version))\]") { $start = $i; break }
+          }
+          if ($null -eq $start) {
+            Write-Host "No CHANGELOG section for $version; using generated notes only."
+            "have_notes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $body = @()
+            for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^## \[') { break }
+              $body += $lines[$i]
+            }
+            ($body -join "`n").Trim() | Out-File -FilePath notes.md -Encoding utf8
+            "have_notes=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create ${{ github.ref_name }}
-          "open-piano-${{ github.ref_name }}-win-x64.zip"
-          --title "${{ steps.flags.outputs.title }}"
-          ${{ steps.flags.outputs.extra }}
-          --generate-notes
+        shell: pwsh
+        run: |
+          $args = @(
+            "${{ github.ref_name }}",
+            "open-piano-${{ github.ref_name }}-win-x64.zip",
+            "--title", "${{ steps.flags.outputs.title }}",
+            "--generate-notes"
+          )
+          $args += "${{ steps.flags.outputs.extra }}".Split(" ")
+          if ("${{ steps.notes.outputs.have_notes }}" -eq "true") {
+            $args += @("--notes-file", "notes.md")
+          }
+          gh release create @args

@@ -1,8 +1,9 @@
 //! In-app auto-update against GitHub Releases.
 //!
-//! On launch a background thread asks the GitHub Releases API whether a tag
-//! newer than the running `CARGO_PKG_VERSION` exists. If so it downloads that
-//! release's portable zip and atomically swaps the running `open-piano.exe` in
+//! On launch a background thread asks the GitHub Releases API whether a newer
+//! release exists (see [`pick_update`] for the stable-vs-preview policy). If so
+//! it downloads that release's portable zip and atomically swaps the running
+//! `open-piano.exe` in
 //! place (via `self_update` → `self_replace`: rename the live exe, drop the new
 //! one beside it). The swap takes effect on the next launch, so the UI surfaces
 //! "update ready" with a one-click **Restart now** ([`restart`]) — or the user
@@ -94,8 +95,36 @@ pub fn start() -> Updater {
 /// exe. Returns `Ok(Some(version))` when a newer build was staged, `Ok(None)`
 /// when already current, and `Err` on any network/IO failure (offline,
 /// rate-limited, non-writable install folder, …).
+///
+/// We don't let `self_update`'s `.update()` pick the release: its built-in logic
+/// just takes the newest release by date among higher versions, which can't
+/// express the stable-vs-preview policy we want. Instead we list every release,
+/// choose one ourselves ([`pick_update`]), and pin that exact tag.
 fn run_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let status = self_update::backends::github::Update::configure()
+    let current = self_update::cargo_crate_version!();
+
+    // List *all* published releases — the GitHub `/releases` endpoint, which
+    // includes pre-releases — keeping only those carrying our Windows asset
+    // (matched on the `win-x64` substring, since the build target triple never
+    // appears in the asset name).
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(REPO_OWNER)
+        .repo_name(REPO_NAME)
+        .with_target(ASSET_TARGET)
+        .build()?
+        .fetch()?;
+
+    let Some(target) = pick_update(current, &releases)? else {
+        return Ok(None);
+    };
+
+    // Pin the exact tag we chose (releases carry the version sans `v`; the tag is
+    // `vX.Y.Z`). With a target version set, `self_update` downloads and swaps
+    // that release unconditionally — it does *no* internal newer-than gate — so
+    // `pick_update` is solely responsible for only ever returning a strictly
+    // newer release.
+    let tag = format!("v{target}");
+    self_update::backends::github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name("open-piano.exe")
@@ -112,18 +141,71 @@ fn run_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
         // No TTY in a windowed app, and the check is meant to be invisible.
         .show_download_progress(false)
         .no_confirm(true)
-        .current_version(self_update::cargo_crate_version!())
+        .current_version(current)
+        .target_version_tag(&tag)
         .build()?
         .update()?;
 
-    // `.update()` returns a `Status`; in self_update 0.44 the query method is
-    // `updated()` (no `is_` prefix). The `is_updated()` name does not exist on
-    // this version, so do NOT rename it back — it won't compile.
-    Ok(if status.updated() {
-        Some(status.version().to_string())
-    } else {
-        None
-    })
+    Ok(Some(target))
+}
+
+/// Choose which release (if any) to update `current` to, under our pre-1.0
+/// policy:
+///
+/// * A **pre-release** is any `0.x.y` tag — the same `v0.*` rule the release
+///   workflow uses to set GitHub's pre-release flag. `1.0.0`+ tags are stable.
+///   `self_update`'s `Release` doesn't expose GitHub's `prerelease` boolean, so
+///   we classify by the version number; because the workflow keys off the same
+///   number, the two can't disagree.
+/// * Prefer the highest **stable** release newer than `current`. A stable
+///   install only ever moves to a higher stable release.
+/// * Only when there is no higher stable release *and* `current` is itself a
+///   pre-release do we fall back to the highest **pre-release** newer than
+///   `current`. So preview users roll forward across previews, but a stable
+///   install is never pulled back onto a preview.
+///
+/// Returns the chosen version string (no leading `v`), or `None` when there's
+/// nothing newer to move to.
+fn pick_update(
+    current: &str,
+    releases: &[self_update::update::Release],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    use self_update::version::bump_is_greater;
+
+    // Highest release strictly newer than `current` among those `keep` accepts.
+    // Compares by version number (not publish date), so an out-of-order release
+    // list can't trick us into picking a lower version.
+    let newest = |keep: &dyn Fn(&str) -> bool| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let mut best: Option<String> = None;
+        for r in releases {
+            if !keep(&r.version) || !bump_is_greater(current, &r.version)? {
+                continue;
+            }
+            let is_better = match &best {
+                None => true,
+                Some(b) => bump_is_greater(b, &r.version)?,
+            };
+            if is_better {
+                best = Some(r.version.clone());
+            }
+        }
+        Ok(best)
+    };
+
+    let is_pre = |v: &str| v.starts_with("0.");
+    let is_stable = |v: &str| !is_pre(v);
+
+    // 1. A higher stable release always wins (for stable and preview users alike).
+    if let Some(stable) = newest(&is_stable)? {
+        return Ok(Some(stable));
+    }
+    // 2. Otherwise a preview install may roll forward to a higher preview.
+    if is_pre(current) {
+        if let Some(pre) = newest(&is_pre)? {
+            return Ok(Some(pre));
+        }
+    }
+    Ok(None)
 }
 
 /// Relaunch the (already-swapped) executable and exit, so the user lands on the
