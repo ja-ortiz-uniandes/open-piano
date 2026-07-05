@@ -66,10 +66,13 @@ fn main() -> eframe::Result<()> {
     // block the GUI.
     bundle::prepare_ort_dylib();
 
+    let icon = eframe::icon_data::from_png_bytes(bundle::ICON_PNG)
+        .expect("assets/icon.png must be a valid PNG (embedded at compile time)");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 620.0])
             .with_min_inner_size([640.0, 420.0])
+            .with_icon(icon)
             .with_title(concat!(
                 "open-piano v",
                 env!("CARGO_PKG_VERSION"),
@@ -119,6 +122,14 @@ const ECHO_HOLDOFF: Duration = Duration::from_millis(2000);
 /// keyboard. 40 px/s shows ~6 s in the default window, and even a staccato
 /// click leaves a visible mark (plus `draw_roll` enforces a 2 px minimum).
 const ROLL_PX_PER_S: f32 = 40.0;
+
+/// After this long with no drag/scroll input, a scrolled-back roll view starts
+/// easing back to live/now. Long enough to read what you scrolled to; short
+/// enough that the view never feels stuck in the past.
+const SCROLLBACK_IDLE_S: f64 = 2.5;
+/// Exponential ease-back rate (1/s) for a scrolled roll returning home —
+/// matches the ~0.2 s feel the history roll's drag-release always had.
+const SCROLLBACK_EASE_RATE: f64 = 12.0;
 
 /// How the central panel splits between the keyboard (top) and the roll
 /// (bottom): the keyboard takes this fraction of the height, but never less
@@ -214,6 +225,14 @@ struct PianoApp {
     // Drag-to-review view state: `Some(t)` is the roll time rendered at the
     // strip's top edge while scrolled back (or animating home); `None` = live.
     scrollback: Option<f64>,
+    // When the last drag/scroll input on the history roll stopped; the view
+    // holds still until `SCROLLBACK_IDLE_S` elapses, then eases back to live.
+    scrollback_idle_since: Option<Instant>,
+    // Falling-panel review state: a view-time offset from the playhead
+    // (negative = looking at the past). Purely a rendering offset — never
+    // touches `PlaybackEngine::playhead_s`, so Learn-mode gating is unaffected.
+    falling_scrollback: Option<f64>,
+    falling_scrollback_idle_since: Option<Instant>,
     // Result of the last save attempt, shown next to the File menu.
     roll_status: String,
     // Whether the "unsaved roll" confirmation is up (close was intercepted).
@@ -230,8 +249,14 @@ struct PianoApp {
     playback_muted: bool,
     // Result of the last File > Open (load warnings/errors).
     open_status: String,
-    // Whether the segment row + Learn side panel are shown (👁 toggle).
-    panels_visible: bool,
+    // Whether the segment + key-range row is shown (checkbox in the playback
+    // controls). The Learn side panel has its own collapse state below.
+    segment_row_visible: bool,
+    // Whether the top config panel is collapsed to its title strip (chevron).
+    config_collapsed: bool,
+    // Whether the Learn side panel is expanded ("‹"/"›" arrows). Preserved
+    // across Learn-mode exits, so re-entering restores the last choice.
+    learn_panel_expanded: bool,
     // Right-click time stash: a `context_menu` closure runs on frames after
     // the opening click, so the clicked time must be captured when
     // `secondary_clicked()` fires, not re-derived inside the menu.
@@ -287,6 +312,9 @@ impl PianoApp {
             show_about: false,
             roll: roll::Roll::new(),
             scrollback: None,
+            scrollback_idle_since: None,
+            falling_scrollback: None,
+            falling_scrollback_idle_since: None,
             roll_status: String::new(),
             show_close_confirm: false,
             allow_close: false,
@@ -294,7 +322,9 @@ impl PianoApp {
             playback_volume: 1.0,
             playback_muted: false,
             open_status: String::new(),
-            panels_visible: true,
+            segment_row_visible: true,
+            config_collapsed: false,
+            learn_panel_expanded: true,
             pending_break_t: None,
             range_drag: None,
             show_refine_range: false,
@@ -522,6 +552,8 @@ impl PianoApp {
                 }
                 self.playback = None;
                 self.open_status.clear();
+                self.falling_scrollback = None;
+                self.falling_scrollback_idle_since = None;
             }
         });
         if self.roll.has_unsaved() {
@@ -583,6 +615,9 @@ impl PianoApp {
                 };
                 self.playback = Some(playback::PlaybackEngine::new(s, path));
                 self.scrollback = None;
+                self.scrollback_idle_since = None;
+                self.falling_scrollback = None;
+                self.falling_scrollback_idle_since = None;
                 self.range_drag = None;
             }
             Err(e) => self.open_status = format!("open failed: {e}"),
@@ -714,9 +749,10 @@ impl PianoApp {
         ui.separator();
         ui.add(egui::Slider::new(&mut pb.speed, 0.25..=2.0).text("speed"));
         ui.separator();
-        let eye = if self.panels_visible { "Hide panels" } else { "Show panels" };
-        ui.checkbox(&mut self.panels_visible, eye)
-            .on_hover_text("Show/hide the segment row and Learn settings panel");
+        let eye =
+            if self.segment_row_visible { "Hide segment row" } else { "Show segment row" };
+        ui.checkbox(&mut self.segment_row_visible, eye)
+            .on_hover_text("Show/hide the segment + key-range row");
         if pb.finished {
             ui.weak("— finished");
         }
@@ -777,56 +813,100 @@ impl PianoApp {
         }
     }
 
-    /// Learn-mode settings side panel: which tracks to practice, how strict
-    /// the gating is, and the key-range readout. Must be shown *before* the
+    /// Learn-mode settings side panel: which tracks to practice and how
+    /// strict the gating is (the key-range readout lives in the top config
+    /// panel — see `key_range_panel`). Must be shown *before* the
     /// CentralPanel each frame (egui reserves panel space in show order).
     fn learn_panel(&mut self, ctx: &egui::Context) {
         let Some(pb) = &mut self.playback else { return };
-        if pb.mode != playback::Mode::Learn || !self.panels_visible {
+        if pb.mode != playback::Mode::Learn {
             return;
         }
-        egui::SidePanel::right("learn_panel")
+
+        // Collapsed/expanded variants animate between two *distinct* panel
+        // ids (see the config panel's note in `update`). `pb` mutably borrows
+        // `self.playback` for the whole closure, so the arrow click is
+        // returned out of the closure and applied to `self` afterwards
+        // instead of toggling in place.
+        let collapsed = egui::SidePanel::right("learn_panel_collapsed")
             .resizable(false)
-            .default_width(220.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                ui.strong("Learn settings");
-                ui.add_space(4.0);
-                ui.checkbox(&mut pb.learn.practice[0], "Practice Local track");
-                ui.checkbox(&mut pb.learn.practice[1], "Practice Remote track");
-                if !pb.learn.practice[0] && !pb.learn.practice[1] {
-                    ui.weak("No track selected — behaves like Listen mode");
-                }
-                for (i, label) in [(0, "Local"), (1, "Remote")] {
-                    if pb.learn.practice[i] && pb.score.tracks[i].notes.is_empty() {
-                        ui.weak(format!("({label} track has no notes)"));
+            .exact_width(18.0);
+        let expanded = egui::SidePanel::right("learn_panel")
+            .resizable(false)
+            .default_width(220.0);
+        let result = egui::SidePanel::show_animated_between(
+            ctx,
+            self.learn_panel_expanded,
+            collapsed,
+            expanded,
+            |ui, how_expanded| -> bool {
+                if how_expanded < 0.5 {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(6.0);
+                        ui.small_button("‹").on_hover_text("Show Learn settings").clicked()
+                    })
+                    .inner
+                } else {
+                    let mut toggled = false;
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        toggled = ui
+                            .small_button("›")
+                            .on_hover_text("Hide Learn settings")
+                            .clicked();
+                        ui.strong("Learn settings");
+                    });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut pb.learn.practice[0], "Practice Local track");
+                    ui.checkbox(&mut pb.learn.practice[1], "Practice Remote track");
+                    if !pb.learn.practice[0] && !pb.learn.practice[1] {
+                        ui.weak("No track selected — behaves like Listen mode");
                     }
-                }
-                ui.separator();
-                ui.checkbox(&mut pb.learn.require_hold, "Require holding notes")
-                    .on_hover_text(
-                        "Off = wait for the right notes, then continue even if you release early",
-                    );
-                ui.checkbox(&mut pb.learn.block_wrong, "Block on wrong notes")
-                    .on_hover_text("Extra held keys also freeze playback");
-                ui.separator();
-                match pb.learn.key_range {
-                    Some((lo, hi)) => {
-                        ui.label(format!(
-                            "Key range: {} – {}",
-                            note::solfege_name(lo),
-                            note::solfege_name(hi)
-                        ));
-                        if ui.button("Clear range").clicked() {
-                            pb.learn.key_range = None;
+                    for (i, label) in [(0, "Local"), (1, "Remote")] {
+                        if pb.learn.practice[i] && pb.score.tracks[i].notes.is_empty() {
+                            ui.weak(format!("({label} track has no notes)"));
                         }
                     }
-                    None => {
-                        ui.weak("Key range: whole keyboard");
-                        ui.weak("(drag across the falling notes to set one)");
-                    }
+                    ui.separator();
+                    ui.checkbox(&mut pb.learn.require_hold, "Require holding notes")
+                        .on_hover_text(
+                            "Off = wait for the right notes, then continue even if you release early",
+                        );
+                    ui.checkbox(&mut pb.learn.block_wrong, "Block on wrong notes")
+                        .on_hover_text("Extra held keys also freeze playback");
+                    toggled
                 }
-            });
+            },
+        );
+        if let Some(inner) = result {
+            if inner.inner {
+                self.learn_panel_expanded = !self.learn_panel_expanded;
+            }
+        }
+    }
+
+    /// Key-range readout + clear button. Lives in the top config panel, not
+    /// the Learn-only side panel: the drag-to-select gesture on the falling
+    /// panel works in any mode, and the range now filters what's audible
+    /// everywhere (see `drive_auto`), so the readout must be visible in
+    /// Listen mode too.
+    fn key_range_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(pb) = &mut self.playback else { return };
+        match pb.learn.key_range {
+            Some((lo, hi)) => {
+                ui.label(format!(
+                    "Key range: {} – {}",
+                    note::solfege_name(lo),
+                    note::solfege_name(hi)
+                ));
+                if ui.button("Clear range").clicked() {
+                    pb.learn.key_range = None;
+                }
+            }
+            None => {
+                ui.weak("Key range: whole keyboard (drag across the falling notes to set one)");
+            }
+        }
     }
 
     /// Clicks and drags on the falling-notes panel: Ctrl+click / right-click
@@ -843,8 +923,39 @@ impl PianoApp {
         let Some(pb) = &mut self.playback else { return };
         let rect = resp.rect;
         // Capture the value, not `pb`, so the closure doesn't pin the borrow.
-        let playhead = pb.playhead_s;
+        // Includes the review offset so clicks land on the time actually drawn
+        // under the pointer, not where the playhead would put it.
+        let playhead = pb.playhead_s + self.falling_scrollback.unwrap_or(0.0);
         let t_of_y = move |y: f32| playhead + ((rect.bottom() - y) / ROLL_PX_PER_S) as f64;
+
+        // Wheel/trackpad scroll reviews time. Drag is reserved for the
+        // key-range selection below (it only ever reads x), so a vertical
+        // drag on the same gesture would be genuinely ambiguous — time
+        // review here is wheel-only. The offset is view-only: the playhead
+        // (and Learn gating) never move.
+        let scroll_dy = if resp.hovered() {
+            ui.input(|i| i.smooth_scroll_delta.y)
+        } else {
+            0.0
+        };
+        if scroll_dy != 0.0 {
+            let lo = -pb.playhead_s;
+            let hi = (pb.score.duration_s - pb.playhead_s).max(0.0);
+            let cur = self.falling_scrollback.unwrap_or(0.0);
+            self.falling_scrollback =
+                Some((cur + (scroll_dy / ROLL_PX_PER_S) as f64).clamp(lo, hi));
+            self.falling_scrollback_idle_since = None;
+        } else if let Some(cur) = self.falling_scrollback {
+            // No input: hold the view for the idle window, then ease home.
+            let idle = *self.falling_scrollback_idle_since.get_or_insert_with(Instant::now);
+            if idle.elapsed().as_secs_f64() >= SCROLLBACK_IDLE_S {
+                let dt = ui.input(|i| i.stable_dt) as f64;
+                self.falling_scrollback = ease_toward(cur, 0.0, dt);
+                if self.falling_scrollback.is_none() {
+                    self.falling_scrollback_idle_since = None;
+                }
+            }
+        }
 
         // Horizontal drag -> key-range selection.
         if resp.drag_started() {
@@ -1013,6 +1124,123 @@ impl PianoApp {
         if changed {
             self.apply_synth_gains();
         }
+    }
+
+    /// Everything inside the *expanded* top config panel: file menu, update
+    /// banner, networking row, playback transport, mic threshold, colors,
+    /// synth volumes, and the record toggle. Split out of `update()` so the
+    /// collapsible-panel wrapper there stays readable.
+    fn config_panel_body(&mut self, ui: &mut egui::Ui) {
+        // ---- File menu (save the piano roll) + unsaved/status chips ----
+        egui::menu::bar(ui, |ui| self.file_menu(ui));
+        ui.separator();
+        // ---- Auto-update banner (only drawn when there's something to act on) ----
+        let mut drawn = false;
+        ui.horizontal(|ui| drawn = self.update_controls(ui));
+        if drawn {
+            ui.separator();
+        }
+        // ---- Play together: host a session or join one with an invite
+        // code. No IPs or ports — iroh handles NAT traversal (net.rs).
+        // Greyed out (not hidden — the row keeps its height, so opening a
+        // file doesn't reflow the whole panel) while a file is open:
+        // playback and live P2P are mutually exclusive (see `open_score`). ----
+        ui.horizontal(|ui| {
+            let net_enabled = self.playback.is_none();
+            let disabled_hint = "Networking is disabled while a file is open (File ▸ Close file)";
+            if ui
+                .add_enabled(net_enabled, egui::Button::new("Host session"))
+                .on_hover_text("Create an invite code to send to the other player")
+                .on_disabled_hover_text(disabled_hint)
+                .clicked()
+            {
+                self.host();
+            }
+            // `my_ticket` is always `None` while a file is open (cleared
+            // in `open_score`), so this branch never renders mid-file.
+            if let Some(code) = &self.my_ticket {
+                if ui
+                    .button("📋 Copy invite code")
+                    .on_hover_text("Copy the code to the clipboard, then send it to the other player")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(code.clone());
+                }
+                // The code is 64 hex chars (or ~250 for the LAN-only
+                // fallback ticket); show just enough to see it exists.
+                // The Copy button is the real interface.
+                ui.weak(format!("{}…", &code[..code.len().min(12)]));
+            }
+            ui.separator();
+            ui.label("Invite code:");
+            ui.add_enabled(
+                net_enabled,
+                egui::TextEdit::singleline(&mut self.join_ticket)
+                    .desired_width(180.0)
+                    .hint_text("paste code from the host"),
+            )
+            .on_disabled_hover_text(disabled_hint);
+            if ui
+                .add_enabled(net_enabled, egui::Button::new("Join"))
+                .on_disabled_hover_text(disabled_hint)
+                .clicked()
+            {
+                self.join();
+            }
+        });
+        // ---- Playback transport + segment row (only with a file open) ----
+        if self.playback.is_some() {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| self.playback_controls(ui));
+            if self.segment_row_visible {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    self.segment_controls(ui);
+                    ui.separator();
+                    self.key_range_panel(ui);
+                });
+            }
+        }
+        // The detection threshold only affects ONNX transcription, so it's
+        // only meaningful when the microphone fallback is active.
+        if self.input.source() == Source::Microphone {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("Detection threshold:");
+                if ui
+                    .add(egui::Slider::new(&mut self.threshold, 0.05..=0.95).step_by(0.01))
+                    .changed()
+                {
+                    self.input.threshold.set(self.threshold);
+                }
+                ui.separator();
+                ui.checkbox(&mut self.mic_muted, "Mute mic").on_hover_text(
+                    "Ignore mic-detected notes (stops ambient noise from \
+                     painting the roll or counting as played keys)",
+                );
+            });
+        }
+        // ---- My color (broadcast to the peer) ----
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("My color:");
+            if ui.color_edit_button_srgb(&mut self.local_color).changed() {
+                // Push the change immediately; the heartbeat covers the rest.
+                self.send_color();
+            }
+            ui.separator();
+            ui.label("Peer's color:");
+            let (r, g, b) = (self.remote_color[0], self.remote_color[1], self.remote_color[2]);
+            ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
+            ui.weak("(chosen by the peer)");
+        });
+        // ---- Synth volume / mute (screen + peer sources) ----
+        ui.add_space(2.0);
+        ui.horizontal(|ui| self.synth_controls(ui));
+        // ---- Training-data capture (record mic audio + MIDI labels) ----
+        ui.add_space(2.0);
+        ui.horizontal(|ui| self.record_controls(ui));
+        ui.add_space(4.0);
     }
 
     /// Auto-update status line. The check + download run on a background thread
@@ -1251,108 +1479,47 @@ impl eframe::App for PianoApp {
             self.send_color();
         }
 
-        // ---- Top: networking + audio config ----
-        egui::TopBottomPanel::top("config").show(ctx, |ui| {
-            ui.add_space(4.0);
-            // ---- File menu (save the piano roll) + unsaved/status chips ----
-            egui::menu::bar(ui, |ui| self.file_menu(ui));
-            ui.separator();
-            // ---- Auto-update banner (only drawn when there's something to act on) ----
-            let mut drawn = false;
-            ui.horizontal(|ui| drawn = self.update_controls(ui));
-            if drawn {
-                ui.separator();
-            }
-            // ---- Play together: host a session or join one with an invite
-            // code. No IPs or ports — iroh handles NAT traversal (net.rs).
-            // Hidden while a file is open: playback and live P2P are
-            // mutually exclusive (see `open_score`). ----
-            ui.horizontal(|ui| {
-                if self.playback.is_some() {
-                    ui.weak("Networking is disabled while a file is open (File ▸ Close file)");
-                    return;
-                }
-                if ui
-                    .button("Host session")
-                    .on_hover_text("Create an invite code to send to the other player")
-                    .clicked()
-                {
-                    self.host();
-                }
-                if let Some(code) = &self.my_ticket {
-                    if ui
-                        .button("📋 Copy invite code")
-                        .on_hover_text("Copy the code to the clipboard, then send it to the other player")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(code.clone());
-                    }
-                    // The code is 64 hex chars (or ~250 for the LAN-only
-                    // fallback ticket); show just enough to see it exists.
-                    // The Copy button is the real interface.
-                    ui.weak(format!("{}…", &code[..code.len().min(12)]));
-                }
-                ui.separator();
-                ui.label("Invite code:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.join_ticket)
-                        .desired_width(180.0)
-                        .hint_text("paste code from the host"),
-                );
-                if ui.button("Join").clicked() {
-                    self.join();
-                }
-            });
-            // ---- Playback transport + segment row (only with a file open) ----
-            if self.playback.is_some() {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| self.playback_controls(ui));
-                if self.panels_visible {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| self.segment_controls(ui));
-                }
-            }
-            // The detection threshold only affects ONNX transcription, so it's
-            // only meaningful when the microphone fallback is active.
-            if self.input.source() == Source::Microphone {
+        // ---- Top: networking + audio config, collapsible to a title strip
+        // via the chevron. The collapsed/expanded variants animate between
+        // two *distinct* panel ids — sharing one would corrupt the height
+        // lerp `show_animated_between` stores per id. ----
+        let collapsed_panel = egui::TopBottomPanel::top("config_collapsed")
+            .resizable(false)
+            .exact_height(24.0);
+        let expanded_panel = egui::TopBottomPanel::top("config").resizable(false);
+        egui::TopBottomPanel::show_animated_between(
+            ctx,
+            !self.config_collapsed,
+            collapsed_panel,
+            expanded_panel,
+            // Branch on `config_collapsed`, not `how_expanded`: contents are
+            // only drawn at the fully-collapsed and fully-expanded endpoints,
+            // which line up exactly with that flag.
+            |ui, _how_expanded| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.label("Detection threshold:");
-                    if ui
-                        .add(egui::Slider::new(&mut self.threshold, 0.05..=0.95).step_by(0.01))
-                        .changed()
-                    {
-                        self.input.threshold.set(self.threshold);
+                    // ⏶/⏷, not ⌃/⌄: the latter aren't in egui's default
+                    // fonts (they render as tofu boxes); these come from the
+                    // same block as the transport glyphs, which do render.
+                    let (chevron, hover) = if self.config_collapsed {
+                        ("⏷", "Show settings")
+                    } else {
+                        ("⏶", "Hide settings")
+                    };
+                    if ui.small_button(chevron).on_hover_text(hover).clicked() {
+                        self.config_collapsed = !self.config_collapsed;
                     }
-                    ui.separator();
-                    ui.checkbox(&mut self.mic_muted, "Mute mic").on_hover_text(
-                        "Ignore mic-detected notes (stops ambient noise from \
-                         painting the roll or counting as played keys)",
+                    ui.label(
+                        egui::RichText::new(concat!("open-piano v", env!("CARGO_PKG_VERSION")))
+                            .weak(),
                     );
                 });
-            }
-            // ---- My color (broadcast to the peer) ----
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label("My color:");
-                if ui.color_edit_button_srgb(&mut self.local_color).changed() {
-                    // Push the change immediately; the heartbeat covers the rest.
-                    self.send_color();
+                if !self.config_collapsed {
+                    ui.add_space(4.0);
+                    self.config_panel_body(ui);
                 }
-                ui.separator();
-                ui.label("Peer's color:");
-                let (r, g, b) = (self.remote_color[0], self.remote_color[1], self.remote_color[2]);
-                ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
-                ui.weak("(chosen by the peer)");
-            });
-            // ---- Synth volume / mute (screen + peer sources) ----
-            ui.add_space(2.0);
-            ui.horizontal(|ui| self.synth_controls(ui));
-            // ---- Training-data capture (record mic audio + MIDI labels) ----
-            ui.add_space(2.0);
-            ui.horizontal(|ui| self.record_controls(ui));
-            ui.add_space(4.0);
-        });
+            },
+        );
 
         // ---- Bottom status bar ----
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1374,6 +1541,20 @@ impl eframe::App for PianoApp {
                 ui.label(model);
                 ui.separator();
                 ui.label(&self.net_status);
+                // While the history roll is scrolled back (or easing home), an
+                // instant way out: a deliberate click deserves an immediate
+                // snap, unlike the idle timer's gentle ease.
+                if self.scrollback.is_some() {
+                    ui.separator();
+                    if ui
+                        .small_button("⏵ Live")
+                        .on_hover_text("Jump back to the live edge")
+                        .clicked()
+                    {
+                        self.scrollback = None;
+                        self.scrollback_idle_since = None;
+                    }
+                }
                 // Version chip pinned to the right edge; opens the About window.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -1402,10 +1583,27 @@ impl eframe::App for PianoApp {
             let kb_h = (avail.y * KEYBOARD_FRACTION).max(MIN_KEYBOARD_H).min(avail.y);
 
             // Falling-notes panel first (it sits on top, ending at the keys).
-            let falling_resp = self.playback.as_ref().map(|_| {
-                let h = ((avail.y - kb_h).max(0.0) * FALLING_FRACTION).floor();
-                ui.allocate_response(egui::vec2(avail.x, h), egui::Sense::click_and_drag())
-            });
+            // Its height animates open/closed on file open/close — the one
+            // layout change big enough (up to 55% of the space under the
+            // keyboard, in one frame) to read as a jarring pop otherwise. The
+            // animate call must run every frame regardless of playback state
+            // so its stored value keeps decaying — satisfied here, since the
+            // CentralPanel closure always runs.
+            let falling_factor = ctx.animate_bool_with_time(
+                egui::Id::new("falling_panel_visible"),
+                self.playback.is_some(),
+                0.2,
+            );
+            let falling_full_h = ((avail.y - kb_h).max(0.0) * FALLING_FRACTION).floor();
+            let falling_h = (falling_full_h * falling_factor).floor();
+            let falling_resp = if falling_h > 0.0 {
+                Some(ui.allocate_response(
+                    egui::vec2(avail.x, falling_h),
+                    egui::Sense::click_and_drag(),
+                ))
+            } else {
+                None
+            };
 
             let response =
                 ui.allocate_response(egui::vec2(avail.x, kb_h), egui::Sense::click_and_drag());
@@ -1474,8 +1672,13 @@ impl eframe::App for PianoApp {
                 draw_keyboard(ui.painter(), rect, &self.local, &self.remote, colors);
             }
 
-            // Falling-panel interactions + drawing.
+            // Falling-panel interactions + drawing. The background is painted
+            // unconditionally: mid-close-animation the panel still has height
+            // but no playback to draw, and a bare "hole" would flash there.
+            // (`falling_panel_interactions` no-ops safely without playback.)
             if let Some(falling_resp) = falling_resp {
+                ui.painter()
+                    .rect_filled(falling_resp.rect, 0.0, egui::Color32::from_gray(18));
                 self.falling_panel_interactions(ui, &falling_resp, &keys);
                 if let Some(pb) = &self.playback {
                     draw_falling(
@@ -1486,6 +1689,7 @@ impl eframe::App for PianoApp {
                         pb.playhead_s,
                         pb.learn.key_range,
                         self.range_drag,
+                        self.falling_scrollback.unwrap_or(0.0),
                     );
                 }
             }
@@ -1494,25 +1698,26 @@ impl eframe::App for PianoApp {
             // reviews history; releasing eases back to the live edge. ----
             let roll_resp =
                 ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
-            if roll_resp.dragged() {
-                // Dragging up (negative delta.y) pulls older paper into view:
-                // a mark sits at y ∝ (view_top − t), so moving marks up means
-                // lowering the view-top time.
+            // Dragging up (negative delta.y) pulls older paper into view: a
+            // mark sits at y ∝ (view_top − t), so moving marks up means
+            // lowering the view-top time. Wheel/trackpad scroll does the same.
+            let roll_delta_px = scroll_or_drag_delta_y(ctx, &roll_resp);
+            if roll_delta_px != 0.0 {
                 let top = self.scrollback.unwrap_or(self.roll.now_s());
-                let new_top = (top + (roll_resp.drag_delta().y / ROLL_PX_PER_S) as f64)
+                let new_top = (top + (roll_delta_px / ROLL_PX_PER_S) as f64)
                     .clamp(0.0, self.roll.now_s());
                 self.scrollback = Some(new_top);
+                self.scrollback_idle_since = None;
             } else if let Some(top) = self.scrollback {
-                // Ease home exponentially (~0.2 s feel, frame-rate independent)
-                // and snap to live once within half a pixel.
-                let dt = ctx.input(|i| i.stable_dt) as f64;
-                let now = self.roll.now_s();
-                let eased = now + (top - now) * (-dt * 12.0).exp();
-                self.scrollback = if (now - eased).abs() < 0.5 / ROLL_PX_PER_S as f64 {
-                    None
-                } else {
-                    Some(eased)
-                };
+                // No input: hold the view for the idle window, then ease home.
+                let idle = *self.scrollback_idle_since.get_or_insert_with(Instant::now);
+                if idle.elapsed().as_secs_f64() >= SCROLLBACK_IDLE_S {
+                    let dt = ctx.input(|i| i.stable_dt) as f64;
+                    self.scrollback = ease_toward(top, self.roll.now_s(), dt);
+                    if self.scrollback.is_none() {
+                        self.scrollback_idle_since = None;
+                    }
+                }
             }
             let view_top_s = self.scrollback.unwrap_or(self.roll.now_s());
 
@@ -1777,6 +1982,31 @@ fn draw_roll(
     }
 }
 
+/// Net vertical input for a hand-rolled scrollable panel this frame: an
+/// active drag wins, otherwise wheel/trackpad scroll while hovered. The hover
+/// gate matters — `smooth_scroll_delta` is a global per-frame value, and
+/// without it a scroll over the config panel would leak into the rolls.
+fn scroll_or_drag_delta_y(ctx: &egui::Context, resp: &egui::Response) -> f32 {
+    if resp.dragged() {
+        resp.drag_delta().y
+    } else if resp.hovered() {
+        ctx.input(|i| i.smooth_scroll_delta.y)
+    } else {
+        0.0
+    }
+}
+
+/// Ease `current` toward `target` (frame-rate independent exponential),
+/// returning `None` once within half a roll-pixel — i.e. "arrived".
+fn ease_toward(current: f64, target: f64, dt: f64) -> Option<f64> {
+    let eased = target + (current - target) * (-dt * SCROLLBACK_EASE_RATE).exp();
+    if (target - eased).abs() < 0.5 / ROLL_PX_PER_S as f64 {
+        None
+    } else {
+        Some(eased)
+    }
+}
+
 /// The time ruler shared by both roll panels: a minor gridline every second,
 /// a major line + `mm:ss` label every ten. Iterates only the whole seconds
 /// in `[lo_s, hi_s]` — O(panel height), never O(session length) — and leaves
@@ -1841,15 +2071,31 @@ fn draw_falling(
     playhead_s: f64,
     key_range: Option<(u8, u8)>,
     range_drag: Option<(f32, f32)>,
+    scroll_offset_s: f64,
 ) {
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
 
-    // Future time -> y (f64 subtraction before the f32 cast, as in draw_roll).
-    let y_of = |t: f64| rect.bottom() - ((t - playhead_s) as f32) * ROLL_PX_PER_S;
-    let top_s = playhead_s + (rect.height() / ROLL_PX_PER_S) as f64;
+    // Wheel-scroll review shifts only this view time; the real playhead (and
+    // with it Learn gating and auto-play) is untouched by construction.
+    let view_playhead_s = playhead_s + scroll_offset_s;
 
-    draw_ruler(&painter, rect, playhead_s, top_s, y_of);
+    // Future time -> y (f64 subtraction before the f32 cast, as in draw_roll).
+    let y_of = |t: f64| rect.bottom() - ((t - view_playhead_s) as f32) * ROLL_PX_PER_S;
+    let top_s = view_playhead_s + (rect.height() / ROLL_PX_PER_S) as f64;
+
+    draw_ruler(&painter, rect, view_playhead_s, top_s, y_of);
+
+    // Make a scrubbed view unmistakable: this is a preview, not a seek.
+    if scroll_offset_s != 0.0 {
+        painter.text(
+            egui::pos2(rect.right() - 6.0, rect.top() + 4.0),
+            egui::Align2::RIGHT_TOP,
+            "previewing",
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_gray(140),
+        );
+    }
 
     // The Learn key-range band (and the in-progress drag preview): a
     // translucent column over the full panel height.
@@ -1896,7 +2142,7 @@ fn draw_falling(
                     continue;
                 }
                 // Cull: already fully past, or not yet inside the window.
-                if n.end_s <= playhead_s || n.start_s > top_s {
+                if n.end_s <= view_playhead_s || n.start_s > top_s {
                     continue;
                 }
                 let y_top = y_of(n.end_s);

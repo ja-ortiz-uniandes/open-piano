@@ -30,6 +30,11 @@ pub const MODEL: &[u8] = include_bytes!("../model.onnx");
 /// ONNX Runtime shared library (Windows x64).
 const ONNXRUNTIME_DLL: &[u8] = include_bytes!("../onnxruntime.dll");
 
+/// Window/taskbar icon (the `.exe` file icon is embedded separately via
+/// `build.rs` + `assets/icon.ico`). Unlike the model/runtime this is small
+/// and committed to the repo — no download step involved.
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
 /// Make the embedded ONNX Runtime loadable and set `ORT_DYLIB_PATH` to it.
 ///
 /// Called once from `main()` **before** the inference thread starts. This is

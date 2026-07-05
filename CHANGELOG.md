@@ -4,6 +4,33 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-05
+
+### Added
+
+- **App icon.** The window/taskbar and the compiled `.exe`'s file icon now
+  show the open-piano logo instead of the default.
+- **Scroll the piano rolls.** Both the history roll and the falling-notes
+  panel now respond to the wheel/trackpad, not just drag. A scrolled view
+  holds still for a couple seconds, then eases back to live/now on its own;
+  a "⏵ Live" button gives an instant way back. Scrubbing the falling panel is
+  purely a preview — it never touches the real playhead or Learn-mode gating.
+- **Key range now filters sound, not just gating.** The pitch-range band you
+  drag across the falling notes (Learn's "Key range") now actually mutes
+  out-of-range notes in both Listen mode's auto-play and Learn mode's
+  unpracticed track — previously it only scoped which notes were *required*.
+  The readout moved out of the Learn-only panel so it's visible in Listen
+  mode too.
+- **Collapsible panels.** The top settings panel collapses to a thin title
+  strip via a chevron, and the Learn side panel collapses via a "‹"/"›"
+  arrow — both to reclaim screen space.
+
+### Changed
+
+- Opening/closing a file no longer pops the layout instantly: the
+  falling-notes panel now slides in/out, and the networking controls stay in
+  place (greyed out) instead of being replaced by a status line.
+
 ## [0.3.0] - 2026-07-04
 
 ### Added

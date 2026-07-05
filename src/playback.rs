@@ -274,7 +274,15 @@ impl PlaybackEngine {
                 }
                 continue;
             }
-            let now: BTreeSet<u8> = self.active_at(who, self.playhead_s).map(|n| n.midi).collect();
+            // The key range scopes what's *audible* too, not just what's
+            // required: with a band set, out-of-range notes neither auto-play
+            // here nor light up in `active_key_array` — one consistent meaning
+            // for the single "Key range" control, in both modes.
+            let now: BTreeSet<u8> = self
+                .active_at(who, self.playhead_s)
+                .map(|n| n.midi)
+                .filter(|&m| self.in_key_range(m))
+                .collect();
             for &m in now.difference(&self.sounding[idx]) {
                 synth.note_on(m, Channel::Playback);
             }
@@ -350,11 +358,15 @@ impl PlaybackEngine {
 
     /// Key-state array for one track's currently-active notes, for the
     /// layered keyboard renderer (only meaningful for unpracticed tracks).
+    /// Scoped to the key range like `drive_auto`, so the lit keys always
+    /// match what's audible.
     pub fn active_key_array(&self, who: Who) -> [bool; KEY_COUNT] {
         let mut out = [false; KEY_COUNT];
         for n in self.active_at(who, self.playhead_s) {
-            if let Some(i) = midi_to_key_index(n.midi) {
-                out[i] = true;
+            if self.in_key_range(n.midi) {
+                if let Some(i) = midi_to_key_index(n.midi) {
+                    out[i] = true;
+                }
             }
         }
         out
@@ -479,6 +491,21 @@ mod tests {
         assert!((pb.playhead_s - 3.0).abs() < 1e-9);
         pb.tick(0.1, &held(&[64]), &synth);
         assert!(pb.playhead_s > 3.0);
+    }
+
+    #[test]
+    fn key_range_scopes_active_keys() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.jump_to(3.5, &synth); // inside the local 62+64 chord
+        let idx = |m: u8| midi_to_key_index(m).unwrap();
+
+        let keys = pb.active_key_array(Who::Local);
+        assert!(keys[idx(62)] && keys[idx(64)]); // no range: whole chord lit
+
+        pb.learn.key_range = Some((63, 80)); // excludes 62, includes 64
+        let keys = pb.active_key_array(Who::Local);
+        assert!(!keys[idx(62)], "out-of-range note must not light up");
+        assert!(keys[idx(64)], "in-range note must still light up");
     }
 
     #[test]
