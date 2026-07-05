@@ -53,7 +53,18 @@ audio transcribed by an ONNX model. See README for the product goal.
   fire-and-forget latency model (and identical wire bytes) as the original
   raw-UDP transport.
 - **`note.rs`** — `NoteMsg` (On/Off), MIDI helpers, and the **wire protocol**
-  (`Packet`): note bytes `[0x90|0x80, note]`, color `[0xC0, r, g, b]`.
+  (`Packet`): note bytes `[0x90|0x80, note]`, color `[0xC0, r, g, b]`, metronome
+  beat `[0xB0, ...]` and control `[0xB1, ...]`. The synced metronome (host is the
+  timing anchor; beat markers carry an RTT-derived one-way stamp added in
+  `net.rs`) lives in `main.rs` (`Metronome`, `drive_metronome`) + `synth.rs`
+  (`Channel::Metronome` click voice).
+- **`prefs.rs`** — serde `Prefs` (+ `Limit`), persisted to
+  `%LOCALAPPDATA%\open-piano\preferences.json` (atomic temp+rename;
+  `#[serde(default)]` on every field). Loaded in `main`'s `new()`, edited via
+  Edit ▸ Preferences, saved on change. Live-editable detector knobs reach the
+  inference thread via the `SharedF32`/`InferenceTunables` atomics in `audio.rs`.
+  The window uses **custom chrome** (`with_decorations(false)` + `title_bar`), so
+  File/Edit and the min/max/close buttons are drawn by us.
 - **`record.rs`** — `Recorder` handle + background writer thread. Writes
   `recordings/session_<unix>/{audio.wav, midi.jsonl, meta.json}`. All disk I/O is
   off the realtime callbacks.

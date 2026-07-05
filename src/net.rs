@@ -72,8 +72,19 @@ pub enum NetEvent {
     /// The peer connection dropped. A host keeps listening for a rejoin;
     /// a joiner must press Join again.
     Disconnected,
-    /// A decoded packet from the peer (note event or color announcement).
+    /// A decoded packet from the peer (note event, color, or metronome control).
     Packet(Packet),
+    /// A metronome beat marker from the host, split out from `Packet` so we can
+    /// stamp `one_way` — half the current QUIC RTT, measured on the net thread
+    /// where it's freshest — which the follower uses to phase-align its local
+    /// click schedule with the host's (see `main.rs`).
+    MetroBeat {
+        bpm: u16,
+        beat_in_bar: u8,
+        beats_per_bar: u8,
+        on: bool,
+        one_way: Duration,
+    },
 }
 
 /// A live networking session (hosting or joining). Dropping it disconnects
@@ -309,7 +320,25 @@ async fn relay_session(
             datagram = conn.read_datagram() => match datagram {
                 Ok(bytes) => {
                     if let Some(packet) = Packet::decode(&bytes) {
-                        if events.send(NetEvent::Packet(packet)).is_err() {
+                        // Metronome markers carry an RTT-derived one-way estimate,
+                        // stamped here where the RTT is freshest; everything else
+                        // rides the generic Packet event.
+                        let event = match packet {
+                            Packet::MetroBeat { bpm, beat_in_bar, beats_per_bar, on } => {
+                                let rtt = conn
+                                    .rtt(iroh::endpoint::PathId::ZERO)
+                                    .unwrap_or_default();
+                                NetEvent::MetroBeat {
+                                    bpm,
+                                    beat_in_bar,
+                                    beats_per_bar,
+                                    on,
+                                    one_way: rtt / 2,
+                                }
+                            }
+                            other => NetEvent::Packet(other),
+                        };
+                        if events.send(event).is_err() {
                             conn.close(0u32.into(), b"closed");
                             return SessionEnd::UiGone;
                         }
@@ -398,5 +427,22 @@ mod tests {
         };
         exchange(&joiner, &host, Packet::Note(NoteMsg::On(60)), "note at host");
         exchange(&host, &joiner, Packet::Color([1, 2, 3]), "color at joiner");
+
+        // Metronome beat markers surface as a distinct `NetEvent::MetroBeat`
+        // (with an RTT-derived one-way stamp), not a generic `Packet` event.
+        let mut got_beat = false;
+        for _ in 0..100 {
+            host.send(Packet::MetroBeat { bpm: 128, beat_in_bar: 2, beats_per_bar: 4, on: true });
+            match joiner.events.recv_timeout(Duration::from_millis(500)) {
+                Ok(NetEvent::MetroBeat { bpm, beat_in_bar, beats_per_bar, on, .. }) => {
+                    assert_eq!((bpm, beat_in_bar, beats_per_bar, on), (128, 2, 4, true));
+                    got_beat = true;
+                    break;
+                }
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!("waiting for metro beat: {e}"),
+            }
+        }
+        assert!(got_beat, "never received a metronome beat marker");
     }
 }

@@ -30,13 +30,14 @@ use std::time::Duration;
 
 use midir::MidiInputConnection;
 
-use crate::audio::{self, AudioHandle, EngineStatus, Threshold};
+use crate::audio::{self, AudioHandle, EngineStatus, InferenceTunables, Threshold};
 use crate::midi;
 use crate::note::NoteMsg;
 use crate::record::Recorder;
 
-/// How often the supervisor rescans the MIDI port list for hot-plug changes.
-const POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// Floor on the MIDI rescan interval, so a preference of 0 can't spin the
+/// supervisor. The interval itself is live-editable (see `midi_poll_ms`).
+const MIN_POLL_MS: u64 = 100;
 
 // `source` atomic encoding (it's read by the UI thread).
 const SRC_DETECTING: u8 = 0;
@@ -56,6 +57,12 @@ pub enum Source {
 pub struct InputEngine {
     pub notes: Receiver<NoteMsg>,
     pub threshold: Threshold,
+    /// Live-editable ONNX/DSP tunables shared with the inference thread
+    /// (Preferences ▸ Advanced writes them; the detector reads them each hop).
+    pub tunables: InferenceTunables,
+    /// Live-editable MIDI-port rescan interval (ms); the supervisor reads it
+    /// each loop. Written by Preferences ▸ Advanced.
+    pub midi_poll_ms: Arc<AtomicU64>,
     pub status: Arc<Mutex<EngineStatus>>,
     /// Training-data capture harness. The UI arms/disarms it and reads its
     /// status; the supervisor drives the actual session lifecycle.
@@ -101,7 +108,11 @@ impl Drop for InputEngine {
 /// Spawn the input supervisor and return immediately. The first poll runs right
 /// away, so a connected MIDI device or the mic fallback comes up within
 /// milliseconds; thereafter the supervisor reacts to hot-plug changes.
-pub fn start(initial_threshold: f32) -> InputEngine {
+pub fn start(
+    initial_threshold: f32,
+    tunables: InferenceTunables,
+    initial_midi_poll_ms: u64,
+) -> InputEngine {
     let threshold = Threshold::new(initial_threshold);
     let (note_tx, note_rx) = mpsc::channel::<NoteMsg>();
     let status = Arc::new(Mutex::new(EngineStatus {
@@ -111,24 +122,34 @@ pub fn start(initial_threshold: f32) -> InputEngine {
     let source = Arc::new(AtomicU8::new(SRC_DETECTING));
     let epoch = Arc::new(AtomicU64::new(0));
     let stop_all = Arc::new(AtomicBool::new(false));
+    let midi_poll_ms = Arc::new(AtomicU64::new(initial_midi_poll_ms));
     let recorder = Recorder::new();
 
     let supervisor = {
         let threshold = threshold.clone();
+        let tunables = tunables.clone();
         let status = Arc::clone(&status);
         let source = Arc::clone(&source);
         let epoch = Arc::clone(&epoch);
         let stop_all = Arc::clone(&stop_all);
+        let midi_poll_ms = Arc::clone(&midi_poll_ms);
         let recorder = recorder.clone();
         thread::Builder::new()
             .name("input-supervisor".into())
-            .spawn(move || supervise(note_tx, threshold, status, source, epoch, stop_all, recorder))
+            .spawn(move || {
+                supervise(
+                    note_tx, threshold, tunables, status, source, epoch, stop_all, midi_poll_ms,
+                    recorder,
+                )
+            })
             .expect("failed to spawn input supervisor thread")
     };
 
     InputEngine {
         notes: note_rx,
         threshold,
+        tunables,
+        midi_poll_ms,
         status,
         recorder,
         source,
@@ -151,13 +172,16 @@ enum Active {
 
 /// Supervisor loop: poll MIDI ports and keep exactly one backend live, MIDI
 /// preferred. Runs until `stop_all` is set (i.e. the `InputEngine` is dropped).
+#[allow(clippy::too_many_arguments)]
 fn supervise(
     note_tx: Sender<NoteMsg>,
     threshold: Threshold,
+    tunables: InferenceTunables,
     status: Arc<Mutex<EngineStatus>>,
     source: Arc<AtomicU8>,
     epoch: Arc<AtomicU64>,
     stop_all: Arc<AtomicBool>,
+    midi_poll_ms: Arc<AtomicU64>,
     recorder: Recorder,
 ) {
     let mut active = Active::None;
@@ -202,14 +226,14 @@ fn supervise(
                     }
                     Err(e) => {
                         eprintln!("[input] MIDI connect failed ({e}); using microphone");
-                        start_mic(&note_tx, &threshold, &status, &source)
+                        start_mic(&note_tx, &threshold, &tunables, &status, &source)
                     }
                 };
             }
         } else if matches!(active, Active::None) {
             // 3) No MIDI device at all: bring up the mic fallback (lazily — only
             //    when there's nothing better, and only if not already running).
-            active = start_mic(&note_tx, &threshold, &status, &source);
+            active = start_mic(&note_tx, &threshold, &tunables, &status, &source);
         }
 
         // Reconcile the recording harness with the UI's Record toggle. A session
@@ -217,7 +241,10 @@ fn supervise(
         // callback (already teeing) logs labels whenever a device is connected.
         reconcile_recording(&recorder, &mut record_capture);
 
-        sleep_unless_stopped(&stop_all, POLL_INTERVAL);
+        // Live poll interval (Preferences ▸ Advanced), floored so a tiny value
+        // can't busy-spin the supervisor.
+        let poll = Duration::from_millis(midi_poll_ms.load(Ordering::Relaxed).max(MIN_POLL_MS));
+        sleep_unless_stopped(&stop_all, poll);
     }
 
     // App is shutting down: finalize any open recording, then stop the live mic
@@ -250,6 +277,7 @@ fn reconcile_recording(recorder: &Recorder, record_capture: &mut Option<AudioHan
 fn start_mic(
     note_tx: &Sender<NoteMsg>,
     threshold: &Threshold,
+    tunables: &InferenceTunables,
     status: &Arc<Mutex<EngineStatus>>,
     source: &Arc<AtomicU8>,
 ) -> Active {
@@ -257,7 +285,12 @@ fn start_mic(
         s.device = "Mic: initializing…".to_string();
         s.model = "Model: loading…".to_string();
     }
-    let handle = audio::start_into(note_tx.clone(), threshold.clone(), Arc::clone(status));
+    let handle = audio::start_into(
+        note_tx.clone(),
+        threshold.clone(),
+        tunables.clone(),
+        Arc::clone(status),
+    );
     source.store(SRC_MIC, Ordering::Relaxed);
     Active::Mic(handle)
 }

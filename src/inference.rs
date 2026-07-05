@@ -25,7 +25,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::audio::{EngineStatus, Threshold};
+use crate::audio::{EngineStatus, InferenceTunables, Threshold};
 use crate::note::{NoteMsg, KEY_COUNT, MIDI_LOW};
 
 /// Model input sample rate (Hz).
@@ -63,12 +63,17 @@ const ONSET_TAIL: usize = 12;
 /// dips in a decaying note without clipping it short.
 const RELEASE_HOPS: u8 = 2;
 
-/// Frame-grid probability below which a sounding note is considered released.
-/// This is the sustain/linger knob: lower = notes hold longer while decaying
-/// (and linger longer after you lift), higher = snappier release but shorter
-/// sustain. Onset triggering (below) handles *starting* notes, so this only
-/// governs how long a note stays lit once started.
-const FRAME_OFF: f32 = 0.10;
+// NOTE: the former `FRAME_OFF`, `SILENCE_RMS` and `NORM_MAX_GAIN` constants are
+// now live-editable [`InferenceTunables`] (Preferences ▸ Advanced), read from
+// shared cells each hop instead of baked in. Their tuning guidance moved to the
+// read sites in `run`/`infer` and to `prefs.rs`'s defaults:
+//   * frame_off   — sustain/linger knob: lower = notes hold longer while
+//                   decaying; higher = snappier release. Default 0.10.
+//   * silence_rms — raw RMS below which a window is silence (inference skipped).
+//                   Set just above the mic idle floor (~0.0011–0.0017); quietest
+//                   real notes ≈ 0.002–0.008. Default 0.002.
+//   * norm_max_gain — hard cap on the normalization gain; too high blows idle
+//                   hiss up into phantom onsets. Default 10.0.
 
 /// Consecutive hops the note/frame probability must hold above the trigger
 /// threshold before Note On. This debounce is what suppresses near-threshold
@@ -86,22 +91,9 @@ const ATTACK_HOPS: u8 = 2;
 /// can't fire. Lower = more attacks go instant (less flicker protection).
 const ONSET_TRIG: f32 = 0.3;
 
-/// Below this *raw* (pre-normalization) RMS the window is treated as silence and
-/// inference is skipped. Set this just above the mic's idle noise floor so room
-/// hiss isn't amplified into phantom notes. Watch the `raw=` value in the debug
-/// line: pick a number comfortably above idle but below your quietest real note.
-/// Measured idle floor ≈ 0.0011–0.0017; quietest real notes ≈ 0.002–0.008.
-const SILENCE_RMS: f32 = 2.0e-3;
-
 /// Normalization target: the window is scaled so its RMS approaches this before
 /// inference, so you don't have to play loud. Higher = louder model input.
 const NORM_TARGET_RMS: f32 = 0.1;
-
-/// Hard cap on the normalization gain. This is the knob that controls how much
-/// quiet input (including idle hiss) gets boosted: at 30× near-silence was blown
-/// up into noise the *onset* detector fired on (idle onset max 0.54–0.75). Lower
-/// it until idle no longer produces phantom onset activations in the debug line.
-const NORM_MAX_GAIN: f32 = 10.0;
 
 /// Detection thread entry point. Loads the model, then loops forever consuming
 /// resampled audio and emitting note transitions. Returns (ending the thread)
@@ -110,6 +102,7 @@ pub fn run(
     raw_rx: Receiver<Vec<f32>>,
     note_tx: Sender<NoteMsg>,
     threshold: Threshold,
+    tunables: InferenceTunables,
     device_sr: u32,
     status: Arc<Mutex<EngineStatus>>,
 ) {
@@ -169,11 +162,17 @@ pub fn run(
         let take = window.len().min(N_SAMPLES);
         input[N_SAMPLES - take..].copy_from_slice(&window[window.len() - take..]);
 
+        // Read the live tunables once per hop (see InferenceTunables): silence
+        // gate, release threshold, and the normalization gain cap.
+        let silence_rms = tunables.silence_rms.get();
+        let frame_off = tunables.frame_off.get();
+        let norm_max_gain = tunables.norm_max_gain.get();
+
         // Per-key note (frame) and onset probabilities (empty == silence).
-        let Frames { note, onset } = if rms(&input) < SILENCE_RMS {
+        let Frames { note, onset } = if rms(&input) < silence_rms {
             Frames::default()
         } else {
-            infer(&mut session, &input)
+            infer(&mut session, &input, norm_max_gain)
         };
         let onset_gating = !onset.is_empty();
 
@@ -186,8 +185,8 @@ pub fn run(
             let note_p = note.get(k).copied().unwrap_or(0.0);
             if on[m] {
                 // Sustain on the frame grid: release only once it stays below
-                // FRAME_OFF for RELEASE_HOPS (keeps decaying notes alive).
-                if note_p < FRAME_OFF {
+                // frame_off for RELEASE_HOPS (keeps decaying notes alive).
+                if note_p < frame_off {
                     absent[m] = absent[m].saturating_add(1);
                     if absent[m] >= RELEASE_HOPS {
                         on[m] = false;
@@ -252,10 +251,10 @@ struct Frames {
 }
 
 /// Run one inference pass and return the note (frame) and onset grids per key.
-fn infer(session: &mut Session, audio: &[f32]) -> Frames {
+fn infer(session: &mut Session, audio: &[f32], norm_max_gain: f32) -> Frames {
     // Level-normalize so quiet mic input still drives the model (see fn below).
     let raw_rms = rms(audio);
-    let normalized = normalize_for_model(audio);
+    let normalized = normalize_for_model(audio, norm_max_gain);
     let tensor = match Tensor::from_array((vec![1_i64, normalized.len() as i64, 1_i64], normalized)) {
         Ok(t) => t,
         Err(e) => {
@@ -314,7 +313,7 @@ fn infer(session: &mut Session, audio: &[f32]) -> Frames {
             .map(|i| tail_reduce(&cands[i], Reduce::Max, ONSET_TAIL))
             .unwrap_or_default(),
     };
-    debug_log_outputs(&cands, note_idx, onset_idx, raw_rms, &frames);
+    debug_log_outputs(&cands, note_idx, onset_idx, raw_rms, norm_max_gain, &frames);
     frames
 }
 
@@ -410,16 +409,16 @@ fn rms(buf: &[f32]) -> f32 {
 /// is capped so near-silence isn't blown up into noise — and the caller already
 /// skips windows below `SILENCE_RMS`. Output is clamped to [-1, 1] to avoid
 /// out-of-range distortion.
-fn normalize_for_model(audio: &[f32]) -> Vec<f32> {
-    let gain = norm_gain(rms(audio));
+fn normalize_for_model(audio: &[f32], norm_max_gain: f32) -> Vec<f32> {
+    let gain = norm_gain(rms(audio), norm_max_gain);
     audio.iter().map(|x| (x * gain).clamp(-1.0, 1.0)).collect()
 }
 
 /// Gain `normalize_for_model` applies for a given raw RMS (shared so the debug
 /// line can report the exact gain without recomputing it differently).
-fn norm_gain(raw_rms: f32) -> f32 {
+fn norm_gain(raw_rms: f32, norm_max_gain: f32) -> f32 {
     if raw_rms > 1.0e-6 {
-        (NORM_TARGET_RMS / raw_rms).min(NORM_MAX_GAIN)
+        (NORM_TARGET_RMS / raw_rms).min(norm_max_gain)
     } else {
         1.0
     }
@@ -437,6 +436,7 @@ fn debug_log_outputs(
     note_idx: usize,
     onset_idx: Option<usize>,
     raw_rms: f32,
+    norm_max_gain: f32,
     frames: &Frames,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -444,7 +444,7 @@ fn debug_log_outputs(
     if COUNT.fetch_add(1, Ordering::Relaxed) % 40 != 0 {
         return;
     }
-    let mut line = format!("raw={raw_rms:.5} gain={:.1}", norm_gain(raw_rms));
+    let mut line = format!("raw={raw_rms:.5} gain={:.1}", norm_gain(raw_rms, norm_max_gain));
     for (i, c) in cands.iter().enumerate() {
         let mean = c.data.iter().sum::<f32>() / c.data.len().max(1) as f32;
         let max = c.data.iter().copied().fold(0.0f32, f32::max);

@@ -52,16 +52,40 @@ pub enum Packet {
     Note(NoteMsg),
     /// The sender's chosen display color, as sRGB `[r, g, b]`.
     Color([u8; 3]),
+    /// Metronome beat marker, broadcast by the host on **each** beat. Carries
+    /// enough to (re)derive the grid (`bpm`, `beats_per_bar`), the accent
+    /// (`beat_in_bar == 0` = downbeat), and to toggle the follower on/off
+    /// (`on`). The follower anchors its local click schedule to when this
+    /// arrives (see `net.rs` / `main.rs`). Status byte `0xB0`.
+    MetroBeat {
+        bpm: u16,
+        beat_in_bar: u8,
+        beats_per_bar: u8,
+        on: bool,
+    },
+    /// Metronome control request, follower → host: set the running state and
+    /// tempo. The host adopts it as the new authoritative grid and echoes it
+    /// back via `MetroBeat`s (last-writer-wins, single scheduler). Status `0xB1`.
+    MetroCtl { on: bool, bpm: u16 },
 }
 
 impl Packet {
     /// Encode to the wire format. Notes are the existing 2-byte form (`0x90`/
-    /// `0x80`); a color is `[0xC0, r, g, b]`. `0xC0` never collides with the note
-    /// status bytes, so `decode` is unambiguous.
+    /// `0x80`); a color is `[0xC0, r, g, b]`; metronome markers/control use
+    /// `0xB0`/`0xB1`. None of these status bytes collide, so `decode` is
+    /// unambiguous. (`bpm` is big-endian u16.)
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Packet::Note(n) => n.encode().to_vec(),
             Packet::Color([r, g, b]) => vec![0xC0, *r, *g, *b],
+            Packet::MetroBeat { bpm, beat_in_bar, beats_per_bar, on } => {
+                let [hi, lo] = bpm.to_be_bytes();
+                vec![0xB0, hi, lo, *beat_in_bar, *beats_per_bar, *on as u8]
+            }
+            Packet::MetroCtl { on, bpm } => {
+                let [hi, lo] = bpm.to_be_bytes();
+                vec![0xB1, *on as u8, hi, lo]
+            }
         }
     }
 
@@ -70,8 +94,46 @@ impl Packet {
         match buf.first()? {
             0x90 | 0x80 => NoteMsg::decode(buf).map(Packet::Note),
             0xC0 if buf.len() >= 4 => Some(Packet::Color([buf[1], buf[2], buf[3]])),
+            0xB0 if buf.len() >= 6 => Some(Packet::MetroBeat {
+                bpm: u16::from_be_bytes([buf[1], buf[2]]),
+                beat_in_bar: buf[3],
+                beats_per_bar: buf[4],
+                on: buf[5] != 0,
+            }),
+            0xB1 if buf.len() >= 4 => Some(Packet::MetroCtl {
+                on: buf[1] != 0,
+                bpm: u16::from_be_bytes([buf[2], buf[3]]),
+            }),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_encode_decode_roundtrips() {
+        for p in [
+            Packet::Note(NoteMsg::On(60)),
+            Packet::Note(NoteMsg::Off(21)),
+            Packet::Color([220, 60, 60]),
+            Packet::MetroBeat { bpm: 120, beat_in_bar: 0, beats_per_bar: 4, on: true },
+            Packet::MetroBeat { bpm: 240, beat_in_bar: 3, beats_per_bar: 4, on: false },
+            Packet::MetroCtl { on: true, bpm: 90 },
+            Packet::MetroCtl { on: false, bpm: 200 },
+        ] {
+            assert_eq!(Packet::decode(&p.encode()), Some(p), "roundtrip {p:?}");
+        }
+    }
+
+    #[test]
+    fn decode_rejects_truncated_and_unknown() {
+        assert_eq!(Packet::decode(&[]), None);
+        assert_eq!(Packet::decode(&[0xB0, 0, 120]), None); // too short for MetroBeat
+        assert_eq!(Packet::decode(&[0xB1, 1]), None); // too short for MetroCtl
+        assert_eq!(Packet::decode(&[0x7F, 0, 0]), None); // unknown status
     }
 }
 

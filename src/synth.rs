@@ -51,10 +51,14 @@ pub enum Channel {
     /// playback must drive `Synth::note_on/off` directly, never through
     /// `synth_note_on`/`synth_note_off`.
     Playback = 2,
+    /// The metronome click (see `Synth::tick`). A player mutes their own click
+    /// by setting this channel's gain to 0 — purely local, so it never affects
+    /// the peer's click.
+    Metronome = 3,
 }
 
 /// Number of distinct channels; sizes the per-channel gain table.
-const CHANNELS: usize = 3;
+const CHANNELS: usize = 4;
 
 /// A command from the GUI thread to the audio callback.
 enum Cmd {
@@ -63,6 +67,9 @@ enum Cmd {
     /// Set a channel's output gain (0.0 = silent). Applied per sample, so it
     /// fades notes already sounding, not just future ones.
     Gain(Channel, f32),
+    /// Fire a one-shot metronome click (`accent` = the downbeat: higher and
+    /// louder). Routed through `Channel::Metronome`.
+    Tick(bool),
 }
 
 /// Where a voice is in its amplitude envelope.
@@ -120,6 +127,13 @@ struct SynthState {
     sample_rate: f32,
     /// Per-channel output gain (indexed by `Channel as usize`). 0.0 mutes.
     gain: [f32; CHANNELS],
+    /// Metronome click: a short percussive sine blip, separate from the
+    /// harmonic voices. Only one sounds at a time (a new tick retriggers it).
+    click_env: f32,   // current amplitude, 0..1 (0 = silent)
+    click_phase: f32, // 0..1
+    click_inc: f32,   // phase advance per sample = click freq / sample_rate
+    click_decay: f32, // per-sample env multiplier (fast, ~30 ms tail)
+    click_amp: f32,   // peak amplitude of the current click (accent = louder)
 }
 
 impl SynthState {
@@ -128,7 +142,24 @@ impl SynthState {
             voices: [Voice::IDLE; MAX_VOICES],
             sample_rate,
             gain: [1.0; CHANNELS],
+            click_env: 0.0,
+            click_phase: 0.0,
+            click_inc: 0.0,
+            // ~12 ms time constant → the blip decays to near-silence in ~30 ms,
+            // a tight percussive tick rather than a lingering beep.
+            click_decay: (-1.0 / (0.012 * sample_rate)).exp(),
+            click_amp: 0.0,
         }
+    }
+
+    /// Fire a one-shot metronome click. Accent (the downbeat) is higher-pitched
+    /// and louder so the bar's first beat stands out.
+    fn trigger_click(&mut self, accent: bool) {
+        let freq = if accent { 1800.0 } else { 1200.0 };
+        self.click_inc = freq / self.sample_rate;
+        self.click_phase = 0.0;
+        self.click_env = 1.0;
+        self.click_amp = if accent { 1.1 } else { 0.75 };
     }
 
     /// Start (or retrigger) the given note on a channel: reuse a voice already on
@@ -215,6 +246,21 @@ impl SynthState {
                 v.phase -= 1.0;
             }
         }
+
+        // Metronome click: one percussive sine blip, scaled by its own channel
+        // gain (0 = this player muted their click locally).
+        if self.click_env > 0.0008 {
+            let s = (std::f32::consts::TAU * self.click_phase).sin();
+            mix += s * self.click_env * self.click_amp * self.gain[Channel::Metronome as usize];
+            self.click_phase += self.click_inc;
+            if self.click_phase >= 1.0 {
+                self.click_phase -= 1.0;
+            }
+            self.click_env *= self.click_decay;
+        } else {
+            self.click_env = 0.0;
+        }
+
         // Soft clamp so dense chords can't blow past full-scale.
         (mix * MASTER_GAIN).clamp(-1.0, 1.0)
     }
@@ -277,6 +323,12 @@ impl Synth {
         let _ = self.cmd_tx.send(Cmd::Gain(channel, gain));
     }
 
+    /// Fire a one-shot metronome click on [`Channel::Metronome`]. `accent` marks
+    /// the downbeat (higher pitch + louder). Cheap and lock-free like the rest.
+    pub fn tick(&self, accent: bool) {
+        let _ = self.cmd_tx.send(Cmd::Tick(accent));
+    }
+
     /// Stop the audio thread and wait for it to wind down.
     #[allow(dead_code)]
     pub fn stop(mut self) {
@@ -321,6 +373,7 @@ fn output_loop(
                     Cmd::On(m, ch) => state.note_on(m, ch),
                     Cmd::Off(m, ch) => state.note_off(m, ch),
                     Cmd::Gain(ch, g) => state.gain[ch as usize] = g,
+                    Cmd::Tick(accent) => state.trigger_click(accent),
                 }
             }
             for frame in $data.chunks_mut($channels) {

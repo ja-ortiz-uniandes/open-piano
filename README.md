@@ -48,6 +48,26 @@ Working today:
   the audio spectrogram and measures the audio↔MIDI latency offset, so you can
   confirm a recording is well-aligned before relying on it.
   (`verify_alignment.py`)
+- **Synced metronome.** A shared click both players hear together: the host is
+  the timing anchor and either player can set the tempo or start/stop it (a
+  guest's change is adopted by the host, so there's one grid, never two duelling
+  clocks). Each player can mute *their own* click locally without silencing the
+  other. Solo, it's just a plain metronome. (`src/synth.rs`, `src/main.rs`)
+- **Preferences, persisted.** An **Edit ▸ Preferences** dialog (Ctrl+,)
+  consolidates the roll timing, appearance, mic, and advanced model/network
+  tunables, saved to `%LOCALAPPDATA%\open-piano\preferences.json` and restored
+  on launch. An **Advanced** section (behind an expander, with a Reset) exposes
+  the detector knobs that used to be compile-time constants, live-editable while
+  you play. (`src/prefs.rs`)
+- **Custom window chrome.** The app draws its own title bar — File/Edit menus on
+  the left, minimize/maximize/close on the right — so the menus are always the
+  topmost row, with window drag, double-click-to-maximize, and edge resizing.
+  (`src/main.rs`)
+- **Configurable roll timing.** The piano roll now preserves the *real* silence
+  between phrases: a gap in your playing shows as that much blank paper, up to a
+  cap (default 20 s) and an idle-pause threshold (default 30 s) — each settable
+  in Preferences, and each switchable to **∞** (never clamp / never auto-pause)
+  for a truly unbounded gap. (`src/roll.rs`)
 
 Known limitation: the microphone path is **laggy and imprecise** today — Basic
 Pitch is an offline model run in a sliding window, so attacks appear late,

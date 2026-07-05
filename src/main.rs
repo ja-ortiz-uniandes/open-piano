@@ -22,6 +22,7 @@ mod midi;
 mod net;
 mod note;
 mod playback;
+mod prefs;
 mod record;
 mod roll;
 mod score;
@@ -73,6 +74,13 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1100.0, 620.0])
             .with_min_inner_size([640.0, 420.0])
             .with_icon(icon)
+            // Custom window chrome: we draw our own title bar (File/Edit menus,
+            // min/max/close) so the menus are always the topmost row, and add
+            // our own edge-resize handles (see `title_bar`). `with_title` still
+            // sets the taskbar/alt-tab label. NOTE: Windows 11 snap-layouts (the
+            // hover menu over the maximize button) need WM_NCHITTEST hooks that
+            // winit/egui don't expose, so they're unavailable with custom chrome.
+            .with_decorations(false)
             .with_title(concat!(
                 "open-piano v",
                 env!("CARGO_PKG_VERSION"),
@@ -93,13 +101,11 @@ fn main() -> eframe::Result<()> {
 /// GitHub Releases.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Default model posterior probability above which a note counts as "on".
-/// 0.3 matches Basic Pitch's own default frame threshold; lower = more
-/// sensitive (use the slider to tune for your room/mic).
-const DEFAULT_THRESHOLD: f32 = 0.3;
-
-/// Default note colors (sRGB). Each player can change *their own* (the local
-/// one); it is sent over the wire so the peer renders this player in this color.
+/// Default note colors (sRGB). The live *local* color is seeded from
+/// [`prefs::Prefs`] (user-configurable and persisted); these constants remain
+/// the compile-time fallbacks — `DEFAULT_LOCAL_COLOR` also colors a loaded
+/// file's Local track (see `score.rs`), and `DEFAULT_REMOTE_COLOR` is transient
+/// (overwritten the moment the peer announces its own color).
 const DEFAULT_LOCAL_COLOR: [u8; 3] = [220, 60, 60]; // warm red
 const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (until the peer announces theirs)
 
@@ -108,25 +114,10 @@ const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (until the peer an
 /// announcement, at a negligible 1 datagram/sec.
 const COLOR_HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// How long, *after* the built-in synth stops voicing a note, to keep ignoring
-/// mic-detected onsets of that same note (see the echo guard in `pump_input`).
-/// The synth's own tone leaks through the speakers into the microphone, where
-/// inference re-detects it as a played note — an echo loop that, combined with
-/// the detector's release hysteresis, leaves a key lit long after you let go.
-/// While a note is actively voiced it's suppressed unconditionally; this window
-/// only has to cover the post-release tail (the synth's ~1.3 s release fade plus
-/// margin), so the key doesn't flicker back on as the tone rings out.
-const ECHO_HOLDOFF: Duration = Duration::from_millis(2000);
+// The mic echo hold-off, roll zoom (px/s), scrollback idle window, detection
+// threshold and default local color are now user preferences (see prefs.rs) —
+// read live from `self.prefs` at their use sites instead of compile-time consts.
 
-/// Pixels of paper per second of roll time in the history strip under the
-/// keyboard. 40 px/s shows ~6 s in the default window, and even a staccato
-/// click leaves a visible mark (plus `draw_roll` enforces a 2 px minimum).
-const ROLL_PX_PER_S: f32 = 40.0;
-
-/// After this long with no drag/scroll input, a scrolled-back roll view starts
-/// easing back to live/now. Long enough to read what you scrolled to; short
-/// enough that the view never feels stuck in the past.
-const SCROLLBACK_IDLE_S: f64 = 2.5;
 /// Exponential ease-back rate (1/s) for a scrolled roll returning home —
 /// matches the ~0.2 s feel the history roll's drag-release always had.
 const SCROLLBACK_EASE_RATE: f64 = 12.0;
@@ -146,6 +137,53 @@ const FALLING_FRACTION: f32 = 0.55;
 /// Ctrl+S (Cmd+S on mac) quick-saves the roll — same action as File ▸ Save.
 const SAVE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+
+/// Ctrl+, (Cmd+, on mac) opens Edit ▸ Preferences — the conventional shortcut.
+const PREFS_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+
+/// Metronome tempo bounds (BPM), shared by the UI control and the wire clamp.
+const MIN_BPM: u16 = 30;
+const MAX_BPM: u16 = 240;
+
+/// Shared metronome state. The **authority** (the host, or a solo player with no
+/// peer) owns the canonical beat grid and, when connected, broadcasts a
+/// `MetroBeat` each beat; a **follower** (joined to a host) anchors a local click
+/// schedule to those markers — clicks are always generated locally, so packet
+/// loss/jitter never drops or delays one. Either side sets tempo / start-stop; a
+/// follower's edit is a `MetroCtl` request the host adopts (last-writer-wins,
+/// one grid). `muted` silences *this* player's click only (local channel gain),
+/// never the peer's.
+struct Metronome {
+    enabled: bool,
+    bpm: u16,
+    beats_per_bar: u8,
+    muted: bool,
+    /// When the next local click fires. Authority free-runs it from enable time;
+    /// a follower has it (re)anchored by each incoming marker. `None` = no click
+    /// scheduled (off, or a follower awaiting its first marker).
+    next_beat_at: Option<Instant>,
+    /// The next click's position in the bar (accent when 0 = the downbeat).
+    next_beat_in_bar: u8,
+}
+
+impl Metronome {
+    fn new(bpm: u16) -> Self {
+        Metronome {
+            enabled: false,
+            bpm: bpm.clamp(MIN_BPM, MAX_BPM),
+            beats_per_bar: 4,
+            muted: false,
+            next_beat_at: None,
+            next_beat_in_bar: 0,
+        }
+    }
+
+    /// Seconds per beat at the current tempo.
+    fn period(&self) -> f64 {
+        60.0 / self.bpm.max(1) as f64
+    }
+}
 
 struct PianoApp {
     // --- note input (MIDI or microphone fallback) ---
@@ -187,7 +225,7 @@ struct PianoApp {
     // which the microphone then hears and re-transcribes. To break that loop we
     // track, per MIDI note, whether the synth is currently voicing it (indexed by
     // `synth::Channel as usize`) and, once it stops, an instant until which a
-    // mic-detected onset of that note is still ignored (`ECHO_HOLDOFF`).
+    // mic-detected onset of that note is still ignored (`prefs.echo_holdoff_ms`).
     echo_held: [[bool; 2]; 128],
     echo_until: [Option<Instant>; 128],
 
@@ -213,6 +251,12 @@ struct PianoApp {
     join_ticket: String,
     peer: Option<Peer>,
     net_status: String,
+    // Whether *we* are the host of the current session (the metronome timing
+    // authority). Meaningless without a peer — then we're always the authority.
+    is_host: bool,
+
+    // --- synced metronome (see Metronome + drive_metronome) ---
+    metro: Metronome,
 
     // --- in-app auto-update (checks GitHub Releases on launch) ---
     updater: update::Updater,
@@ -220,13 +264,21 @@ struct PianoApp {
     // Whether the About window is open (toggled from the status bar).
     show_about: bool,
 
+    // --- persisted user preferences (see prefs.rs + Edit ▸ Preferences) ---
+    // Loaded on startup; every Preferences edit mutates this, applies live to
+    // the relevant consumer, and saves. Consumers read from here at their use
+    // sites (roll zoom, scrollback window, echo hold-off, mic tunables, …).
+    prefs: prefs::Prefs,
+    // Whether the Preferences window is open.
+    show_prefs: bool,
+
     // --- piano-roll history (see roll.rs + draw_roll) ---
     roll: roll::Roll,
     // Drag-to-review view state: `Some(t)` is the roll time rendered at the
     // strip's top edge while scrolled back (or animating home); `None` = live.
     scrollback: Option<f64>,
     // When the last drag/scroll input on the history roll stopped; the view
-    // holds still until `SCROLLBACK_IDLE_S` elapses, then eases back to live.
+    // holds still until the scrollback-hold window elapses, then eases to live.
     scrollback_idle_since: Option<Instant>,
     // Falling-panel review state: a view-time offset from the playhead
     // (negative = looking at the past). Purely a rendering offset — never
@@ -280,7 +332,16 @@ struct PianoApp {
 
 impl PianoApp {
     fn new() -> Self {
-        let input = input::start(DEFAULT_THRESHOLD);
+        // Preferences drive the startup seeds below (and the input backend's
+        // initial tunables), so load them first.
+        let prefs = prefs::Prefs::load();
+        let input = input::start(
+            prefs.threshold,
+            audio::InferenceTunables::new(prefs.silence_rms, prefs.norm_max_gain, prefs.frame_off),
+            prefs.midi_poll_ms,
+        );
+        let mut roll = roll::Roll::new();
+        roll.set_timing(prefs.trailing_blank.as_duration(), prefs.idle_pause.as_duration());
         Self {
             input,
             synth: synth::Synth::start(),
@@ -288,8 +349,8 @@ impl PianoApp {
             screen_muted: false,
             peer_volume: 1.0,
             peer_muted: false,
-            threshold: DEFAULT_THRESHOLD,
-            mic_muted: false,
+            threshold: prefs.threshold,
+            mic_muted: prefs.mic_muted,
             notes_epoch: 0,
             was_midi: false,
             local: [false; KEY_COUNT],
@@ -299,18 +360,22 @@ impl PianoApp {
             mouse_note: None,
             pointer_still_since: Instant::now(),
             last_pointer_pos: None,
-            local_color: DEFAULT_LOCAL_COLOR,
+            local_color: prefs.local_color,
             remote_color: DEFAULT_REMOTE_COLOR,
             last_color_send: Instant::now(),
             my_ticket: None,
             join_ticket: String::new(),
             peer: None,
             net_status: "Not connected".to_string(),
+            is_host: false,
+            metro: Metronome::new(prefs.metro_bpm),
             // Kick off the background GitHub Releases check; the UI polls its
             // state each frame (see `update_controls`).
             updater: update::start(),
             show_about: false,
-            roll: roll::Roll::new(),
+            prefs,
+            show_prefs: false,
+            roll,
             scrollback: None,
             scrollback_idle_since: None,
             falling_scrollback: None,
@@ -351,6 +416,9 @@ impl PianoApp {
         self.my_ticket = None;
         self.clear_remote_keys();
         self.net_status = "Starting…".into();
+        self.is_host = true;
+        // Fresh session: re-anchor the metronome (we're the authority now).
+        self.metro.next_beat_at = None;
         self.peer = Some(net::host());
     }
 
@@ -365,6 +433,9 @@ impl PianoApp {
         self.my_ticket = None;
         self.clear_remote_keys();
         self.net_status = "Joining…".into();
+        self.is_host = false;
+        // As a follower we no longer own the grid; wait for the host's markers.
+        self.metro.next_beat_at = None;
         self.peer = Some(net::join(code));
     }
 
@@ -436,7 +507,7 @@ impl PianoApp {
 
     /// Whether a mic-detected transition for `midi` should be ignored as the
     /// synth's own sound echoing back: true while the synth is voicing that note,
-    /// or within `ECHO_HOLDOFF` of it having stopped (covers the release tail).
+    /// or within the echo hold-off of it having stopped (covers the release tail).
     fn echo_suppressed(&self, midi: u8) -> bool {
         let n = midi as usize;
         if n >= 128 {
@@ -468,7 +539,8 @@ impl PianoApp {
         let was = self.echo_held[n][channel as usize];
         self.echo_held[n][channel as usize] = false;
         if was && !self.echo_held[n][0] && !self.echo_held[n][1] {
-            self.echo_until[n] = Some(Instant::now() + ECHO_HOLDOFF);
+            let holdoff = Duration::from_millis(self.prefs.echo_holdoff_ms);
+            self.echo_until[n] = Some(Instant::now() + holdoff);
         }
     }
 
@@ -512,10 +584,12 @@ impl PianoApp {
         }
     }
 
-    /// The File menu (save the piano roll) plus the "unsaved" chip and the
-    /// last save result. Lives in a `menu::bar` row at the top of the config
-    /// panel. Save As… lets the user pick between the interoperable MIDI
-    /// export and the self-contained JSONL one (see roll.rs).
+    /// The File menu (save/open the piano roll), now just the menu button —
+    /// it lives in the custom title bar's `menu::bar` (see `title_bar`). The
+    /// "unsaved" chip rides alongside it there; the instance-rename field and
+    /// last save/open results moved to `roll_status_row` in the config panel.
+    /// Save As… lets the user pick between the interoperable MIDI export and
+    /// the self-contained JSONL one (see roll.rs).
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("File", |ui| {
             let save = egui::Button::new("Save roll")
@@ -556,14 +630,24 @@ impl PianoApp {
                 self.falling_scrollback_idle_since = None;
             }
         });
+    }
+
+    /// The "● unsaved" chip. Rendered next to the File menu in the title bar so
+    /// it's visible regardless of the config panel's collapse state.
+    fn unsaved_chip(&self, ui: &mut egui::Ui) {
         if self.roll.has_unsaved() {
             ui.colored_label(egui::Color32::from_rgb(210, 170, 60), "● unsaved")
                 .on_hover_text("The roll has notes that haven't been saved (File ▸ Save)");
         }
+    }
+
+    /// Instance rename field + last save/open results. Lives in the config
+    /// panel (below the title bar), where there's room for the text field and
+    /// the potentially-long status paths.
+    fn roll_status_row(&mut self, ui: &mut egui::Ui) {
         // Rename whichever instance the live roll is currently in — the name
         // is baked into the file's markers on the next save.
         if !self.roll.is_empty() {
-            ui.separator();
             ui.label("Instance:");
             let current = self.roll.current_instance_name();
             let edit =
@@ -920,13 +1004,16 @@ impl PianoApp {
         resp: &egui::Response,
         keys: &[KeyRect],
     ) {
+        // Read prefs before borrowing `self.playback` mutably below.
+        let px_per_s = self.prefs.roll_px_per_s;
+        let scrollback_idle_s = self.prefs.scrollback_idle_s;
         let Some(pb) = &mut self.playback else { return };
         let rect = resp.rect;
         // Capture the value, not `pb`, so the closure doesn't pin the borrow.
         // Includes the review offset so clicks land on the time actually drawn
         // under the pointer, not where the playhead would put it.
         let playhead = pb.playhead_s + self.falling_scrollback.unwrap_or(0.0);
-        let t_of_y = move |y: f32| playhead + ((rect.bottom() - y) / ROLL_PX_PER_S) as f64;
+        let t_of_y = move |y: f32| playhead + ((rect.bottom() - y) / px_per_s) as f64;
 
         // Wheel/trackpad scroll reviews time. Drag is reserved for the
         // key-range selection below (it only ever reads x), so a vertical
@@ -943,14 +1030,14 @@ impl PianoApp {
             let hi = (pb.score.duration_s - pb.playhead_s).max(0.0);
             let cur = self.falling_scrollback.unwrap_or(0.0);
             self.falling_scrollback =
-                Some((cur + (scroll_dy / ROLL_PX_PER_S) as f64).clamp(lo, hi));
+                Some((cur + (scroll_dy / px_per_s) as f64).clamp(lo, hi));
             self.falling_scrollback_idle_since = None;
         } else if let Some(cur) = self.falling_scrollback {
             // No input: hold the view for the idle window, then ease home.
             let idle = *self.falling_scrollback_idle_since.get_or_insert_with(Instant::now);
-            if idle.elapsed().as_secs_f64() >= SCROLLBACK_IDLE_S {
+            if idle.elapsed().as_secs_f64() >= scrollback_idle_s {
                 let dt = ui.input(|i| i.stable_dt) as f64;
-                self.falling_scrollback = ease_toward(cur, 0.0, dt);
+                self.falling_scrollback = ease_toward(cur, 0.0, dt, px_per_s);
                 if self.falling_scrollback.is_none() {
                     self.falling_scrollback_idle_since = None;
                 }
@@ -1131,9 +1218,13 @@ impl PianoApp {
     /// synth volumes, and the record toggle. Split out of `update()` so the
     /// collapsible-panel wrapper there stays readable.
     fn config_panel_body(&mut self, ui: &mut egui::Ui) {
-        // ---- File menu (save the piano roll) + unsaved/status chips ----
-        egui::menu::bar(ui, |ui| self.file_menu(ui));
-        ui.separator();
+        // ---- Instance rename + last save/open status. (File/Edit menus live
+        // in the custom title bar now — see `title_bar`.) Only drawn when
+        // there's something to show, so the panel doesn't reserve a blank row. ----
+        if !self.roll.is_empty() || !self.roll_status.is_empty() || !self.open_status.is_empty() {
+            ui.horizontal(|ui| self.roll_status_row(ui));
+            ui.separator();
+        }
         // ---- Auto-update banner (only drawn when there's something to act on) ----
         let mut drawn = false;
         ui.horizontal(|ui| drawn = self.update_controls(ui));
@@ -1212,12 +1303,22 @@ impl PianoApp {
                     .changed()
                 {
                     self.input.threshold.set(self.threshold);
+                    // Keep the persisted default in sync with this live control.
+                    self.prefs.threshold = self.threshold;
+                    self.prefs.save();
                 }
                 ui.separator();
-                ui.checkbox(&mut self.mic_muted, "Mute mic").on_hover_text(
-                    "Ignore mic-detected notes (stops ambient noise from \
-                     painting the roll or counting as played keys)",
-                );
+                if ui
+                    .checkbox(&mut self.mic_muted, "Mute mic")
+                    .on_hover_text(
+                        "Ignore mic-detected notes (stops ambient noise from \
+                         painting the roll or counting as played keys)",
+                    )
+                    .changed()
+                {
+                    self.prefs.mic_muted = self.mic_muted;
+                    self.prefs.save();
+                }
             });
         }
         // ---- My color (broadcast to the peer) ----
@@ -1227,6 +1328,9 @@ impl PianoApp {
             if ui.color_edit_button_srgb(&mut self.local_color).changed() {
                 // Push the change immediately; the heartbeat covers the rest.
                 self.send_color();
+                // Persist as the new default color.
+                self.prefs.local_color = self.local_color;
+                self.prefs.save();
             }
             ui.separator();
             ui.label("Peer's color:");
@@ -1237,6 +1341,9 @@ impl PianoApp {
         // ---- Synth volume / mute (screen + peer sources) ----
         ui.add_space(2.0);
         ui.horizontal(|ui| self.synth_controls(ui));
+        // ---- Metronome (synced with the peer; each side mutes its own click) ----
+        ui.add_space(2.0);
+        ui.horizontal(|ui| self.metro_controls(ui));
         // ---- Training-data capture (record mic audio + MIDI labels) ----
         ui.add_space(2.0);
         ui.horizontal(|ui| self.record_controls(ui));
@@ -1302,6 +1409,169 @@ impl PianoApp {
         self.synth.set_gain(synth::Channel::Local, screen);
         self.synth.set_gain(synth::Channel::Peer, peer);
         self.synth.set_gain(synth::Channel::Playback, playback);
+        // The metronome click has no volume slider — just the local mute.
+        self.synth
+            .set_gain(synth::Channel::Metronome, if self.metro.muted { 0.0 } else { 1.0 });
+    }
+
+    /// Whether *this* instance owns the metronome grid: true when solo (no peer)
+    /// or when we're the host. A follower defers to the host's markers.
+    fn metro_authority(&self) -> bool {
+        self.peer.is_none() || self.is_host
+    }
+
+    /// Advance the metronome and fire any clicks due this frame. Called once per
+    /// frame from `update`. The authority free-runs its own schedule (and, when
+    /// connected, broadcasts each beat); a follower fires from the schedule its
+    /// last received marker anchored (see `on_metro_beat`).
+    fn drive_metronome(&mut self) {
+        if !self.metro.enabled {
+            self.metro.next_beat_at = None;
+            return;
+        }
+        let now = Instant::now();
+        let authority = self.metro_authority();
+        let period = Duration::from_secs_f64(self.metro.period());
+        let bpb = self.metro.beats_per_bar.max(1);
+
+        // The authority free-runs; anchor to now (on the downbeat) if idle.
+        if authority && self.metro.next_beat_at.is_none() {
+            self.metro.next_beat_at = Some(now);
+            self.metro.next_beat_in_bar = 0;
+        }
+        // Recover from a long GUI stall (window drag, file dialog, sleep) without
+        // machine-gunning every missed beat: skip ahead to now.
+        if let Some(at) = self.metro.next_beat_at {
+            if now.saturating_duration_since(at) > Duration::from_secs(1) {
+                self.metro.next_beat_at = Some(now);
+            }
+        }
+
+        while let Some(at) = self.metro.next_beat_at {
+            if now < at {
+                break;
+            }
+            let beat_in_bar = self.metro.next_beat_in_bar;
+            if !self.metro.muted {
+                self.synth.tick(beat_in_bar == 0);
+            }
+            if authority {
+                if let Some(peer) = &self.peer {
+                    peer.send(Packet::MetroBeat {
+                        bpm: self.metro.bpm,
+                        beat_in_bar,
+                        beats_per_bar: self.metro.beats_per_bar,
+                        on: true,
+                    });
+                }
+            }
+            self.metro.next_beat_in_bar = (beat_in_bar + 1) % bpb;
+            self.metro.next_beat_at = Some(at + period);
+        }
+    }
+
+    /// Apply a metronome start/stop + tempo edit from the UI, routed by role: the
+    /// authority changes its grid directly (and tells a connected follower); a
+    /// follower sends a `MetroCtl` request the host adopts and echoes back.
+    fn metro_set(&mut self, enabled: bool, bpm: u16) {
+        let bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+        let was_enabled = self.metro.enabled;
+        self.metro.bpm = bpm;
+        self.metro.enabled = enabled;
+        if !enabled {
+            self.metro.next_beat_at = None;
+        }
+        if self.metro_authority() {
+            if enabled && !was_enabled {
+                // Fresh start: click the downbeat immediately.
+                self.metro.next_beat_at = Some(Instant::now());
+                self.metro.next_beat_in_bar = 0;
+            }
+            // A bpm-only change keeps the running schedule (period is read live);
+            // only broadcast the start/stop edge here — the per-beat markers
+            // carry the new tempo to the follower on the next beat.
+            if enabled != was_enabled {
+                if let Some(peer) = &self.peer {
+                    peer.send(Packet::MetroBeat {
+                        bpm,
+                        beat_in_bar: 0,
+                        beats_per_bar: self.metro.beats_per_bar,
+                        on: enabled,
+                    });
+                }
+            }
+        } else if let Some(peer) = &self.peer {
+            // Follower: request the change; the host's markers are authoritative.
+            peer.send(Packet::MetroCtl { on: enabled, bpm });
+        }
+    }
+
+    /// Handle a metronome beat marker from the host (follower side). Anchors the
+    /// *next* local click to the corrected marker time (receive time minus the
+    /// one-way estimate), so our clicks land in phase with the host's. Ignored
+    /// by the authority (it owns the grid).
+    fn on_metro_beat(
+        &mut self,
+        bpm: u16,
+        beat_in_bar: u8,
+        beats_per_bar: u8,
+        on: bool,
+        one_way: Duration,
+    ) {
+        if self.metro_authority() {
+            return;
+        }
+        self.metro.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+        self.metro.beats_per_bar = beats_per_bar.max(1);
+        if !on {
+            self.metro.enabled = false;
+            self.metro.next_beat_at = None;
+            return;
+        }
+        self.metro.enabled = true;
+        let now = Instant::now();
+        let period = Duration::from_secs_f64(self.metro.period());
+        // When (corrected for transit) the host played this beat, in our clock.
+        let this_beat_at = now.checked_sub(one_way).unwrap_or(now);
+        // Schedule the *next* beat locally; the following marker re-anchors it,
+        // correcting drift, while local generation covers any lost marker.
+        self.metro.next_beat_at = Some(this_beat_at + period);
+        self.metro.next_beat_in_bar = (beat_in_bar + 1) % self.metro.beats_per_bar;
+    }
+
+    /// Metronome row: on/off, tempo, and a local-only "mute click". Editing tempo
+    /// or on/off on a follower is sent to the host (see `metro_set`).
+    fn metro_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label("Metronome:");
+        let mut enabled = self.metro.enabled;
+        let label = if enabled { "⏸" } else { "▶" };
+        if ui
+            .toggle_value(&mut enabled, label)
+            .on_hover_text("Start / stop the metronome (synced with the peer)")
+            .changed()
+        {
+            self.metro_set(enabled, self.metro.bpm);
+        }
+        let mut bpm = self.metro.bpm;
+        if ui
+            .add(egui::DragValue::new(&mut bpm).range(MIN_BPM..=MAX_BPM).suffix(" BPM"))
+            .on_hover_text("Tempo (both players hear the same beat)")
+            .changed()
+        {
+            self.metro_set(self.metro.enabled, bpm);
+            self.prefs.metro_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+            self.prefs.save();
+        }
+        if ui
+            .checkbox(&mut self.metro.muted, "Mute click")
+            .on_hover_text("Silence the click on *this* machine only (the peer still hears it)")
+            .changed()
+        {
+            self.synth.set_gain(
+                synth::Channel::Metronome,
+                if self.metro.muted { 0.0 } else { 1.0 },
+            );
+        }
     }
 
     /// Apply the source-dependent default for the on-screen ("screen") synth:
@@ -1346,6 +1616,391 @@ impl PianoApp {
         if let Some(new) = target {
             self.mouse_note = Some(new);
             self.local_note(NoteMsg::On(new));
+        }
+    }
+
+    /// The custom window title bar, drawn as the *first* panel each frame so it
+    /// stays the topmost row regardless of the config panel's collapse state:
+    /// File/Edit menus + the unsaved chip on the left, a centered title, and our
+    /// own minimize/maximize/close buttons on the right. Empty bar area drags
+    /// the window; double-click maximizes/restores. Also installs the edge-resize
+    /// handles the OS would provide (we dropped its chrome — see `main`).
+    fn title_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(30.0)
+            .show(ctx, |ui| {
+                let bar_rect = ui.max_rect();
+                // Drag / double-click the bar. Interact FIRST so the menus and
+                // buttons added afterwards sit on top and win their own clicks;
+                // the leftover bar area drags the window.
+                let drag = ui.interact(
+                    bar_rect,
+                    egui::Id::new("titlebar_drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if drag.double_clicked() {
+                    let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+                } else if drag.drag_started_by(egui::PointerButton::Primary) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                // Centered title, painted behind the widgets (non-interactive).
+                ui.painter().text(
+                    bar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    concat!("open-piano v", env!("CARGO_PKG_VERSION")),
+                    egui::FontId::proportional(12.5),
+                    ui.visuals().weak_text_color(),
+                );
+
+                // Window controls on the right. A child UI spanning the FULL bar
+                // rect, laid out right-to-left, so Close lands at the true right
+                // edge (a plain `menu::bar` shrinks to content and would bunch
+                // these next to the menus instead).
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(bar_rect)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    |ui| {
+                        if window_button(ui, WinBtn::Close) {
+                            self.request_close(ctx);
+                        }
+                        let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        if window_button(ui, WinBtn::Maximize(max)) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+                        }
+                        if window_button(ui, WinBtn::Minimize) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    },
+                );
+
+                // File/Edit menus + unsaved chip on the left, in a full-width
+                // child UI so they anchor to the left edge independently of the
+                // buttons above.
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(bar_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        egui::menu::bar(ui, |ui| {
+                            self.file_menu(ui);
+                            self.edit_menu(ui);
+                            self.unsaved_chip(ui);
+                        });
+                    },
+                );
+            });
+
+        self.resize_handles(ctx);
+    }
+
+    /// Shared close decision for both the custom ✕ and the OS close path
+    /// (Alt+F4, handled in `update` via `close_requested`): with unsaved roll
+    /// notes, open the confirm dialog; otherwise close for real.
+    fn request_close(&mut self, ctx: &egui::Context) {
+        if self.roll.has_unsaved() && !self.allow_close {
+            self.show_close_confirm = true;
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Thin invisible drag handles on the window's four edges and corners, each
+    /// issuing `BeginResize` — the resize affordance the OS gave us before we
+    /// dropped its chrome. Each handle is its *own* foreground `Area` with a
+    /// thin bounding rect, so only the edge strips capture the pointer and the
+    /// window interior falls through to the app (a single screen-spanning Area
+    /// would block everything — see egui's `layer_id_at`). Skipped while
+    /// maximized (nothing to resize).
+    fn resize_handles(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        let s = ctx.screen_rect();
+        const B: f32 = 6.0; // handle thickness
+        use egui::CursorIcon as C;
+        use egui::ResizeDirection as D;
+        let (l, r, t, b) = (s.left(), s.right(), s.top(), s.bottom());
+        let rect = egui::Rect::from_min_max;
+        let p = egui::pos2;
+        // (handle rect, resize direction, cursor) — corners then edges, tiled
+        // so none overlap.
+        let handles = [
+            (rect(p(l, t), p(l + B, t + B)), D::NorthWest, C::ResizeNorthWest),
+            (rect(p(r - B, t), p(r, t + B)), D::NorthEast, C::ResizeNorthEast),
+            (rect(p(l, b - B), p(l + B, b)), D::SouthWest, C::ResizeSouthWest),
+            (rect(p(r - B, b - B), p(r, b)), D::SouthEast, C::ResizeSouthEast),
+            (rect(p(l + B, t), p(r - B, t + B)), D::North, C::ResizeNorth),
+            (rect(p(l + B, b - B), p(r - B, b)), D::South, C::ResizeSouth),
+            (rect(p(l, t + B), p(l + B, b - B)), D::West, C::ResizeWest),
+            (rect(p(r - B, t + B), p(r, b - B)), D::East, C::ResizeEast),
+        ];
+        for (i, (hr, dir, cursor)) in handles.into_iter().enumerate() {
+            egui::Area::new(egui::Id::new(("resize_handle", i)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(hr.min)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    let (_r, resp) = ui.allocate_exact_size(hr.size(), egui::Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ui.ctx().set_cursor_icon(cursor);
+                    }
+                    if resp.drag_started() {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                    }
+                });
+        }
+    }
+
+    /// The Edit menu. Currently just Preferences; shares the title bar's menu
+    /// bar with File.
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Edit", |ui| {
+            let prefs = egui::Button::new("Preferences…")
+                .shortcut_text(ui.ctx().format_shortcut(&PREFS_SHORTCUT));
+            if ui
+                .add(prefs)
+                .on_hover_text("Roll timing, appearance, audio, and advanced tunables")
+                .clicked()
+            {
+                ui.close_menu();
+                self.show_prefs = true;
+            }
+        });
+    }
+
+    /// Edit ▸ Preferences: every persisted tunable (see prefs.rs), grouped.
+    /// Each widget applies its change live to the relevant consumer and, if
+    /// anything changed this frame, saves the prefs file (a tiny atomic write).
+    /// Advanced knobs that can degrade mic detection sit behind a collapsed
+    /// expander with a Reset button.
+    fn preferences_window(&mut self, ctx: &egui::Context) {
+        if !self.show_prefs {
+            return;
+        }
+        // A local `open` for the window ✕ so the closure can still take `&mut
+        // self` (unlike `about_window`, which only reads inside).
+        let mut open = true;
+        let mut changed = false;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                // ---- Roll & history ----
+                ui.heading("Roll & history");
+                changed |= limit_row(
+                    ui,
+                    "Trailing blank",
+                    &mut self.prefs.trailing_blank,
+                    "Cap on blank paper kept past the last note. Shorter gaps show in \
+                     full; longer gaps clamp here. ∞ = never clamp — but a truly \
+                     unbounded gap also needs Idle pause set to ∞.",
+                );
+                changed |= limit_row(
+                    ui,
+                    "Idle pause",
+                    &mut self.prefs.idle_pause,
+                    "Silence before the roll clock pauses, so the next note starts a \
+                     new instance. ∞ = never auto-pause (one continuous instance).",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Roll zoom (px/s):");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.roll_px_per_s)
+                                .range(8.0..=200.0)
+                                .speed(1.0),
+                        )
+                        .on_hover_text("Vertical scale of the history + falling-note strips")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Scrollback hold (s):");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.scrollback_idle_s)
+                                .range(0.0..=30.0)
+                                .speed(0.1),
+                        )
+                        .on_hover_text("How long a scrolled-back view holds before easing to live")
+                        .changed();
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ---- Appearance ----
+                ui.heading("Appearance");
+                ui.horizontal(|ui| {
+                    ui.label("My note color:");
+                    if ui.color_edit_button_srgb(&mut self.prefs.local_color).changed() {
+                        self.local_color = self.prefs.local_color;
+                        self.send_color();
+                        changed = true;
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ---- Audio / mic ----
+                ui.heading("Audio / mic");
+                ui.horizontal(|ui| {
+                    ui.label("Detection threshold:");
+                    if ui
+                        .add(egui::Slider::new(&mut self.prefs.threshold, 0.05..=0.95).step_by(0.01))
+                        .on_hover_text("Mic sensitivity: lower detects quieter notes (more noise)")
+                        .changed()
+                    {
+                        self.threshold = self.prefs.threshold;
+                        self.input.threshold.set(self.prefs.threshold);
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Echo hold-off (ms):");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.prefs.echo_holdoff_ms)
+                                .range(0..=10_000)
+                                .speed(50.0),
+                        )
+                        .on_hover_text(
+                            "How long after the synth stops a note the mic keeps ignoring \
+                             that note (stops the speaker→mic echo loop)",
+                        )
+                        .changed();
+                });
+                if ui
+                    .checkbox(&mut self.prefs.mic_muted, "Mute mic by default")
+                    .changed()
+                {
+                    self.mic_muted = self.prefs.mic_muted;
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // ---- Advanced (model / network) ----
+                egui::CollapsingHeader::new("Advanced")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "These affect mic transcription directly — bad values can \
+                                 stop notes being detected. Defaults suit most rooms.",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Silence RMS:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.prefs.silence_rms)
+                                        .range(0.0..=0.05)
+                                        .speed(0.0002)
+                                        .fixed_decimals(4),
+                                )
+                                .on_hover_text("Below this raw mic level a window is treated as silence")
+                                .changed()
+                            {
+                                self.input.tunables.silence_rms.set(self.prefs.silence_rms);
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Norm max gain:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.prefs.norm_max_gain)
+                                        .range(1.0..=100.0)
+                                        .speed(0.5),
+                                )
+                                .on_hover_text("Cap on how much quiet input is amplified before inference")
+                                .changed()
+                            {
+                                self.input.tunables.norm_max_gain.set(self.prefs.norm_max_gain);
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Frame off:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.prefs.frame_off)
+                                        .range(0.01..=0.9)
+                                        .speed(0.005)
+                                        .fixed_decimals(3),
+                                )
+                                .on_hover_text("Probability below which a sounding note is released")
+                                .changed()
+                            {
+                                self.input.tunables.frame_off.set(self.prefs.frame_off);
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("MIDI poll (ms):");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.prefs.midi_poll_ms)
+                                        .range(100..=5_000)
+                                        .speed(10.0),
+                                )
+                                .on_hover_text("How often the app rescans for MIDI devices")
+                                .changed()
+                            {
+                                self.input
+                                    .midi_poll_ms
+                                    .store(self.prefs.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
+                                changed = true;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        if ui
+                            .button("Reset advanced to defaults")
+                            .on_hover_text("Restore Silence RMS / Norm max gain / Frame off / MIDI poll")
+                            .clicked()
+                        {
+                            let d = prefs::Prefs::default();
+                            self.prefs.silence_rms = d.silence_rms;
+                            self.prefs.norm_max_gain = d.norm_max_gain;
+                            self.prefs.frame_off = d.frame_off;
+                            self.prefs.midi_poll_ms = d.midi_poll_ms;
+                            self.input.tunables.silence_rms.set(d.silence_rms);
+                            self.input.tunables.norm_max_gain.set(d.norm_max_gain);
+                            self.input.tunables.frame_off.set(d.frame_off);
+                            self.input
+                                .midi_poll_ms
+                                .store(d.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
+                            changed = true;
+                        }
+                    });
+
+                // Roll timing is read from `self.roll`'s own fields, so push any
+                // trailing-blank / idle-pause edit down (cheap; harmless if it
+                // wasn't those fields that changed).
+                if changed {
+                    self.roll.set_timing(
+                        self.prefs.trailing_blank.as_duration(),
+                        self.prefs.idle_pause.as_duration(),
+                    );
+                }
+            });
+
+        if changed {
+            self.prefs.save();
+        }
+        // The window ✕ (or Esc) clears `open`; mirror it back into our flag.
+        if !open {
+            self.show_prefs = false;
         }
     }
 
@@ -1402,6 +2057,19 @@ impl PianoApp {
                     // reconnect mid-chord), and the peer needs our color.
                     self.clear_remote_keys();
                     self.send_color();
+                    // If we're the metronome authority, announce current state so
+                    // a follower syncs immediately (even when it's off). The
+                    // per-beat markers handle the running case.
+                    if self.metro_authority() {
+                        if let Some(peer) = &self.peer {
+                            peer.send(Packet::MetroBeat {
+                                bpm: self.metro.bpm,
+                                beat_in_bar: 0,
+                                beats_per_bar: self.metro.beats_per_bar,
+                                on: self.metro.enabled,
+                            });
+                        }
+                    }
                 }
                 NetEvent::Disconnected => self.clear_remote_keys(),
                 NetEvent::Packet(Packet::Note(msg)) => {
@@ -1411,6 +2079,35 @@ impl PianoApp {
                     self.play_synth(msg, synth::Channel::Peer);
                 }
                 NetEvent::Packet(Packet::Color(rgb)) => self.remote_color = rgb,
+                NetEvent::Packet(Packet::MetroCtl { on, bpm }) => {
+                    // Follower → host request: the authority adopts it as the new
+                    // grid and echoes authoritative state back.
+                    if self.metro_authority() {
+                        let was = self.metro.enabled;
+                        self.metro.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
+                        self.metro.enabled = on;
+                        if on && !was {
+                            self.metro.next_beat_at = Some(Instant::now());
+                            self.metro.next_beat_in_bar = 0;
+                        } else if !on {
+                            self.metro.next_beat_at = None;
+                        }
+                        if let Some(peer) = &self.peer {
+                            peer.send(Packet::MetroBeat {
+                                bpm: self.metro.bpm,
+                                beat_in_bar: 0,
+                                beats_per_bar: self.metro.beats_per_bar,
+                                on,
+                            });
+                        }
+                    }
+                }
+                // Markers should always arrive as NetEvent::MetroBeat (net.rs
+                // splits them out to stamp RTT); ignore any that slip through.
+                NetEvent::Packet(Packet::MetroBeat { .. }) => {}
+                NetEvent::MetroBeat { bpm, beat_in_bar, beats_per_bar, on, one_way } => {
+                    self.on_metro_beat(bpm, beat_in_bar, beats_per_bar, on, one_way);
+                }
             }
         }
     }
@@ -1428,6 +2125,7 @@ impl eframe::App for PianoApp {
         self.pump_input();
         self.pump_network();
         self.sync_synth_to_source();
+        self.drive_metronome();
         self.roll.tick(Instant::now());
 
         // Advance the loaded score's playhead (Listen auto-play / Learn
@@ -1459,6 +2157,9 @@ impl eframe::App for PianoApp {
         if ctx.input_mut(|i| i.consume_shortcut(&SAVE_SHORTCUT)) {
             self.save_roll_quick();
         }
+        if ctx.input_mut(|i| i.consume_shortcut(&PREFS_SHORTCUT)) {
+            self.show_prefs = true;
+        }
 
         // Track how long the pointer has held still. This drives the two-stage
         // "keyboard locked" tooltip during recording: a short label on hover that
@@ -1478,6 +2179,10 @@ impl eframe::App for PianoApp {
         if self.peer.is_some() && self.last_color_send.elapsed() >= COLOR_HEARTBEAT {
             self.send_color();
         }
+
+        // ---- Custom title bar (File/Edit menus, window controls, edge resize).
+        // MUST be the first panel shown so it's the topmost row. ----
+        self.title_bar(ctx);
 
         // ---- Top: networking + audio config, collapsible to a title strip
         // via the chevron. The collapsed/expanded variants animate between
@@ -1570,6 +2275,7 @@ impl eframe::App for PianoApp {
         });
 
         self.about_window(ctx);
+        self.preferences_window(ctx);
         self.unsaved_dialog(ctx);
         self.refine_range_window(ctx);
         // Side panels reserve space in show order — must precede CentralPanel.
@@ -1690,6 +2396,7 @@ impl eframe::App for PianoApp {
                         pb.learn.key_range,
                         self.range_drag,
                         self.falling_scrollback.unwrap_or(0.0),
+                        self.prefs.roll_px_per_s,
                     );
                 }
             }
@@ -1701,19 +2408,21 @@ impl eframe::App for PianoApp {
             // Dragging up (negative delta.y) pulls older paper into view: a
             // mark sits at y ∝ (view_top − t), so moving marks up means
             // lowering the view-top time. Wheel/trackpad scroll does the same.
+            let px_per_s = self.prefs.roll_px_per_s;
+            let scrollback_idle_s = self.prefs.scrollback_idle_s;
             let roll_delta_px = scroll_or_drag_delta_y(ctx, &roll_resp);
             if roll_delta_px != 0.0 {
                 let top = self.scrollback.unwrap_or(self.roll.now_s());
-                let new_top = (top + (roll_delta_px / ROLL_PX_PER_S) as f64)
+                let new_top = (top + (roll_delta_px / px_per_s) as f64)
                     .clamp(0.0, self.roll.now_s());
                 self.scrollback = Some(new_top);
                 self.scrollback_idle_since = None;
             } else if let Some(top) = self.scrollback {
                 // No input: hold the view for the idle window, then ease home.
                 let idle = *self.scrollback_idle_since.get_or_insert_with(Instant::now);
-                if idle.elapsed().as_secs_f64() >= SCROLLBACK_IDLE_S {
+                if idle.elapsed().as_secs_f64() >= scrollback_idle_s {
                     let dt = ctx.input(|i| i.stable_dt) as f64;
-                    self.scrollback = ease_toward(top, self.roll.now_s(), dt);
+                    self.scrollback = ease_toward(top, self.roll.now_s(), dt, px_per_s);
                     if self.scrollback.is_none() {
                         self.scrollback_idle_since = None;
                     }
@@ -1724,7 +2433,7 @@ impl eframe::App for PianoApp {
             // Manual instance breaks on the history roll: Ctrl+click inserts
             // one at the clicked time; right-click offers the same via menu.
             let roll_t_of_y =
-                |y: f32| view_top_s - ((y - roll_resp.rect.top()) / ROLL_PX_PER_S) as f64;
+                |y: f32| view_top_s - ((y - roll_resp.rect.top()) / px_per_s) as f64;
             if roll_resp.clicked() && ui.input(|i| i.modifiers.command) {
                 if let Some(pos) = roll_resp.interact_pointer_pos() {
                     self.roll.insert_separator(roll_t_of_y(pos.y));
@@ -1744,7 +2453,7 @@ impl eframe::App for PianoApp {
                 }
             });
 
-            draw_roll(ui.painter(), roll_resp.rect, &keys, &self.roll, view_top_s);
+            draw_roll(ui.painter(), roll_resp.rect, &keys, &self.roll, view_top_s, px_per_s);
         });
 
         // Keep redrawing for smooth real-time updates.
@@ -1913,18 +2622,19 @@ fn draw_roll(
     keys: &[KeyRect],
     roll: &roll::Roll,
     view_top_s: f64,
+    px_per_s: f32,
 ) {
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
 
     // Roll time -> y. Subtract in f64 *before* the f32 cast: after a long
     // session the times are large and f32 subtraction would jitter the marks.
-    let y_of = |t: f64| rect.top() + ((view_top_s - t) as f32) * ROLL_PX_PER_S;
+    let y_of = |t: f64| rect.top() + ((view_top_s - t) as f32) * px_per_s;
 
     // ---- Ruler: only the whole seconds inside the visible window (top edge
     // = view_top_s, bottom edge = view_top_s - height/speed), never the whole
     // session, so cost is O(strip height) regardless of duration.
-    let bottom_s = view_top_s - (rect.height() / ROLL_PX_PER_S) as f64;
+    let bottom_s = view_top_s - (rect.height() / px_per_s) as f64;
     draw_ruler(&painter, rect, bottom_s, view_top_s, y_of);
 
     // ---- Instance separators: full-width lines where the clock resumed
@@ -1996,11 +2706,99 @@ fn scroll_or_drag_delta_y(ctx: &egui::Context, resp: &egui::Response) -> f32 {
     }
 }
 
+/// Which caption button to draw (`Maximize(true)` = currently maximized, so it
+/// shows the "restore" glyph).
+#[derive(Clone, Copy)]
+enum WinBtn {
+    Minimize,
+    Maximize(bool),
+    Close,
+}
+
+/// Draw one custom window-caption button and return whether it was clicked. The
+/// glyphs are *painted* (line/rect strokes), not font characters, so they can't
+/// fall back to a tofu box the way `🗕🗖🗙` might in egui's default font (the
+/// codebase already learned some glyphs don't render — see the chevron note).
+/// Close highlights red on hover, matching the OS button.
+fn window_button(ui: &mut egui::Ui, kind: WinBtn) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::click());
+    let close = matches!(kind, WinBtn::Close);
+    let hovered = resp.hovered();
+    if hovered {
+        let bg = if close {
+            egui::Color32::from_rgb(200, 60, 60)
+        } else {
+            ui.visuals().widgets.hovered.bg_fill
+        };
+        ui.painter().rect_filled(rect, 2.0, bg);
+    }
+    let fg = if hovered && close {
+        egui::Color32::WHITE
+    } else {
+        ui.visuals().text_color()
+    };
+    let stroke = egui::Stroke::new(1.2, fg);
+    let c = rect.center();
+    let e = 4.5;
+    let painter = ui.painter();
+    match kind {
+        WinBtn::Minimize => {
+            painter.hline(egui::Rangef::new(c.x - e, c.x + e), c.y + e - 0.5, stroke);
+        }
+        WinBtn::Maximize(false) => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(c, egui::vec2(2.0 * e, 2.0 * e)),
+                0.0,
+                stroke,
+            );
+        }
+        WinBtn::Maximize(true) => {
+            // Restore: two overlapping square outlines (back + front).
+            let side = 2.0 * e - 1.5;
+            painter.rect_stroke(
+                egui::Rect::from_min_size(egui::pos2(c.x - e + 2.0, c.y - e), egui::vec2(side, side)),
+                0.0,
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_size(egui::pos2(c.x - e, c.y - e + 2.0), egui::vec2(side, side)),
+                0.0,
+                stroke,
+            );
+        }
+        WinBtn::Close => {
+            painter.line_segment([egui::pos2(c.x - e, c.y - e), egui::pos2(c.x + e, c.y + e)], stroke);
+            painter.line_segment([egui::pos2(c.x - e, c.y + e), egui::pos2(c.x + e, c.y - e)], stroke);
+        }
+    }
+    resp.clicked()
+}
+
+/// A Preferences row for a [`prefs::Limit`]: a seconds `DragValue` (greyed but
+/// value-preserving while infinite) plus an `∞` toggle. Returns whether either
+/// widget changed this frame. Free fn (not a method) so it can borrow one
+/// `Limit` field while the caller still holds `&mut self`.
+fn limit_row(ui: &mut egui::Ui, label: &str, limit: &mut prefs::Limit, tip: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(format!("{label} (s):"));
+        // Greyed while infinite, but `secs` is untouched, so flipping ∞ back
+        // off restores the exact prior value.
+        let dv = egui::DragValue::new(&mut limit.secs)
+            .range(0.0..=3600.0)
+            .speed(0.5);
+        changed |= ui.add_enabled(!limit.infinite, dv).on_hover_text(tip).changed();
+        changed |= ui.checkbox(&mut limit.infinite, "∞").on_hover_text(tip).changed();
+    });
+    changed
+}
+
 /// Ease `current` toward `target` (frame-rate independent exponential),
-/// returning `None` once within half a roll-pixel — i.e. "arrived".
-fn ease_toward(current: f64, target: f64, dt: f64) -> Option<f64> {
+/// returning `None` once within half a roll-pixel — i.e. "arrived". The
+/// arrival tolerance scales with the current roll zoom (`px_per_s`).
+fn ease_toward(current: f64, target: f64, dt: f64, px_per_s: f32) -> Option<f64> {
     let eased = target + (current - target) * (-dt * SCROLLBACK_EASE_RATE).exp();
-    if (target - eased).abs() < 0.5 / ROLL_PX_PER_S as f64 {
+    if (target - eased).abs() < 0.5 / px_per_s as f64 {
         None
     } else {
         Some(eased)
@@ -2072,6 +2870,7 @@ fn draw_falling(
     key_range: Option<(u8, u8)>,
     range_drag: Option<(f32, f32)>,
     scroll_offset_s: f64,
+    px_per_s: f32,
 ) {
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
@@ -2081,8 +2880,8 @@ fn draw_falling(
     let view_playhead_s = playhead_s + scroll_offset_s;
 
     // Future time -> y (f64 subtraction before the f32 cast, as in draw_roll).
-    let y_of = |t: f64| rect.bottom() - ((t - view_playhead_s) as f32) * ROLL_PX_PER_S;
-    let top_s = view_playhead_s + (rect.height() / ROLL_PX_PER_S) as f64;
+    let y_of = |t: f64| rect.bottom() - ((t - view_playhead_s) as f32) * px_per_s;
+    let top_s = view_playhead_s + (rect.height() / px_per_s) as f64;
 
     draw_ruler(&painter, rect, view_playhead_s, top_s, y_of);
 

@@ -1,6 +1,6 @@
 [package]
 name = "open-piano"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Real-time, networked, peer-to-peer acoustic piano visualizer"
 license = "MIT OR Apache-2.0"
@@ -55,6 +55,10 @@ rfd = "0.15"
 # in a later phase, so robust (de)serialization is worth it — and serde is
 # already in the dependency graph transitively via iroh, so ~no build cost.
 serde_json = "1"
+# Derive-based (de)serialization for the persisted Preferences struct
+# (see prefs.rs). serde is already pulled in transitively via iroh, so enabling
+# `derive` here adds negligible build cost.
+serde = { version = "1", features = ["derive"] }
 
 # Embeds assets/icon.ico as the .exe's file icon (see build.rs). Windows-only:
 # the icon resource is a PE-format concept.

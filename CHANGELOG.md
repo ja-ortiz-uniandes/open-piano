@@ -4,6 +4,45 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-05
+
+### Added
+
+- **Preferences dialog (Edit ▸ Preferences, Ctrl+,).** The app's scattered
+  compile-time tunables are now editable and **persisted** across restarts to
+  `%LOCALAPPDATA%\open-piano\preferences.json`. Sections: roll timing,
+  appearance (default note color), audio/mic (threshold, echo hold-off, mute
+  default), and an **Advanced** expander (collapsed, with a Reset) for the
+  detector's silence/normalization/release knobs and MIDI-poll interval — all
+  live-editable while you play. Older/partial preference files load without
+  error. (`src/prefs.rs`)
+- **Custom window title bar.** The OS chrome is replaced by our own title bar:
+  File/Edit menus on the left (always the topmost row, independent of the
+  settings panel's collapse state), the title centered, and minimize/maximize/
+  close on the right. The bar drags the window, double-click maximizes/restores,
+  and the window edges resize. (Windows 11 snap-layouts aren't available with
+  custom chrome — an accepted trade-off.) (`src/main.rs`)
+- **Synced metronome.** A shared click both players hear together. The host is
+  the timing authority and broadcasts a beat marker each beat; a guest anchors a
+  local click schedule to those markers (corrected by half the measured RTT), so
+  clicks are generated locally and packet loss never drops or delays one. Either
+  player can set the tempo (30–240 BPM) or start/stop — a guest's change is a
+  request the host adopts and echoes back (one grid, last-writer-wins). Each
+  player can mute *their own* click locally without affecting the peer's. Solo,
+  it's a plain local metronome. (`src/synth.rs`, `src/note.rs`, `src/net.rs`,
+  `src/main.rs`)
+
+### Changed
+
+- **Roll timing preserves real silence.** The trailing-blank cap now defaults
+  to **20 s** (was 2 s), so a pause in your playing shows as roughly that much
+  blank paper instead of snapping to a couple seconds. Both the trailing-blank
+  cap and the idle-pause threshold (default 30 s) are now Preferences settings,
+  and each can be switched to **∞** — no clamp / no auto-pause — for a truly
+  unbounded gap (which needs both set to ∞). (`src/roll.rs`)
+- The File/Edit menus moved out of the collapsible settings panel into the new
+  title bar; the instance-rename field and save/open status stay in the panel.
+
 ## [0.3.1] - 2026-07-05
 
 ### Added

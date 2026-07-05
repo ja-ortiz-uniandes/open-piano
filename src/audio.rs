@@ -23,20 +23,49 @@ use crate::inference;
 use crate::note::NoteMsg;
 use crate::record::Recorder;
 
-/// Shared, lock-free detection threshold (model posterior probability, 0..1),
-/// stored as f32 bits. The UI writes it; the inference thread reads it.
+/// A shared, lock-free `f32` (stored as its bit pattern in an [`AtomicU32`]):
+/// the UI thread writes it, a realtime/inference thread reads it every hop with
+/// no locking. Cloning shares the same cell. Originally just the detection
+/// threshold; now the reusable primitive behind every live-editable audio knob.
 #[derive(Clone)]
-pub struct Threshold(Arc<AtomicU32>);
+pub struct SharedF32(Arc<AtomicU32>);
 
-impl Threshold {
+impl SharedF32 {
     pub fn new(initial: f32) -> Self {
-        Threshold(Arc::new(AtomicU32::new(initial.to_bits())))
+        SharedF32(Arc::new(AtomicU32::new(initial.to_bits())))
     }
     pub fn get(&self) -> f32 {
         f32::from_bits(self.0.load(Ordering::Relaxed))
     }
     pub fn set(&self, v: f32) {
         self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// The mic detection threshold (model posterior probability, 0..1). A
+/// [`SharedF32`] under a name the rest of the app already uses.
+pub type Threshold = SharedF32;
+
+/// Live-editable ONNX/DSP tunables shared with the inference thread — the
+/// former `SILENCE_RMS` / `NORM_MAX_GAIN` / `FRAME_OFF` constants, now cells the
+/// Preferences ▸ Advanced tab writes and the detector reads each hop. Cloning
+/// shares the underlying cells, so a UI edit takes effect on the next inference
+/// pass with no restart. (The detection threshold stays a separate handle —
+/// it's surfaced in the main config panel, not just Advanced.)
+#[derive(Clone)]
+pub struct InferenceTunables {
+    pub silence_rms: SharedF32,
+    pub norm_max_gain: SharedF32,
+    pub frame_off: SharedF32,
+}
+
+impl InferenceTunables {
+    pub fn new(silence_rms: f32, norm_max_gain: f32, frame_off: f32) -> Self {
+        InferenceTunables {
+            silence_rms: SharedF32::new(silence_rms),
+            norm_max_gain: SharedF32::new(norm_max_gain),
+            frame_off: SharedF32::new(frame_off),
+        }
     }
 }
 
@@ -78,6 +107,7 @@ impl AudioHandle {
 pub fn start_into(
     note_tx: Sender<NoteMsg>,
     threshold: Threshold,
+    tunables: InferenceTunables,
     status: Arc<Mutex<EngineStatus>>,
 ) -> AudioHandle {
     let stop = Arc::new(AtomicBool::new(false));
@@ -86,7 +116,7 @@ pub fn start_into(
     let join = thread::Builder::new()
         .name("audio-capture".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(note_tx, threshold, st.clone(), stop_for_thread) {
+            if let Err(e) = capture_loop(note_tx, threshold, tunables, st.clone(), stop_for_thread) {
                 eprintln!("[audio] fatal: {e}");
                 if let Ok(mut s) = st.lock() {
                     s.device = format!("Audio ERROR: {e}");
@@ -199,6 +229,7 @@ fn record_capture_loop(
 fn capture_loop(
     note_tx: Sender<NoteMsg>,
     threshold: Threshold,
+    tunables: InferenceTunables,
     status: Arc<Mutex<EngineStatus>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -229,11 +260,12 @@ fn capture_loop(
     {
         let note_tx = note_tx.clone();
         let threshold = threshold.clone();
+        let tunables = tunables.clone();
         let status = Arc::clone(&status);
         thread::Builder::new()
             .name("inference".into())
             .spawn(move || {
-                inference::run(raw_rx, note_tx, threshold, sample_rate, status);
+                inference::run(raw_rx, note_tx, threshold, tunables, sample_rate, status);
             })
             .expect("failed to spawn inference thread");
     }
