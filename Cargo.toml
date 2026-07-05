@@ -1,6 +1,6 @@
 [package]
 name = "open-piano"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Real-time, networked, peer-to-peer acoustic piano visualizer"
 license = "MIT OR Apache-2.0"
@@ -44,6 +44,17 @@ iroh-tickets = "1"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # `Connection::send_datagram` takes `bytes::Bytes` payloads.
 bytes = "1"
+# Standard MIDI File writing for the piano-roll save feature (see roll.rs).
+# Pure-Rust; the default `std` feature provides `Smf::save`.
+midly = "0.5"
+# Native "Save As…" dialog for exporting the piano roll. Blocking call on the
+# GUI thread — standard practice with eframe on Windows.
+rfd = "0.15"
+# JSON for the roll's color sidecar + JSONL export (see roll.rs). record.rs
+# deliberately hand-writes its JSON; here these files will also be *read back*
+# in a later phase, so robust (de)serialization is worth it — and serde is
+# already in the dependency graph transitively via iroh, so ~no build cost.
+serde_json = "1"
 
 [profile.dev]
 # Optimize the audio / pitch-detection math loops even in dev builds.

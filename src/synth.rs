@@ -36,19 +36,25 @@ const MASTER_GAIN: f32 = 0.22;
 /// warm rather than buzzy.
 const HARMONICS: [f32; 4] = [1.0, 0.45, 0.22, 0.12];
 
-/// Which player a synthesized note belongs to. Notes carry their channel so the
-/// audio callback can scale (or silence) the two sources independently — the
-/// keys *you* click on screen vs. the ones the *peer* plays.
+/// Which source a synthesized note belongs to. Notes carry their channel so
+/// the audio callback can scale (or silence) each source independently — the
+/// keys *you* click on screen, the ones the *peer* plays, and the notes a
+/// loaded MIDI file plays back (see playback.rs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// Notes from this player's on-screen (mouse) keyboard.
     Local = 0,
     /// Notes received from the remote peer.
     Peer = 1,
+    /// Notes auto-played from a loaded MIDI file. NOTE: main.rs's mic-echo
+    /// bookkeeping (`echo_held`) is sized for the two *live* channels only —
+    /// playback must drive `Synth::note_on/off` directly, never through
+    /// `synth_note_on`/`synth_note_off`.
+    Playback = 2,
 }
 
 /// Number of distinct channels; sizes the per-channel gain table.
-const CHANNELS: usize = 2;
+const CHANNELS: usize = 3;
 
 /// A command from the GUI thread to the audio callback.
 enum Cmd {
@@ -245,6 +251,14 @@ impl Synth {
             stop,
             join: Some(join),
         }
+    }
+
+    /// A synth whose commands go nowhere — for unit tests that need a
+    /// `&Synth` without opening a real audio device.
+    #[cfg(test)]
+    pub fn disconnected() -> Synth {
+        let (cmd_tx, _) = mpsc::channel::<Cmd>();
+        Synth { cmd_tx, stop: Arc::new(AtomicBool::new(false)), join: None }
     }
 
     /// Begin sounding `midi` (MIDI note number) on `channel`.

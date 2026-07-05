@@ -19,6 +19,8 @@ rustc-ice-*.txt
 # Captured training data (see src/record.rs + verify_alignment.py). Can be large
 # (raw WAV); keep it out of git. Plus the model + runtime + Python caches.
 recordings/
+# Saved piano rolls (see src/roll.rs) — user data, not source.
+rolls/
 model.onnx
 onnxruntime.dll
 __pycache__/

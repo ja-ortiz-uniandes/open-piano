@@ -87,3 +87,33 @@ pub fn midi_to_key_index(midi: u8) -> Option<usize> {
 pub fn is_black_key(midi: u8) -> bool {
     matches!(midi % 12, 1 | 3 | 6 | 8 | 10)
 }
+
+/// Fixed-do solfège note names, the app's naming convention for keys
+/// (Do = C). Sharps use the ASCII '#' so names are typeable in text fields.
+const SOLFEGE: [&str; 12] = [
+    "Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si",
+];
+
+/// Solfège name + scientific-pitch octave for a MIDI note: 60 → "Do4"
+/// (middle C), 21 → "La0" (the piano's lowest key).
+pub fn solfege_name(midi: u8) -> String {
+    let octave = (midi as i32 / 12) - 1;
+    format!("{}{}", SOLFEGE[(midi % 12) as usize], octave)
+}
+
+/// Inverse of `solfege_name`: case-insensitive "NameOctave" (e.g. "sol3",
+/// "do#5"; '♯' is accepted as an alias for '#'). `None` if it doesn't parse
+/// or falls outside MIDI 0..=127.
+pub fn solfege_to_midi(s: &str) -> Option<u8> {
+    let s = s.trim().replace('♯', "#").to_lowercase();
+    // Longest match first so "do#" isn't read as "do" + garbage octave.
+    let (pc, rest) = SOLFEGE
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| s.starts_with(&name.to_lowercase()))
+        .max_by_key(|(_, name)| name.len())
+        .map(|(i, name)| (i as i32, &s[name.len()..]))?;
+    let octave: i32 = rest.parse().ok()?;
+    let midi = (octave + 1) * 12 + pc;
+    u8::try_from(midi).ok().filter(|&m| m <= 127)
+}

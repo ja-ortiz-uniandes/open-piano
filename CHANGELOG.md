@@ -4,6 +4,40 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-04
+
+### Added
+
+- **Piano-roll history.** A paper-roll strip below the keyboard records every
+  note both players play — your color and the peer's, black keys thinner and
+  darker — with a time ruler (1 s gridlines, `mm:ss` labels every 10 s). The
+  roll pauses after 30 s of silence and draws a separator line when play
+  resumes, splitting the session into named "instances": rename the current
+  one inline (next to the File menu), Ctrl+click (or right-click) either roll
+  to insert a break by hand, and drag the strip to review history (it eases
+  back to live on release).
+- **Save & open rolls.** File ▸ Save (Ctrl+S) writes a standard MIDI file plus
+  a tiny color sidecar to `rolls/`; Save As… also offers a self-contained
+  JSONL. Instance names are saved as standard MIDI markers, so they show up in
+  any DAW. Closing the app with unsaved notes asks first.
+- **Playback: Listen & Learn modes.** File ▸ Open loads a saved roll:
+  falling notes descend onto the keyboard, auto-played through the built-in
+  synth (own volume/mute), with transport (⏮ ⏪ ▶/⏸ ⏩ ⏭ — segment-aware,
+  with the restart/previous double-tap convention) and a 0.25×–2× speed
+  slider. In Learn mode you play instead: pick which track(s) to practice and
+  the piece only advances while you're playing the right notes — strict
+  hold-the-notes gating by default, or a wait-for-onset mode; optionally block
+  on wrong notes; optionally restrict gating to a key range by dragging across
+  the falling notes (refine it with exact solfège names, e.g. Do4–Sol5).
+  Practice sessions record onto the live roll like normal play.
+- **Segments.** A roll's instances become named segments on playback: rename
+  them (persisted in a sidecar without touching the original file), jump
+  between them, and loop the current one — indefinitely or N times — with a
+  5-second breather between repeats.
+- **Mute mic.** A checkbox next to the detection threshold stops mic-detected
+  notes from painting the roll (or counting as played keys in Learn mode) —
+  handy in noisy rooms.
+
 ## [0.2.2] - 2026-07-02
 
 ### Added

@@ -21,7 +21,10 @@ mod input;
 mod midi;
 mod net;
 mod note;
+mod playback;
 mod record;
+mod roll;
+mod score;
 mod synth;
 mod update;
 
@@ -65,8 +68,8 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 380.0])
-            .with_min_inner_size([640.0, 300.0])
+            .with_inner_size([1100.0, 620.0])
+            .with_min_inner_size([640.0, 420.0])
             .with_title(concat!(
                 "open-piano v",
                 env!("CARGO_PKG_VERSION"),
@@ -112,6 +115,27 @@ const COLOR_HEARTBEAT: Duration = Duration::from_secs(1);
 /// margin), so the key doesn't flicker back on as the tone rings out.
 const ECHO_HOLDOFF: Duration = Duration::from_millis(2000);
 
+/// Pixels of paper per second of roll time in the history strip under the
+/// keyboard. 40 px/s shows ~6 s in the default window, and even a staccato
+/// click leaves a visible mark (plus `draw_roll` enforces a 2 px minimum).
+const ROLL_PX_PER_S: f32 = 40.0;
+
+/// How the central panel splits between the keyboard (top) and the roll
+/// (bottom): the keyboard takes this fraction of the height, but never less
+/// than `MIN_KEYBOARD_H` so keys stay playable in a short window.
+const KEYBOARD_FRACTION: f32 = 0.45;
+const MIN_KEYBOARD_H: f32 = 140.0;
+
+/// With a score loaded, the space not taken by the keyboard splits between
+/// the falling-notes panel (above the keys) and the history roll (below).
+/// Biased toward the falling notes — the forward-looking practice aid — over
+/// history review.
+const FALLING_FRACTION: f32 = 0.55;
+
+/// Ctrl+S (Cmd+S on mac) quick-saves the roll — same action as File ▸ Save.
+const SAVE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+
 struct PianoApp {
     // --- note input (MIDI or microphone fallback) ---
     input: InputEngine,
@@ -140,6 +164,12 @@ struct PianoApp {
     // --- key state ---
     local: [bool; KEY_COUNT],
     remote: [bool; KEY_COUNT],
+
+    // Ignore mic-detected note *onsets* while set (offs still pass, so held
+    // notes close instead of sticking). Useful when ambient noise keeps
+    // painting phantom notes on the roll — and during Learn-mode playback if
+    // the room is noisy.
+    mic_muted: bool,
 
     // --- mic↔synth echo guard (only relevant when the mic is the source) ---
     // The synth voices the on-screen keyboard and the peer through the speakers,
@@ -178,6 +208,49 @@ struct PianoApp {
 
     // Whether the About window is open (toggled from the status bar).
     show_about: bool,
+
+    // --- piano-roll history (see roll.rs + draw_roll) ---
+    roll: roll::Roll,
+    // Drag-to-review view state: `Some(t)` is the roll time rendered at the
+    // strip's top edge while scrolled back (or animating home); `None` = live.
+    scrollback: Option<f64>,
+    // Result of the last save attempt, shown next to the File menu.
+    roll_status: String,
+    // Whether the "unsaved roll" confirmation is up (close was intercepted).
+    show_close_confirm: bool,
+    // Set once the user confirms quitting, so the re-issued close passes the
+    // interception even though the roll is still unsaved.
+    allow_close: bool,
+
+    // --- playback of a loaded score (see playback.rs; None = live mode) ---
+    playback: Option<playback::PlaybackEngine>,
+    // Per-channel volume/mute for the playback synth source, mirroring the
+    // screen/peer pairs above.
+    playback_volume: f32,
+    playback_muted: bool,
+    // Result of the last File > Open (load warnings/errors).
+    open_status: String,
+    // Whether the segment row + Learn side panel are shown (👁 toggle).
+    panels_visible: bool,
+    // Right-click time stash: a `context_menu` closure runs on frames after
+    // the opening click, so the clicked time must be captured when
+    // `secondary_clicked()` fires, not re-derived inside the menu.
+    pending_break_t: Option<f64>,
+    // In-progress key-range drag on the falling panel: (start x, current x).
+    range_drag: Option<(f32, f32)>,
+    // "Refine range" dialog state: visibility + the two editable key names.
+    show_refine_range: bool,
+    refine_lo: String,
+    refine_hi: String,
+    // Persistent buffers for the two rename-in-place fields. A TextEdit's
+    // backing string must survive across frames while focused, or typed
+    // characters are wiped on the next repaint; these mirror the app state
+    // while idle and only commit on lost focus.
+    instance_edit: String,
+    segment_edit: String,
+    // Which segment `segment_edit` is editing — pinned on focus so a moving
+    // playhead can't silently redirect the rename to a different segment.
+    segment_edit_idx: usize,
 }
 
 impl PianoApp {
@@ -191,6 +264,7 @@ impl PianoApp {
             peer_volume: 1.0,
             peer_muted: false,
             threshold: DEFAULT_THRESHOLD,
+            mic_muted: false,
             notes_epoch: 0,
             was_midi: false,
             local: [false; KEY_COUNT],
@@ -211,6 +285,24 @@ impl PianoApp {
             // state each frame (see `update_controls`).
             updater: update::start(),
             show_about: false,
+            roll: roll::Roll::new(),
+            scrollback: None,
+            roll_status: String::new(),
+            show_close_confirm: false,
+            allow_close: false,
+            playback: None,
+            playback_volume: 1.0,
+            playback_muted: false,
+            open_status: String::new(),
+            panels_visible: true,
+            pending_break_t: None,
+            range_drag: None,
+            show_refine_range: false,
+            refine_lo: String::new(),
+            refine_hi: String::new(),
+            instance_edit: String::new(),
+            segment_edit: String::new(),
+            segment_edit_idx: 0,
         }
     }
 
@@ -257,6 +349,7 @@ impl PianoApp {
                 self.synth_note_off(MIDI_LOW + idx as u8, synth::Channel::Peer);
             }
         }
+        self.roll.release_all(roll::Who::Remote);
     }
 
     /// Drain the input channel (MIDI or mic, whichever is active): update local
@@ -281,6 +374,9 @@ impl PianoApp {
                     }
                 }
             }
+            // The matching note-offs will never arrive, so close the roll's
+            // open marks too.
+            self.roll.release_all(roll::Who::Local);
         }
 
         // Only the microphone backend can hear the synth bleed back; a MIDI piano
@@ -295,7 +391,13 @@ impl PianoApp {
             if mic_source && self.echo_suppressed(msg.midi()) {
                 continue;
             }
+            // Muted mic: drop new onsets but let offs through, so anything
+            // already sounding when the mute flipped on closes normally.
+            if mic_source && self.mic_muted && matches!(msg, NoteMsg::On(_)) {
+                continue;
+            }
             apply(&mut self.local, msg);
+            self.roll.note(roll::Who::Local, msg, self.local_color);
             if let Some(peer) = &self.peer {
                 peer.send(Packet::Note(msg));
             }
@@ -380,6 +482,496 @@ impl PianoApp {
         }
     }
 
+    /// The File menu (save the piano roll) plus the "unsaved" chip and the
+    /// last save result. Lives in a `menu::bar` row at the top of the config
+    /// panel. Save As… lets the user pick between the interoperable MIDI
+    /// export and the self-contained JSONL one (see roll.rs).
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            let save = egui::Button::new("Save roll")
+                .shortcut_text(ui.ctx().format_shortcut(&SAVE_SHORTCUT));
+            if ui
+                .add_enabled(!self.roll.is_empty(), save)
+                .on_hover_text("Write the roll to rolls/roll_<time>.mid (+ .json colors)")
+                .clicked()
+            {
+                ui.close_menu();
+                self.save_roll_quick();
+            }
+            if ui
+                .add_enabled(!self.roll.is_empty(), egui::Button::new("Save roll as…"))
+                .on_hover_text("Choose where to save, as MIDI (+ colors) or JSONL")
+                .clicked()
+            {
+                ui.close_menu();
+                self.save_roll_as();
+            }
+            ui.separator();
+            if ui
+                .button("Open…")
+                .on_hover_text("Load a saved roll (.mid or .jsonl) for playback / practice")
+                .clicked()
+            {
+                ui.close_menu();
+                self.open_score();
+            }
+            if self.playback.is_some() && ui.button("Close file").clicked() {
+                ui.close_menu();
+                if let Some(pb) = &mut self.playback {
+                    pb.silence(&self.synth);
+                }
+                self.playback = None;
+                self.open_status.clear();
+            }
+        });
+        if self.roll.has_unsaved() {
+            ui.colored_label(egui::Color32::from_rgb(210, 170, 60), "● unsaved")
+                .on_hover_text("The roll has notes that haven't been saved (File ▸ Save)");
+        }
+        // Rename whichever instance the live roll is currently in — the name
+        // is baked into the file's markers on the next save.
+        if !self.roll.is_empty() {
+            ui.separator();
+            ui.label("Instance:");
+            let current = self.roll.current_instance_name();
+            let edit =
+                ui.add(egui::TextEdit::singleline(&mut self.instance_edit).desired_width(120.0));
+            if edit.lost_focus() {
+                if !self.instance_edit.is_empty() && self.instance_edit != current {
+                    self.roll.rename_current_instance(self.instance_edit.clone());
+                }
+            } else if !edit.has_focus() {
+                // Idle: mirror the app state (the current instance can change
+                // under the field as the clock runs).
+                self.instance_edit = current;
+            }
+        }
+        if !self.roll_status.is_empty() {
+            ui.weak(&self.roll_status);
+        }
+        if !self.open_status.is_empty() {
+            ui.weak(&self.open_status);
+        }
+    }
+
+    /// File > Open…: load a `.mid`/`.jsonl` into a playback engine. Playback
+    /// and a live P2P session are mutually exclusive — a real peer's notes
+    /// colliding with a score's "Remote" track visualization would be
+    /// nonsense, so opening a file drops any session.
+    fn open_score(&mut self) {
+        std::fs::create_dir_all("rolls").ok();
+        let start_dir = std::env::current_dir().unwrap_or_default().join("rolls");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Piano rolls", &["mid", "midi", "jsonl"])
+            .set_directory(start_dir)
+            .pick_file()
+        else {
+            return; // cancelled
+        };
+        match score::Score::load(&path) {
+            Ok(s) => {
+                self.peer = None;
+                self.my_ticket = None;
+                self.clear_remote_keys();
+                self.net_status = "Not connected".to_string();
+                if let Some(pb) = &mut self.playback {
+                    pb.silence(&self.synth); // replacing an already-open file
+                }
+                self.open_status = match &s.warning {
+                    Some(w) => format!("opened {} ({w})", path.display()),
+                    None => format!("opened {}", path.display()),
+                };
+                self.playback = Some(playback::PlaybackEngine::new(s, path));
+                self.scrollback = None;
+                self.range_drag = None;
+            }
+            Err(e) => self.open_status = format!("open failed: {e}"),
+        }
+    }
+
+    /// One-click save to `rolls/roll_<unix>.mid` (+ color sidecar). Returns
+    /// whether it succeeded, so the unsaved-close dialog can gate quitting on
+    /// the file actually being on disk.
+    fn save_roll_quick(&mut self) -> bool {
+        if self.roll.is_empty() {
+            return false;
+        }
+        match roll::save_quick(&self.roll, self.local_color, self.remote_color) {
+            Ok(path) => {
+                self.roll.mark_saved();
+                self.roll_status = format!("saved → {}", path.display());
+                true
+            }
+            Err(e) => {
+                self.roll_status = format!("save failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// "Save As…" via the native dialog. Blocking on the GUI thread is fine:
+    /// the frame simply freezes while the dialog is up, which is standard for
+    /// eframe apps on Windows. The chosen extension picks the format.
+    fn save_roll_as(&mut self) {
+        // Make sure the default directory exists so the dialog lands there.
+        std::fs::create_dir_all("rolls").ok();
+        let start_dir = std::env::current_dir().unwrap_or_default().join("rolls");
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("MIDI + color sidecar", &["mid"])
+            .add_filter("Piano-roll JSONL", &["jsonl"])
+            .set_directory(start_dir)
+            .set_file_name("roll")
+            .save_file()
+        else {
+            return; // cancelled
+        };
+        let result = match path.extension().and_then(|e| e.to_str()) {
+            Some("jsonl") => roll::save_jsonl(&self.roll, self.local_color, self.remote_color, &path),
+            _ => roll::save_midi(&self.roll, self.local_color, self.remote_color, &path),
+        };
+        match result {
+            Ok(()) => {
+                self.roll.mark_saved();
+                self.roll_status = format!("saved → {}", path.display());
+            }
+            Err(e) => self.roll_status = format!("save failed: {e}"),
+        }
+    }
+
+    /// The "unsaved roll" confirmation shown when the window ✕ is clicked with
+    /// unsaved notes. Deliberately has no titlebar ✕ (`.open()`): only the
+    /// three buttons resolve it. A failed save stays open with the error
+    /// visible rather than losing the roll.
+    fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_close_confirm {
+            return;
+        }
+        egui::Window::new("Unsaved piano roll")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("The piano roll has notes that haven't been saved.");
+                if !self.roll_status.is_empty() {
+                    ui.weak(&self.roll_status);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save and quit").clicked() && self.save_roll_quick() {
+                        // Synchronous save: the file is on disk before the
+                        // process is allowed to die. On failure we fall
+                        // through with the error shown above.
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Quit without saving").clicked() {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_close_confirm = false;
+                    }
+                });
+            });
+    }
+
+    /// Transport + mode + speed for the loaded score. Always visible while a
+    /// file is open (core playback UI, unlike the hideable settings panels).
+    /// Glyph scheme: barred ⏮/⏭ act on the whole piece, double-triangle
+    /// ⏪/⏩ on one segment, and play/pause flips ▶/⏸ with state.
+    fn playback_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(pb) = &mut self.playback else { return };
+
+        if ui.button("⏮").on_hover_text("Jump to the start of the piece").clicked() {
+            pb.jump_to(0.0, &self.synth);
+        }
+        if ui
+            .button("⏪")
+            .on_hover_text("Restart this segment (press again right away for the previous one)")
+            .clicked()
+        {
+            pb.restart_or_previous(&self.synth);
+        }
+        let play_label = if pb.playing { "⏸" } else { "▶" };
+        if ui
+            .button(play_label)
+            .on_hover_text(if pb.playing { "Pause" } else { "Play" })
+            .clicked()
+        {
+            pb.set_playing(!pb.playing, &self.synth);
+        }
+        if ui.button("⏩").on_hover_text("Jump to the next segment").clicked() {
+            pb.next_segment(&self.synth);
+        }
+        if ui.button("⏭").on_hover_text("Jump to the end of the piece").clicked() {
+            let end = pb.score.duration_s;
+            pb.jump_to(end, &self.synth);
+        }
+
+        ui.separator();
+        ui.radio_value(&mut pb.mode, playback::Mode::Listen, "Listen");
+        ui.radio_value(&mut pb.mode, playback::Mode::Learn, "Learn");
+        ui.separator();
+        ui.add(egui::Slider::new(&mut pb.speed, 0.25..=2.0).text("speed"));
+        ui.separator();
+        let eye = if self.panels_visible { "Hide panels" } else { "Show panels" };
+        ui.checkbox(&mut self.panels_visible, eye)
+            .on_hover_text("Show/hide the segment row and Learn settings panel");
+        if pb.finished {
+            ui.weak("— finished");
+        }
+    }
+
+    /// The current segment's name (editable, persisted to the sidecar) and
+    /// its loop controls. Shown in both modes — looping a passage is as
+    /// useful for listening as for practicing.
+    fn segment_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(pb) = &mut self.playback else { return };
+        let idx = pb.current_segment_index();
+
+        ui.label("Segment:");
+        let edit =
+            ui.add(egui::TextEdit::singleline(&mut self.segment_edit).desired_width(140.0));
+        if edit.lost_focus() {
+            // Commit to the segment that was pinned when editing began — the
+            // playhead may have moved on since.
+            let i = self.segment_edit_idx.min(pb.score.segments.len() - 1);
+            if !self.segment_edit.is_empty() && self.segment_edit != pb.score.segments[i].name {
+                pb.score.segments[i].name = self.segment_edit.clone();
+                if let Err(e) = pb.score.save_segment_sidecar(&pb.source_path) {
+                    self.open_status = format!("couldn't save segment names: {e}");
+                }
+            }
+        } else if !edit.has_focus() {
+            // Idle: follow the playhead's current segment.
+            self.segment_edit = pb.score.segments[idx].name.clone();
+            self.segment_edit_idx = idx;
+        }
+        ui.weak(format!("({}/{})", idx + 1, pb.score.segments.len()));
+
+        ui.separator();
+        ui.checkbox(&mut pb.loop_state.enabled, "Loop this segment");
+        if pb.loop_state.enabled {
+            let mut finite = pb.loop_state.remaining.is_some();
+            if ui
+                .checkbox(&mut finite, "Limit repeats")
+                .on_hover_text("Repeats *after* the pass currently playing")
+                .changed()
+            {
+                pb.loop_state.remaining = if finite { Some(3) } else { None };
+            }
+            if let Some(n) = &mut pb.loop_state.remaining {
+                ui.add(egui::DragValue::new(n).range(1..=99));
+            }
+            match pb.loop_state.pad_left_s {
+                Some(left) => {
+                    ui.weak(format!("looping in {left:.1}s"));
+                }
+                None => {
+                    ui.weak(match pb.loop_state.remaining {
+                        Some(n) => format!("🔁 {n} more"),
+                        None => "🔁 ∞".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Learn-mode settings side panel: which tracks to practice, how strict
+    /// the gating is, and the key-range readout. Must be shown *before* the
+    /// CentralPanel each frame (egui reserves panel space in show order).
+    fn learn_panel(&mut self, ctx: &egui::Context) {
+        let Some(pb) = &mut self.playback else { return };
+        if pb.mode != playback::Mode::Learn || !self.panels_visible {
+            return;
+        }
+        egui::SidePanel::right("learn_panel")
+            .resizable(false)
+            .default_width(220.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.strong("Learn settings");
+                ui.add_space(4.0);
+                ui.checkbox(&mut pb.learn.practice[0], "Practice Local track");
+                ui.checkbox(&mut pb.learn.practice[1], "Practice Remote track");
+                if !pb.learn.practice[0] && !pb.learn.practice[1] {
+                    ui.weak("No track selected — behaves like Listen mode");
+                }
+                for (i, label) in [(0, "Local"), (1, "Remote")] {
+                    if pb.learn.practice[i] && pb.score.tracks[i].notes.is_empty() {
+                        ui.weak(format!("({label} track has no notes)"));
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut pb.learn.require_hold, "Require holding notes")
+                    .on_hover_text(
+                        "Off = wait for the right notes, then continue even if you release early",
+                    );
+                ui.checkbox(&mut pb.learn.block_wrong, "Block on wrong notes")
+                    .on_hover_text("Extra held keys also freeze playback");
+                ui.separator();
+                match pb.learn.key_range {
+                    Some((lo, hi)) => {
+                        ui.label(format!(
+                            "Key range: {} – {}",
+                            note::solfege_name(lo),
+                            note::solfege_name(hi)
+                        ));
+                        if ui.button("Clear range").clicked() {
+                            pb.learn.key_range = None;
+                        }
+                    }
+                    None => {
+                        ui.weak("Key range: whole keyboard");
+                        ui.weak("(drag across the falling notes to set one)");
+                    }
+                }
+            });
+    }
+
+    /// Clicks and drags on the falling-notes panel: Ctrl+click / right-click
+    /// insert a segment break at the clicked time (persisted via the
+    /// sidecar); a horizontal drag selects the Learn key-range band; a plain
+    /// click outside the band clears it; right-click also offers "Refine
+    /// range…" while a band exists.
+    fn falling_panel_interactions(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        keys: &[KeyRect],
+    ) {
+        let Some(pb) = &mut self.playback else { return };
+        let rect = resp.rect;
+        // Capture the value, not `pb`, so the closure doesn't pin the borrow.
+        let playhead = pb.playhead_s;
+        let t_of_y = move |y: f32| playhead + ((rect.bottom() - y) / ROLL_PX_PER_S) as f64;
+
+        // Horizontal drag -> key-range selection.
+        if resp.drag_started() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                self.range_drag = Some((pos.x, pos.x));
+            }
+        }
+        if resp.dragged() {
+            if let (Some(drag), Some(pos)) = (&mut self.range_drag, resp.interact_pointer_pos()) {
+                drag.1 = pos.x;
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some((a, b)) = self.range_drag.take() {
+                let (x0, x1) = (a.min(b), a.max(b));
+                // Keys whose lane intersects the dragged span; a sub-key drag
+                // still grabs whatever key it touched.
+                let mut lo = u8::MAX;
+                let mut hi = u8::MIN;
+                for k in keys {
+                    if k.rect.right() >= x0 && k.rect.left() <= x1 {
+                        lo = lo.min(k.midi);
+                        hi = hi.max(k.midi);
+                    }
+                }
+                if lo <= hi {
+                    pb.learn.key_range = Some((lo, hi));
+                }
+            }
+        }
+
+        if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if ui.input(|i| i.modifiers.command) {
+                    pb.score.insert_segment_break(t_of_y(pos.y));
+                    if let Err(e) = pb.score.save_segment_sidecar(&pb.source_path) {
+                        self.open_status = format!("couldn't save segment breaks: {e}");
+                    }
+                } else if let Some((lo, hi)) = pb.learn.key_range {
+                    // A plain click outside the band dismisses it; inside is
+                    // inert so stray clicks don't discard the selection.
+                    if let Some(band) = range_band_x(keys, lo, hi) {
+                        if !band.contains(pos.x) {
+                            pb.learn.key_range = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        if resp.secondary_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                self.pending_break_t = Some(t_of_y(pos.y));
+            }
+        }
+        // NOTE: shown while *any* band exists (not only when the click landed
+        // inside it) — simpler, and harmless to offer slightly outside.
+        let has_range = pb.learn.key_range.is_some();
+        let range_text = pb
+            .learn
+            .key_range
+            .map(|(lo, hi)| (note::solfege_name(lo), note::solfege_name(hi)));
+        resp.context_menu(|ui| {
+            if ui.button("Insert segment break here").clicked() {
+                if let Some(t) = self.pending_break_t.take() {
+                    if let Some(pb) = &mut self.playback {
+                        pb.score.insert_segment_break(t);
+                        if let Err(e) = pb.score.save_segment_sidecar(&pb.source_path) {
+                            self.open_status = format!("couldn't save segment breaks: {e}");
+                        }
+                    }
+                }
+                ui.close_menu();
+            }
+            if has_range && ui.button("Refine range…").clicked() {
+                if let Some((lo, hi)) = &range_text {
+                    self.refine_lo = lo.clone();
+                    self.refine_hi = hi.clone();
+                }
+                self.show_refine_range = true;
+                ui.close_menu();
+            }
+        });
+    }
+
+    /// The "Refine range…" dialog: exact solfège key names for the Learn
+    /// key-range band. A field that doesn't parse just leaves that end as-is.
+    fn refine_range_window(&mut self, ctx: &egui::Context) {
+        if !self.show_refine_range {
+            return;
+        }
+        let Some(pb) = &mut self.playback else {
+            self.show_refine_range = false;
+            return;
+        };
+        egui::Window::new("Refine key range")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Key names use solfège + octave, e.g. Do4 (middle C), Sol#2, La5.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("From:");
+                    ui.add(egui::TextEdit::singleline(&mut self.refine_lo).desired_width(70.0));
+                    ui.label("to:");
+                    ui.add(egui::TextEdit::singleline(&mut self.refine_hi).desired_width(70.0));
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Set").clicked() {
+                        let (cur_lo, cur_hi) =
+                            pb.learn.key_range.unwrap_or((MIDI_LOW, MIDI_HIGH));
+                        let lo = note::solfege_to_midi(&self.refine_lo).unwrap_or(cur_lo);
+                        let hi = note::solfege_to_midi(&self.refine_hi).unwrap_or(cur_hi);
+                        let lo = lo.clamp(MIDI_LOW, MIDI_HIGH);
+                        let hi = hi.clamp(MIDI_LOW, MIDI_HIGH);
+                        pb.learn.key_range = Some((lo.min(hi), lo.max(hi)));
+                        self.show_refine_range = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_refine_range = false;
+                    }
+                });
+            });
+    }
+
     /// Synth volume + mute controls for the two sources with no acoustic origin:
     /// the keys you click on screen and the notes the peer plays. Each has a mute
     /// toggle and a 0–100% volume slider; changes are pushed to the synth as
@@ -406,6 +998,18 @@ impl PianoApp {
                     .text("peer"),
             )
             .changed();
+        if self.playback.is_some() {
+            ui.separator();
+            changed |= ui.checkbox(&mut self.playback_muted, "Mute playback").changed();
+            changed |= ui
+                .add_enabled(
+                    !self.playback_muted,
+                    egui::Slider::new(&mut self.playback_volume, 0.0..=1.0)
+                        .show_value(false)
+                        .text("playback"),
+                )
+                .changed();
+        }
         if changed {
             self.apply_synth_gains();
         }
@@ -466,8 +1070,10 @@ impl PianoApp {
     fn apply_synth_gains(&self) {
         let screen = if self.screen_muted { 0.0 } else { self.screen_volume };
         let peer = if self.peer_muted { 0.0 } else { self.peer_volume };
+        let playback = if self.playback_muted { 0.0 } else { self.playback_volume };
         self.synth.set_gain(synth::Channel::Local, screen);
         self.synth.set_gain(synth::Channel::Peer, peer);
+        self.synth.set_gain(synth::Channel::Playback, playback);
     }
 
     /// Apply the source-dependent default for the on-screen ("screen") synth:
@@ -491,6 +1097,7 @@ impl PianoApp {
     /// in `pump_input`, plus the synth (clicks have no other sound source).
     fn local_note(&mut self, msg: NoteMsg) {
         apply(&mut self.local, msg);
+        self.roll.note(roll::Who::Local, msg, self.local_color);
         self.play_synth(msg, synth::Channel::Local);
         if let Some(peer) = &self.peer {
             peer.send(Packet::Note(msg));
@@ -571,6 +1178,7 @@ impl PianoApp {
                 NetEvent::Disconnected => self.clear_remote_keys(),
                 NetEvent::Packet(Packet::Note(msg)) => {
                     apply(&mut self.remote, msg);
+                    self.roll.note(roll::Who::Remote, msg, self.remote_color);
                     // The peer's notes have no local sound source, so voice them.
                     self.play_synth(msg, synth::Channel::Peer);
                 }
@@ -592,6 +1200,37 @@ impl eframe::App for PianoApp {
         self.pump_input();
         self.pump_network();
         self.sync_synth_to_source();
+        self.roll.tick(Instant::now());
+
+        // Advance the loaded score's playhead (Listen auto-play / Learn
+        // gating). `self.local` is already current from the pumps above.
+        // dt is clamped: after a GUI-thread stall (the blocking rfd file
+        // dialog, a window drag, a system sleep) the first frame's dt is the
+        // whole stall — unclamped it would fling the playhead past the end
+        // of the piece the moment a file is opened.
+        if let Some(pb) = &mut self.playback {
+            let dt = (ctx.input(|i| i.stable_dt) as f64).min(0.1);
+            let held: std::collections::BTreeSet<u8> = (0..KEY_COUNT)
+                .filter(|&i| self.local[i])
+                .map(|i| MIDI_LOW + i as u8)
+                .collect();
+            pb.tick(dt, &held, &self.synth);
+        }
+
+        // Intercept the window ✕ while the roll has unsaved notes: cancel the
+        // close (must happen this same frame) and ask instead. `allow_close`
+        // lets the close we re-issue from the dialog through.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.roll.has_unsaved()
+            && !self.allow_close
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.show_close_confirm = true;
+        }
+
+        if ctx.input_mut(|i| i.consume_shortcut(&SAVE_SHORTCUT)) {
+            self.save_roll_quick();
+        }
 
         // Track how long the pointer has held still. This drives the two-stage
         // "keyboard locked" tooltip during recording: a short label on hover that
@@ -615,6 +1254,9 @@ impl eframe::App for PianoApp {
         // ---- Top: networking + audio config ----
         egui::TopBottomPanel::top("config").show(ctx, |ui| {
             ui.add_space(4.0);
+            // ---- File menu (save the piano roll) + unsaved/status chips ----
+            egui::menu::bar(ui, |ui| self.file_menu(ui));
+            ui.separator();
             // ---- Auto-update banner (only drawn when there's something to act on) ----
             let mut drawn = false;
             ui.horizontal(|ui| drawn = self.update_controls(ui));
@@ -622,8 +1264,14 @@ impl eframe::App for PianoApp {
                 ui.separator();
             }
             // ---- Play together: host a session or join one with an invite
-            // code. No IPs or ports — iroh handles NAT traversal (net.rs). ----
+            // code. No IPs or ports — iroh handles NAT traversal (net.rs).
+            // Hidden while a file is open: playback and live P2P are
+            // mutually exclusive (see `open_score`). ----
             ui.horizontal(|ui| {
+                if self.playback.is_some() {
+                    ui.weak("Networking is disabled while a file is open (File ▸ Close file)");
+                    return;
+                }
                 if ui
                     .button("Host session")
                     .on_hover_text("Create an invite code to send to the other player")
@@ -655,6 +1303,15 @@ impl eframe::App for PianoApp {
                     self.join();
                 }
             });
+            // ---- Playback transport + segment row (only with a file open) ----
+            if self.playback.is_some() {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| self.playback_controls(ui));
+                if self.panels_visible {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| self.segment_controls(ui));
+                }
+            }
             // The detection threshold only affects ONNX transcription, so it's
             // only meaningful when the microphone fallback is active.
             if self.input.source() == Source::Microphone {
@@ -667,6 +1324,11 @@ impl eframe::App for PianoApp {
                     {
                         self.input.threshold.set(self.threshold);
                     }
+                    ui.separator();
+                    ui.checkbox(&mut self.mic_muted, "Mute mic").on_hover_text(
+                        "Ignore mic-detected notes (stops ambient noise from \
+                         painting the roll or counting as played keys)",
+                    );
                 });
             }
             // ---- My color (broadcast to the peer) ----
@@ -727,32 +1389,50 @@ impl eframe::App for PianoApp {
         });
 
         self.about_window(ctx);
+        self.unsaved_dialog(ctx);
+        self.refine_range_window(ctx);
+        // Side panels reserve space in show order — must precede CentralPanel.
+        self.learn_panel(ctx);
 
-        // ---- Center: the 88-key keyboard (also playable with the mouse) ----
+        // ---- Center: the 88-key keyboard (also playable with the mouse),
+        // the piano-roll history strip on the paper below it, and — with a
+        // score loaded — the falling-notes panel above it ----
         egui::CentralPanel::default().show(ctx, |ui| {
+            let avail = ui.available_size();
+            let kb_h = (avail.y * KEYBOARD_FRACTION).max(MIN_KEYBOARD_H).min(avail.y);
+
+            // Falling-notes panel first (it sits on top, ending at the keys).
+            let falling_resp = self.playback.as_ref().map(|_| {
+                let h = ((avail.y - kb_h).max(0.0) * FALLING_FRACTION).floor();
+                ui.allocate_response(egui::vec2(avail.x, h), egui::Sense::click_and_drag())
+            });
+
             let response =
-                ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
+                ui.allocate_response(egui::vec2(avail.x, kb_h), egui::Sense::click_and_drag());
             let rect = response.rect;
 
-            // Mouse play is disabled while capturing training data: a click makes
-            // no real sound and isn't written to the MIDI labels, so it would put
-            // notes on screen that don't exist in the recorded audio.
-            if self.input.recorder.is_armed() {
+            // Mouse play is disabled while capturing training data (a click
+            // makes no real sound and isn't in the MIDI labels) and while a
+            // score is open (clicking keys would fight the score's own
+            // highlights; real MIDI/mic input is the Learn-mode instrument).
+            if self.input.recorder.is_armed() || self.playback.is_some() {
                 self.set_mouse_note(None); // drop any note the mouse was holding
-                response.on_hover_ui(|ui| {
-                    ui.set_max_width(260.0);
-                    ui.label(
-                        egui::RichText::new("🔒 Recording — keyboard locked").strong(),
-                    );
-                    if still_secs >= 1.0 {
-                        ui.add_space(4.0);
+                if self.input.recorder.is_armed() {
+                    response.on_hover_ui(|ui| {
+                        ui.set_max_width(260.0);
                         ui.label(
-                            "A mouse click makes no sound and isn't written to the \
-                             MIDI labels, so it would show notes that aren't in the \
-                             recorded audio. Stop recording to play with the mouse.",
+                            egui::RichText::new("🔒 Recording — keyboard locked").strong(),
                         );
-                    }
-                });
+                        if still_secs >= 1.0 {
+                            ui.add_space(4.0);
+                            ui.label(
+                                "A mouse click makes no sound and isn't written to the \
+                                 MIDI labels, so it would show notes that aren't in the \
+                                 recorded audio. Stop recording to play with the mouse.",
+                            );
+                        }
+                    });
+                }
             } else {
                 // While the button is held, the key under the pointer is played;
                 // dragging across keys glides note-to-note.
@@ -764,11 +1444,102 @@ impl eframe::App for PianoApp {
                 self.set_mouse_note(target);
             }
 
-            let colors = KeyColors {
-                local: egui::Color32::from_rgb(self.local_color[0], self.local_color[1], self.local_color[2]),
-                remote: egui::Color32::from_rgb(self.remote_color[0], self.remote_color[1], self.remote_color[2]),
-            };
-            draw_keyboard(ui.painter(), rect, &self.local, &self.remote, colors);
+            // The keyboard's key layout doubles as lane geometry for both
+            // roll panels, so marks are exactly x-aligned with their keys.
+            let keys = layout_keys(rect);
+
+            if let Some(pb) = &self.playback {
+                // Layered keyboard: your live presses, plus each unpracticed
+                // track's currently-playing notes in its own color.
+                let mut layers: Vec<([bool; KEY_COUNT], egui::Color32)> = vec![(
+                    self.local,
+                    egui::Color32::from_rgb(
+                        self.local_color[0],
+                        self.local_color[1],
+                        self.local_color[2],
+                    ),
+                )];
+                for who in [roll::Who::Local, roll::Who::Remote] {
+                    if !pb.practiced(who) {
+                        let [r, g, b] = pb.score.tracks[who.idx()].color;
+                        layers.push((pb.active_key_array(who), egui::Color32::from_rgb(r, g, b)));
+                    }
+                }
+                draw_keyboard_layered(ui.painter(), rect, &keys, &layers);
+            } else {
+                let colors = KeyColors {
+                    local: egui::Color32::from_rgb(self.local_color[0], self.local_color[1], self.local_color[2]),
+                    remote: egui::Color32::from_rgb(self.remote_color[0], self.remote_color[1], self.remote_color[2]),
+                };
+                draw_keyboard(ui.painter(), rect, &self.local, &self.remote, colors);
+            }
+
+            // Falling-panel interactions + drawing.
+            if let Some(falling_resp) = falling_resp {
+                self.falling_panel_interactions(ui, &falling_resp, &keys);
+                if let Some(pb) = &self.playback {
+                    draw_falling(
+                        ui.painter(),
+                        falling_resp.rect,
+                        &keys,
+                        &pb.score,
+                        pb.playhead_s,
+                        pb.learn.key_range,
+                        self.range_drag,
+                    );
+                }
+            }
+
+            // ---- The roll strip: everything below the keyboard. Dragging it
+            // reviews history; releasing eases back to the live edge. ----
+            let roll_resp =
+                ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
+            if roll_resp.dragged() {
+                // Dragging up (negative delta.y) pulls older paper into view:
+                // a mark sits at y ∝ (view_top − t), so moving marks up means
+                // lowering the view-top time.
+                let top = self.scrollback.unwrap_or(self.roll.now_s());
+                let new_top = (top + (roll_resp.drag_delta().y / ROLL_PX_PER_S) as f64)
+                    .clamp(0.0, self.roll.now_s());
+                self.scrollback = Some(new_top);
+            } else if let Some(top) = self.scrollback {
+                // Ease home exponentially (~0.2 s feel, frame-rate independent)
+                // and snap to live once within half a pixel.
+                let dt = ctx.input(|i| i.stable_dt) as f64;
+                let now = self.roll.now_s();
+                let eased = now + (top - now) * (-dt * 12.0).exp();
+                self.scrollback = if (now - eased).abs() < 0.5 / ROLL_PX_PER_S as f64 {
+                    None
+                } else {
+                    Some(eased)
+                };
+            }
+            let view_top_s = self.scrollback.unwrap_or(self.roll.now_s());
+
+            // Manual instance breaks on the history roll: Ctrl+click inserts
+            // one at the clicked time; right-click offers the same via menu.
+            let roll_t_of_y =
+                |y: f32| view_top_s - ((y - roll_resp.rect.top()) / ROLL_PX_PER_S) as f64;
+            if roll_resp.clicked() && ui.input(|i| i.modifiers.command) {
+                if let Some(pos) = roll_resp.interact_pointer_pos() {
+                    self.roll.insert_separator(roll_t_of_y(pos.y));
+                }
+            }
+            if roll_resp.secondary_clicked() {
+                if let Some(pos) = roll_resp.interact_pointer_pos() {
+                    self.pending_break_t = Some(roll_t_of_y(pos.y));
+                }
+            }
+            roll_resp.context_menu(|ui| {
+                if ui.button("Insert segment break here").clicked() {
+                    if let Some(t) = self.pending_break_t.take() {
+                        self.roll.insert_separator(t);
+                    }
+                    ui.close_menu();
+                }
+            });
+
+            draw_roll(ui.painter(), roll_resp.rect, &keys, &self.roll, view_top_s);
         });
 
         // Keep redrawing for smooth real-time updates.
@@ -917,5 +1688,295 @@ fn draw_keyboard(
             (egui::Color32::from_gray(245), white_stroke)
         };
         paint_key(painter, key.rect, local[idx], remote[idx], colors, base, 2.0, stroke);
+    }
+}
+
+/// Render the piano-roll history strip: paper that scrolls down from the
+/// keyboard, where every note leaves a mark in its key's lane.
+///
+/// `keys` is the *keyboard's* layout, so lanes are exactly x-aligned with the
+/// keys above. `view_top_s` is the roll time at the strip's top edge — equal
+/// to `roll.now_s()` when live, older while drag-reviewing.
+///
+/// Paint order: ruler (1 s / 10 s gridlines + timestamps), instance
+/// separators, then marks — white-key lanes first and black on top, mirroring
+/// the keyboard, with black marks naturally thinner (black-key width) and
+/// drawn darker.
+fn draw_roll(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    keys: &[KeyRect],
+    roll: &roll::Roll,
+    view_top_s: f64,
+) {
+    let painter = painter.with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+
+    // Roll time -> y. Subtract in f64 *before* the f32 cast: after a long
+    // session the times are large and f32 subtraction would jitter the marks.
+    let y_of = |t: f64| rect.top() + ((view_top_s - t) as f32) * ROLL_PX_PER_S;
+
+    // ---- Ruler: only the whole seconds inside the visible window (top edge
+    // = view_top_s, bottom edge = view_top_s - height/speed), never the whole
+    // session, so cost is O(strip height) regardless of duration.
+    let bottom_s = view_top_s - (rect.height() / ROLL_PX_PER_S) as f64;
+    draw_ruler(&painter, rect, bottom_s, view_top_s, y_of);
+
+    // ---- Instance separators: full-width lines where the clock resumed
+    // after an idle pause (or a break was inserted by hand).
+    let sep_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
+    for sep in &roll.separators {
+        let y = y_of(sep.at);
+        if y >= rect.top() && y <= rect.bottom() {
+            painter.hline(rect.x_range(), y, sep_stroke);
+        }
+    }
+
+    // ---- Note marks. Lane x-extents per MIDI note, from the keyboard layout.
+    let mut lanes: [Option<(egui::Rangef, bool)>; 128] = [None; 128];
+    for k in keys {
+        lanes[k.midi as usize] = Some((k.rect.x_range(), k.black));
+    }
+
+    // Fixed half-lane split: local always left, remote always right, so
+    // simultaneous same-key presses sit side by side with no overlap logic —
+    // the roll's analogue of `paint_key`'s diagonal split.
+    for pass_black in [false, true] {
+        for seg in &roll.segments {
+            let Some((xr, black)) = lanes[seg.midi as usize] else { continue };
+            if black != pass_black {
+                continue;
+            }
+            let end = seg.end_s.unwrap_or(roll.now_s()); // held notes extend live
+            let y_top = y_of(end);
+            let y_bot = y_of(seg.start_s);
+            if y_bot < rect.top() || y_top > rect.bottom() {
+                continue;
+            }
+            let mid = xr.center();
+            let (x0, x1) = match seg.who {
+                roll::Who::Local => (xr.min + 1.0, mid),
+                roll::Who::Remote => (mid, xr.max - 1.0),
+            };
+            let [r, g, b] = seg.color;
+            let color = if black {
+                // Black-key marks: same hue, dimmed — thinner comes free from
+                // the black key's narrower lane.
+                let dark = |c: u8| (c as f32 * 0.72) as u8;
+                egui::Color32::from_rgb(dark(r), dark(g), dark(b))
+            } else {
+                egui::Color32::from_rgb(r, g, b)
+            };
+            // Enforce a 2 px minimum so staccato notes still leave a sliver.
+            let mark = egui::Rect::from_min_max(
+                egui::pos2(x0, y_top),
+                egui::pos2(x1, y_bot.max(y_top + 2.0)),
+            );
+            painter.rect_filled(mark, 2.0, color);
+        }
+    }
+}
+
+/// The time ruler shared by both roll panels: a minor gridline every second,
+/// a major line + `mm:ss` label every ten. Iterates only the whole seconds
+/// in `[lo_s, hi_s]` — O(panel height), never O(session length) — and leaves
+/// the time→y mapping to the caller so the two panels' opposite scroll
+/// directions both work.
+fn draw_ruler(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    lo_s: f64,
+    hi_s: f64,
+    y_of: impl Fn(f64) -> f32,
+) {
+    let minor = egui::Stroke::new(0.5, egui::Color32::from_gray(40));
+    let major = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
+    let mut s = lo_s.max(0.0).ceil() as i64;
+    let hi = hi_s.floor() as i64;
+    while s <= hi {
+        let y = y_of(s as f64);
+        if s % 10 == 0 {
+            painter.hline(rect.x_range(), y, major);
+            painter.text(
+                egui::pos2(rect.left() + 4.0, y + 2.0),
+                egui::Align2::LEFT_TOP,
+                format!("{}:{:02}", s / 60, s % 60),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_gray(140),
+            );
+        } else {
+            painter.hline(rect.x_range(), y, minor);
+        }
+        s += 1;
+    }
+}
+
+/// The x-extent of the Learn key-range band: the union of the lanes of every
+/// key in `lo..=hi`. `None` if no key falls in the range (can't happen for
+/// ranges produced by drag/refine, which are clamped to real keys).
+fn range_band_x(keys: &[KeyRect], lo: u8, hi: u8) -> Option<egui::Rangef> {
+    let mut band: Option<egui::Rangef> = None;
+    for k in keys {
+        if (lo..=hi).contains(&k.midi) {
+            let r = k.rect.x_range();
+            band = Some(match band {
+                None => r,
+                Some(b) => egui::Rangef::new(b.min.min(r.min), b.max.max(r.max)),
+            });
+        }
+    }
+    band
+}
+
+/// The falling-notes panel: the loaded score's future, sliding down to reach
+/// the keyboard exactly when each note starts. "Now" (the playhead) sits at
+/// the *bottom* edge — the mirror of `draw_roll`, which hangs history off its
+/// top edge. Both tracks always draw (this shows the score, not who's
+/// practicing what) with the same half-lane convention as the history roll.
+fn draw_falling(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    keys: &[KeyRect],
+    score: &score::Score,
+    playhead_s: f64,
+    key_range: Option<(u8, u8)>,
+    range_drag: Option<(f32, f32)>,
+) {
+    let painter = painter.with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+
+    // Future time -> y (f64 subtraction before the f32 cast, as in draw_roll).
+    let y_of = |t: f64| rect.bottom() - ((t - playhead_s) as f32) * ROLL_PX_PER_S;
+    let top_s = playhead_s + (rect.height() / ROLL_PX_PER_S) as f64;
+
+    draw_ruler(&painter, rect, playhead_s, top_s, y_of);
+
+    // The Learn key-range band (and the in-progress drag preview): a
+    // translucent column over the full panel height.
+    let band_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14);
+    if let Some((lo, hi)) = key_range {
+        if let Some(band) = range_band_x(keys, lo, hi) {
+            painter.rect_filled(
+                egui::Rect::from_x_y_ranges(band, rect.y_range()),
+                0.0,
+                band_fill,
+            );
+        }
+    }
+    if let Some((a, b)) = range_drag {
+        painter.rect_filled(
+            egui::Rect::from_x_y_ranges(egui::Rangef::new(a.min(b), a.max(b)), rect.y_range()),
+            0.0,
+            band_fill,
+        );
+    }
+
+    // Segment boundaries ahead, same style as the history roll's separators.
+    let sep_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
+    for seg in score.segments.iter().skip(1) {
+        let y = y_of(seg.start_s);
+        if y >= rect.top() && y <= rect.bottom() {
+            painter.hline(rect.x_range(), y, sep_stroke);
+        }
+    }
+
+    // Lane x-extents per MIDI note, from the keyboard layout.
+    let mut lanes: [Option<(egui::Rangef, bool)>; 128] = [None; 128];
+    for k in keys {
+        lanes[k.midi as usize] = Some((k.rect.x_range(), k.black));
+    }
+
+    for pass_black in [false, true] {
+        for who in [roll::Who::Local, roll::Who::Remote] {
+            let track = &score.tracks[who.idx()];
+            let [r, g, b] = track.color;
+            for n in &track.notes {
+                let Some((xr, black)) = lanes[n.midi as usize] else { continue };
+                if black != pass_black {
+                    continue;
+                }
+                // Cull: already fully past, or not yet inside the window.
+                if n.end_s <= playhead_s || n.start_s > top_s {
+                    continue;
+                }
+                let y_top = y_of(n.end_s);
+                let y_bot = y_of(n.start_s);
+                let mid = xr.center();
+                let (x0, x1) = match who {
+                    roll::Who::Local => (xr.min + 1.0, mid),
+                    roll::Who::Remote => (mid, xr.max - 1.0),
+                };
+                let color = if black {
+                    let dark = |c: u8| (c as f32 * 0.72) as u8;
+                    egui::Color32::from_rgb(dark(r), dark(g), dark(b))
+                } else {
+                    egui::Color32::from_rgb(r, g, b)
+                };
+                let mark = egui::Rect::from_min_max(
+                    egui::pos2(x0, y_top),
+                    egui::pos2(x1, y_bot.max(y_top + 2.0)),
+                );
+                painter.rect_filled(mark, 2.0, color);
+            }
+        }
+    }
+}
+
+/// Paint one key as up to N vertical color stripes — the playback-mode
+/// analogue of `paint_key`'s two-way diagonal split, generalized to the three
+/// possible sources there (your live press + each auto-played track).
+fn paint_key_striped(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    colors: &[egui::Color32],
+    base: egui::Color32,
+    rounding: f32,
+    stroke: egui::Stroke,
+) {
+    if colors.is_empty() {
+        painter.rect(rect, rounding, base, stroke);
+        return;
+    }
+    painter.rect(rect, rounding, colors[0], egui::Stroke::NONE);
+    if colors.len() > 1 {
+        let w = rect.width() / colors.len() as f32;
+        for (i, &c) in colors.iter().enumerate().skip(1) {
+            let x0 = rect.left() + i as f32 * w;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x0 + w, rect.bottom())),
+                0.0,
+                c,
+            );
+        }
+    }
+    painter.rect_stroke(rect, rounding, stroke);
+}
+
+/// Playback-mode keyboard: each layer is (per-key on-states, color). Most
+/// keys have 0–1 active layers; simultaneous 2–3 (e.g. practicing a note an
+/// auto-played track also hits) render as vertical stripes — deliberately
+/// distinct from live mode's diagonal split. `draw_keyboard` stays untouched
+/// for live mode.
+fn draw_keyboard_layered(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    keys: &[KeyRect],
+    layers: &[([bool; KEY_COUNT], egui::Color32)],
+) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(30));
+
+    let white_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
+    let black_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+
+    for key in keys {
+        let idx = midi_to_key_index(key.midi).unwrap();
+        let (base, stroke) = if key.black {
+            (egui::Color32::from_gray(20), black_stroke)
+        } else {
+            (egui::Color32::from_gray(245), white_stroke)
+        };
+        let active: Vec<egui::Color32> =
+            layers.iter().filter(|(on, _)| on[idx]).map(|(_, c)| *c).collect();
+        paint_key_striped(painter, key.rect, &active, base, 2.0, stroke);
     }
 }

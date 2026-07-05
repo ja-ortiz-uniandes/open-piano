@@ -1,0 +1,665 @@
+//! Piano-roll history: a record of every note either player has played this
+//! session, on a pausable "roll clock", plus save-to-disk.
+//!
+//! The roll is the data behind the paper-roll strip drawn under the keyboard
+//! (see `draw_roll` in main.rs): each key press opens a [`Segment`] at the
+//! current roll time and closes it on release. To keep the data (and the
+//! on-screen paper) bounded, the clock freezes after [`IDLE_PAUSE`] of
+//! inactivity and resumes on the next note, recording an "instance" separator
+//! at the resume point.
+//!
+//! Saving writes an open, universally-readable Standard MIDI File (format 1,
+//! one track per player, separators as SMF marker meta-events) plus a tiny
+//! JSON sidecar for the one thing SMF cannot express: each player's display
+//! color. Alternatively the whole roll (colors included) can be exported as a
+//! single self-describing JSONL file.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::note::{midi_to_key_index, NoteMsg, KEY_COUNT};
+
+/// Idle time (no note on/off from either player, and no key held) after which
+/// the roll clock freezes, so an unattended app doesn't accumulate blank paper
+/// or scroll the history away. The pause is only *detected* after the idle
+/// window elapses, so up to this much trailing blank paper per instance stays
+/// in the record — bounded, and freezing in place avoids the visible snap that
+/// clamping the clock back would cause.
+const IDLE_PAUSE: Duration = Duration::from_secs(30);
+
+/// Which player produced a segment. Doubles as an index (0 = local,
+/// 1 = remote) into per-player tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Who {
+    Local,
+    Remote,
+}
+
+impl Who {
+    pub(crate) fn idx(self) -> usize {
+        match self {
+            Who::Local => 0,
+            Who::Remote => 1,
+        }
+    }
+}
+
+/// One "instance" boundary — where the roll clock resumed after an idle
+/// pause (or where the user inserted a break by hand). `name: None`
+/// renders/saves as an auto-generated "instance N".
+pub struct Instance {
+    pub at: f64,
+    pub name: Option<String>,
+}
+
+/// One held note on the roll. Times are roll-clock seconds (see [`Roll::tick`]).
+pub struct Segment {
+    pub who: Who,
+    pub midi: u8,
+    pub start_s: f64,
+    /// `None` while the key is still held; the renderer extends the mark to
+    /// the live edge and a save synthesizes an off at save time.
+    pub end_s: Option<f64>,
+    /// The player's color at note-on, so changing a color mid-session doesn't
+    /// repaint history. (A save persists only the *current* two player colors;
+    /// mid-session color changes are a live-view nicety, not saved fidelity.)
+    pub color: [u8; 3],
+}
+
+/// The roll: an append-only list of note segments on a pausable clock.
+///
+/// Memory is deliberately uncapped: segments accrue at human playing speed
+/// (~40 bytes each; two players at a frantic 10 notes/s combined for four
+/// hours is ~144k segments ≈ 6 MB), and IDLE_PAUSE bounds the blank paper.
+pub struct Roll {
+    /// Every segment ever recorded, in note-on order (`start_s` is monotonic).
+    pub segments: Vec<Segment>,
+    /// Index into `segments` of the still-open segment per (player, key).
+    open: [[Option<usize>; KEY_COUNT]; 2],
+    /// How many segments are currently open (held keys, both players).
+    open_count: usize,
+    /// Boundaries where the clock resumed after a pause (or a break was
+    /// inserted by hand) — drawn as full-width lines separating "instances"
+    /// of play, kept sorted by time. These delimit instance 2, 3, ...
+    pub separators: Vec<Instance>,
+    /// Name for instance 1 (everything before the first separator) — kept
+    /// separately since there's no `Instance` entry to attach it to.
+    pub first_instance_name: Option<String>,
+    /// The paper position: seconds of roll time elapsed while unpaused.
+    roll_now_s: f64,
+    /// Wall time of the last `tick`, used both to advance the clock and as
+    /// "now" for events (events arrive on the same thread between ticks, so
+    /// they are at most one frame stale — imperceptible at repaint rate).
+    last_frame: Instant,
+    /// Wall time of the last note on/off, for idle detection.
+    last_event: Option<Instant>,
+    /// Starts paused: no paper accumulates before the first note.
+    paused: bool,
+    /// Set on every note event, cleared by `mark_saved`.
+    dirty: bool,
+}
+
+impl Roll {
+    pub fn new() -> Self {
+        Roll {
+            segments: Vec::new(),
+            open: [[None; KEY_COUNT]; 2],
+            open_count: 0,
+            separators: Vec::new(),
+            first_instance_name: None,
+            roll_now_s: 0.0,
+            last_frame: Instant::now(),
+            last_event: None,
+            paused: true,
+            dirty: false,
+        }
+    }
+
+    /// Advance the roll clock. Call once per frame, before rendering.
+    pub fn tick(&mut self, now: Instant) {
+        if !self.paused {
+            self.roll_now_s += now.saturating_duration_since(self.last_frame).as_secs_f64();
+            // Freeze only when nothing is held: a key held for minutes is
+            // still an extending mark, and the paper must keep moving under it.
+            if self.open_count == 0 {
+                if let Some(last) = self.last_event {
+                    if now.saturating_duration_since(last) > IDLE_PAUSE {
+                        self.paused = true;
+                    }
+                }
+            }
+        }
+        self.last_frame = now;
+    }
+
+    /// Record a note transition. `color` is that player's current color.
+    pub fn note(&mut self, who: Who, msg: NoteMsg, color: [u8; 3]) {
+        let Some(key) = midi_to_key_index(msg.midi()) else {
+            return;
+        };
+        match msg {
+            NoteMsg::On(midi) => {
+                // Idempotent, like main.rs's `apply()`: the mic path's
+                // hysteresis (or a reconnect race) can emit On twice.
+                if self.open[who.idx()][key].is_some() {
+                    return;
+                }
+                if self.paused {
+                    self.paused = false;
+                    // A resume after a pause starts a new "instance"; the
+                    // very first note of the session gets no separator.
+                    if !self.segments.is_empty() {
+                        self.separators.push(Instance { at: self.roll_now_s, name: None });
+                    }
+                }
+                self.open[who.idx()][key] = Some(self.segments.len());
+                self.open_count += 1;
+                self.segments.push(Segment {
+                    who,
+                    midi,
+                    start_s: self.roll_now_s,
+                    end_s: None,
+                    color,
+                });
+            }
+            NoteMsg::Off(_) => {
+                let Some(i) = self.open[who.idx()][key].take() else {
+                    return;
+                };
+                self.segments[i].end_s = Some(self.roll_now_s);
+                self.open_count -= 1;
+            }
+        }
+        self.last_event = Some(self.last_frame);
+        self.dirty = true;
+    }
+
+    /// Close all of `who`'s open segments at the current roll time. Called at
+    /// the same points the UI force-releases stuck keys (input-backend epoch
+    /// switch, peer connect/disconnect), where the matching note-offs will
+    /// never arrive.
+    pub fn release_all(&mut self, who: Who) {
+        for slot in self.open[who.idx()].iter_mut() {
+            if let Some(i) = slot.take() {
+                self.segments[i].end_s = Some(self.roll_now_s);
+                self.open_count -= 1;
+                self.last_event = Some(self.last_frame);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The current roll time — the live (top) edge of the paper.
+    pub fn now_s(&self) -> f64 {
+        self.roll_now_s
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// True when there are notes on the roll that haven't been saved since
+    /// the last change — drives the "● unsaved" chip and the close warning.
+    pub fn has_unsaved(&self) -> bool {
+        self.dirty && !self.segments.is_empty()
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+    }
+
+    /// Which instance the roll clock is currently in: 0 while still in the
+    /// first, 1 once the second has started, etc.
+    pub fn current_instance(&self) -> usize {
+        self.separators.iter().filter(|i| i.at <= self.roll_now_s).count()
+    }
+
+    /// Display name of the current instance — the custom name if one was set,
+    /// else the same "instance N" auto-name the save path writes.
+    pub fn current_instance_name(&self) -> String {
+        let idx = self.current_instance();
+        let name = if idx == 0 {
+            self.first_instance_name.clone()
+        } else {
+            self.separators.get(idx - 1).and_then(|s| s.name.clone())
+        };
+        name.unwrap_or_else(|| format!("instance {}", idx + 1))
+    }
+
+    /// Rename whichever instance the roll is currently in. Counts as an
+    /// unsaved change, same as a new note.
+    pub fn rename_current_instance(&mut self, name: String) {
+        let idx = self.current_instance();
+        if idx == 0 {
+            self.first_instance_name = Some(name);
+        } else if let Some(sep) = self.separators.get_mut(idx - 1) {
+            sep.name = Some(name);
+        }
+        self.dirty = true;
+    }
+
+    /// Insert a boundary at `at` (roll-clock seconds), splitting whatever
+    /// instance currently spans that time. No-op at/before 0 or exactly on an
+    /// existing boundary (avoids duplicate/zero-length instances). Unlike the
+    /// auto-pause boundaries, this can land anywhere in already-recorded
+    /// history, not just at the live edge.
+    pub fn insert_separator(&mut self, at: f64) {
+        let at = at.clamp(0.0, self.roll_now_s);
+        if at <= 0.0 || self.separators.iter().any(|s| (s.at - at).abs() < 1e-9) {
+            return;
+        }
+        let pos = self.separators.partition_point(|s| s.at < at);
+        self.separators.insert(pos, Instance { at, name: None });
+        self.dirty = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Saving. Synchronous on the caller's (GUI) thread: these are one-shot writes
+// of tiny files (an evening of playing is well under a megabyte), so the cost
+// is milliseconds at worst — and a synchronous result lets the caller clear
+// the dirty flag only on success and surface the error, which the unsaved-
+// close dialog depends on for correctness.
+// ---------------------------------------------------------------------------
+
+/// SMF timing: 120 BPM (500 000 µs per quarter) at 480 ticks per quarter gives
+/// exactly 960 ticks per second, so roll seconds convert to ticks losslessly
+/// at ~1 ms resolution.
+const TICKS_PER_SEC: f64 = 960.0;
+const PPQ: u16 = 480;
+const TEMPO_US_PER_QUARTER: u32 = 500_000;
+
+pub(crate) fn ticks(t_s: f64) -> u32 {
+    (t_s * TICKS_PER_SEC).round().max(0.0) as u32
+}
+
+/// Inverse of `ticks`: general tick→seconds conversion for a *loaded* file
+/// (see score.rs), whose tempo/PPQ may differ from this app's own fixed
+/// write-side constants above.
+pub(crate) fn seconds(ticks: u32, us_per_quarter: u32, ppq: u16) -> f64 {
+    let ticks_per_sec = ppq as f64 * 1_000_000.0 / us_per_quarter.max(1) as f64;
+    ticks as f64 / ticks_per_sec
+}
+
+/// Quick save: write `rolls/roll_<unix>.mid` (+ `.json` color sidecar) and
+/// return the `.mid` path.
+pub fn save_quick(roll: &Roll, local_color: [u8; 3], remote_color: [u8; 3]) -> io::Result<PathBuf> {
+    std::fs::create_dir_all("rolls")?;
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = PathBuf::from(format!("rolls/roll_{unix}.mid"));
+    save_midi(roll, local_color, remote_color, &path)?;
+    Ok(path)
+}
+
+/// Write the roll as a Standard MIDI File at `path`, plus a `<stem>.json`
+/// sidecar carrying the player colors (the one thing SMF cannot express).
+///
+/// Layout: format 1 with a conductor track (tempo + instance markers) and one
+/// note track per player, named so any DAW shows who played what. Segments
+/// still open at save time get a synthesized note-off at the live edge — in
+/// the file only; the in-memory roll is untouched.
+pub fn save_midi(
+    roll: &Roll,
+    local_color: [u8; 3],
+    remote_color: [u8; 3],
+    path: &Path,
+) -> io::Result<()> {
+    use midly::num::{u15, u24, u28, u4, u7};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+
+    // Marker text is borrowed by the Smf, so the owned strings must outlive it.
+    let marker_texts: Vec<String> = roll
+        .separators
+        .iter()
+        .enumerate()
+        .map(|(i, sep)| sep.name.clone().unwrap_or_else(|| format!("instance {}", i + 2)))
+        .collect();
+
+    let mut smf = Smf::new(Header::new(Format::Parallel, Timing::Metrical(u15::from(PPQ))));
+
+    // Conductor track: tempo, then a marker at each instance boundary. A
+    // custom name for instance 1 gets its own marker at tick 0 (there is no
+    // separator entry to carry it); unnamed instance 1 emits nothing, keeping
+    // unnamed exports byte-identical to before names existed.
+    let mut conductor: Vec<TrackEvent> = vec![TrackEvent {
+        delta: u28::from(0),
+        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(TEMPO_US_PER_QUARTER))),
+    }];
+    if let Some(name) = &roll.first_instance_name {
+        conductor.push(TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::Marker(name.as_bytes())),
+        });
+    }
+    let mut prev = 0u32;
+    for (sep, text) in roll.separators.iter().zip(&marker_texts) {
+        let at = ticks(sep.at);
+        conductor.push(TrackEvent {
+            delta: u28::from(at - prev),
+            kind: TrackEventKind::Meta(MetaMessage::Marker(text.as_bytes())),
+        });
+        prev = at;
+    }
+    conductor.push(TrackEvent {
+        delta: u28::from(0),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    smf.tracks.push(conductor);
+
+    for (who, name) in [
+        (Who::Local, &b"open-piano: local player"[..]),
+        (Who::Remote, &b"open-piano: remote player"[..]),
+    ] {
+        // Absolute-tick events: (tick, is_on, key). Sorted with offs before
+        // ons at equal times so a retriggered note never nests.
+        let mut events: Vec<(u32, bool, u8)> = Vec::new();
+        for seg in roll.segments.iter().filter(|s| s.who == who) {
+            events.push((ticks(seg.start_s), true, seg.midi));
+            events.push((ticks(seg.end_s.unwrap_or(roll.now_s())), false, seg.midi));
+        }
+        events.sort_by_key(|&(t, is_on, key)| (t, is_on, key));
+
+        let mut track: Vec<TrackEvent> = vec![TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::TrackName(name)),
+        }];
+        let mut prev = 0u32;
+        for (at, is_on, key) in events {
+            let message = if is_on {
+                MidiMessage::NoteOn { key: u7::from(key), vel: u7::from(64) }
+            } else {
+                MidiMessage::NoteOff { key: u7::from(key), vel: u7::from(0) }
+            };
+            track.push(TrackEvent {
+                delta: u28::from(at - prev),
+                kind: TrackEventKind::Midi { channel: u4::from(0), message },
+            });
+            prev = at;
+        }
+        track.push(TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+        smf.tracks.push(track);
+    }
+
+    smf.save(path)?;
+
+    let sidecar = serde_json::json!({
+        "version": 1,
+        "kind": "open-piano-roll-colors",
+        "local_color": local_color,
+        "remote_color": remote_color,
+    });
+    std::fs::write(path.with_extension("json"), format!("{sidecar}\n"))
+}
+
+/// Write the roll as a single self-contained JSONL file: a header line with
+/// the player colors, then one line per event (note on/off + instance
+/// separators) in time order. Human-readable; nothing lost, but no music
+/// software opens it — the `.mid` export is the interoperable one.
+pub fn save_jsonl(
+    roll: &Roll,
+    local_color: [u8; 3],
+    remote_color: [u8; 3],
+    path: &Path,
+) -> io::Result<()> {
+    // Milliseconds are plenty (and match the .mid resolution); rounding keeps
+    // the f64s from printing as 17-digit noise.
+    fn ms(t: f64) -> f64 {
+        (t * 1000.0).round() / 1000.0
+    }
+
+    let mut lines = vec![serde_json::json!({
+        "version": 1,
+        "kind": "open-piano-roll",
+        "local_color": local_color,
+        "remote_color": remote_color,
+        "first_instance_name": roll.first_instance_name,
+    })];
+
+    // (time, order-within-time, json): offs (0) before separators (1) before
+    // ons (2) at equal timestamps, so instances read cleanly.
+    let mut events: Vec<(f64, u8, serde_json::Value)> = Vec::new();
+    for seg in &roll.segments {
+        let who = match seg.who {
+            Who::Local => "l",
+            Who::Remote => "r",
+        };
+        events.push((
+            seg.start_s,
+            2,
+            serde_json::json!({"t": ms(seg.start_s), "e": "on", "n": seg.midi, "who": who}),
+        ));
+        let end = seg.end_s.unwrap_or(roll.now_s());
+        events.push((
+            end,
+            0,
+            serde_json::json!({"t": ms(end), "e": "off", "n": seg.midi, "who": who}),
+        ));
+    }
+    for sep in &roll.separators {
+        events.push((
+            sep.at,
+            1,
+            serde_json::json!({"t": ms(sep.at), "e": "sep", "name": sep.name}),
+        ));
+    }
+    events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    lines.extend(events.into_iter().map(|(_, _, v)| v));
+
+    let mut out = String::new();
+    for line in &lines {
+        out.push_str(&line.to_string());
+        out.push('\n');
+    }
+    std::fs::write(path, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the clock deterministically: `new()` starts paused, so wall time
+    /// between `new()` and the first tick never reaches the roll.
+    fn t(base: Instant, s: f64) -> Instant {
+        base + Duration::from_secs_f64(s)
+    }
+
+    #[test]
+    fn clock_pauses_after_idle_and_separates_instances() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        assert_eq!(roll.now_s(), 0.0);
+
+        // First note: unpauses, no separator.
+        roll.note(Who::Local, NoteMsg::On(60), [1, 2, 3]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [1, 2, 3]);
+        assert!(roll.separators.is_empty());
+        assert_eq!(roll.segments[0].start_s, 0.0);
+        assert_eq!(roll.segments[0].end_s, Some(1.0));
+
+        // Idle past IDLE_PAUSE with nothing held: clock freezes.
+        roll.tick(t(base, 40.0));
+        let frozen = roll.now_s();
+        assert_eq!(frozen, 40.0); // advanced up to the pause check...
+        roll.tick(t(base, 100.0));
+        assert_eq!(roll.now_s(), frozen); // ...then froze.
+
+        // Next note resumes and records a separator at the frozen time.
+        roll.note(Who::Local, NoteMsg::On(61), [1, 2, 3]);
+        assert_eq!(roll.separators.len(), 1);
+        assert_eq!(roll.separators[0].at, frozen);
+        assert_eq!(roll.separators[0].name, None);
+        roll.tick(t(base, 101.0));
+        assert_eq!(roll.now_s(), frozen + 1.0);
+    }
+
+    #[test]
+    fn instance_naming_and_manual_breaks() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        assert_eq!(roll.current_instance_name(), "instance 1");
+        roll.rename_current_instance("warmup".into());
+        assert_eq!(roll.current_instance_name(), "warmup");
+        assert_eq!(roll.first_instance_name.as_deref(), Some("warmup"));
+
+        // A manual break splits recorded history and lands sorted.
+        roll.tick(t(base, 10.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        roll.insert_separator(4.0);
+        roll.insert_separator(2.0);
+        roll.insert_separator(4.0); // duplicate: no-op
+        roll.insert_separator(0.0); // at zero: no-op
+        let ats: Vec<f64> = roll.separators.iter().map(|s| s.at).collect();
+        assert_eq!(ats, vec![2.0, 4.0]);
+
+        // The clock (at 10.0) is now past both breaks: current = instance 3.
+        assert_eq!(roll.current_instance(), 2);
+        assert_eq!(roll.current_instance_name(), "instance 3");
+        roll.rename_current_instance("bridge".into());
+        assert_eq!(roll.separators[1].name.as_deref(), Some("bridge"));
+        assert_eq!(roll.separators[0].name, None);
+    }
+
+    #[test]
+    fn held_key_keeps_the_clock_running() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        // Held far past IDLE_PAUSE: the paper must keep moving.
+        roll.tick(t(base, 120.0));
+        assert_eq!(roll.now_s(), 120.0);
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        assert_eq!(roll.segments[0].end_s, Some(120.0));
+    }
+
+    #[test]
+    fn duplicate_on_is_ignored_and_release_all_closes() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Remote, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Remote, NoteMsg::On(60), [0; 3]);
+        assert_eq!(roll.segments.len(), 1);
+        roll.note(Who::Remote, NoteMsg::On(72), [0; 3]);
+        roll.tick(t(base, 2.0));
+        roll.release_all(Who::Remote);
+        assert!(roll.segments.iter().all(|s| s.end_s == Some(2.0)));
+        // Off with nothing open is a no-op.
+        roll.note(Who::Remote, NoteMsg::Off(60), [0; 3]);
+        assert_eq!(roll.segments.len(), 2);
+    }
+
+    #[test]
+    fn dirty_tracks_note_events_and_saves() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        assert!(!roll.has_unsaved()); // empty roll never warns
+        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        assert!(roll.has_unsaved());
+        roll.mark_saved();
+        assert!(!roll.has_unsaved());
+        // An Off after a save is a change too (the segment's end moved).
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        assert!(roll.has_unsaved());
+    }
+
+    #[test]
+    fn seconds_to_ticks_is_960_per_second() {
+        assert_eq!(ticks(0.0), 0);
+        assert_eq!(ticks(1.0), 960);
+        assert_eq!(ticks(0.5), 480);
+        assert_eq!(ticks(10.0), 9600);
+    }
+
+    /// Build a small two-player roll with a separator and an open note.
+    fn sample_roll() -> Roll {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60), [220, 60, 60]);
+        roll.tick(t(base, 0.5));
+        roll.note(Who::Local, NoteMsg::Off(60), [220, 60, 60]);
+        roll.note(Who::Remote, NoteMsg::On(64), [60, 110, 230]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Remote, NoteMsg::Off(64), [60, 110, 230]);
+        roll.tick(t(base, 60.0)); // idle -> pause
+        roll.note(Who::Local, NoteMsg::On(62), [220, 60, 60]); // resume, separator
+        roll.tick(t(base, 61.0)); // note 62 left open on purpose
+        roll
+    }
+
+    #[test]
+    fn saved_midi_is_valid_smf_with_expected_shape() {
+        let roll = sample_roll();
+        let dir = std::env::temp_dir().join(format!("open-piano-roll-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.mid");
+        save_midi(&roll, [220, 60, 60], [60, 110, 230], &path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let smf = midly::Smf::parse(&bytes).expect("saved file must be valid SMF");
+        assert_eq!(smf.tracks.len(), 3); // conductor + local + remote
+        // One marker for the one separator.
+        let markers = smf.tracks[0]
+            .iter()
+            .filter(|e| matches!(e.kind, midly::TrackEventKind::Meta(midly::MetaMessage::Marker(_))))
+            .count();
+        assert_eq!(markers, 1);
+        // The open note got a synthesized off: ons == offs in each note track.
+        for track in &smf.tracks[1..] {
+            let (mut ons, mut offs) = (0, 0);
+            for e in track {
+                if let midly::TrackEventKind::Midi { message, .. } = e.kind {
+                    match message {
+                        midly::MidiMessage::NoteOn { .. } => ons += 1,
+                        midly::MidiMessage::NoteOff { .. } => offs += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(ons, offs);
+        }
+        // Sidecar exists and holds the colors.
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.with_extension("json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar["local_color"], serde_json::json!([220, 60, 60]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saved_jsonl_is_well_formed_and_ordered() {
+        let roll = sample_roll();
+        let dir = std::env::temp_dir().join(format!("open-piano-jsonl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.jsonl");
+        save_jsonl(&roll, [220, 60, 60], [60, 110, 230], &path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line must be valid JSON"))
+            .collect();
+        assert_eq!(lines[0]["kind"], "open-piano-roll");
+        // 3 segments -> 6 note events, plus 1 separator.
+        assert_eq!(lines.len(), 1 + 7);
+        let times: Vec<f64> = lines[1..].iter().map(|l| l["t"].as_f64().unwrap()).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "events must be time-ordered");
+        assert!(lines[1..].iter().any(|l| l["e"] == "sep"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
