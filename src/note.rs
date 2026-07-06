@@ -52,6 +52,11 @@ pub enum Packet {
     Note(NoteMsg),
     /// The sender's chosen display color, as sRGB `[r, g, b]`.
     Color([u8; 3]),
+    /// The sender's chosen display name (UTF-8). Travels over the network the
+    /// same way colors do — each player picks their own name and the other end
+    /// renders it next to the peer color. Re-sent on the color heartbeat so a
+    /// dropped datagram doesn't leave the peer showing a stale name.
+    Name(String),
     /// Metronome beat marker, broadcast by the host on **each** beat. Carries
     /// enough to (re)derive the grid (`bpm`, `beats_per_bar`), the accent
     /// (`beat_in_bar == 0` = downbeat), and to toggle the follower on/off
@@ -86,6 +91,24 @@ impl Packet {
         match self {
             Packet::Note(n) => n.encode().to_vec(),
             Packet::Color([r, g, b]) => vec![0xC0, *r, *g, *b],
+            Packet::Name(name) => {
+                // `[0xC1, len, ..utf8..]`. Length-prefixed with a single byte so
+                // the frame is self-delimiting; names longer than 255 bytes are
+                // truncated on a UTF-8 char boundary so the wire stays valid.
+                let mut bytes = name.as_bytes();
+                if bytes.len() > u8::MAX as usize {
+                    let mut end = u8::MAX as usize;
+                    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+                        end -= 1; // back off to a char boundary
+                    }
+                    bytes = &bytes[..end];
+                }
+                let mut buf = Vec::with_capacity(2 + bytes.len());
+                buf.push(0xC1);
+                buf.push(bytes.len() as u8);
+                buf.extend_from_slice(bytes);
+                buf
+            }
             Packet::MetroBeat { bpm, beat_in_bar, beats_per_bar, on } => {
                 let [hi, lo] = bpm.to_be_bytes();
                 vec![0xB0, hi, lo, *beat_in_bar, *beats_per_bar, *on as u8]
@@ -118,6 +141,14 @@ impl Packet {
         match buf.first()? {
             0x90 | 0x80 => NoteMsg::decode(buf).map(Packet::Note),
             0xC0 if buf.len() >= 4 => Some(Packet::Color([buf[1], buf[2], buf[3]])),
+            0xC1 if buf.len() >= 2 => {
+                let len = buf[1] as usize;
+                if buf.len() < 2 + len {
+                    return None;
+                }
+                // Lossy so a corrupt byte can't drop the whole (valid-length) frame.
+                Some(Packet::Name(String::from_utf8_lossy(&buf[2..2 + len]).into_owned()))
+            }
             0xB0 if buf.len() >= 6 => Some(Packet::MetroBeat {
                 bpm: u16::from_be_bytes([buf[1], buf[2]]),
                 beat_in_bar: buf[3],
@@ -156,6 +187,9 @@ mod tests {
             Packet::Note(NoteMsg::On(60)),
             Packet::Note(NoteMsg::Off(21)),
             Packet::Color([220, 60, 60]),
+            Packet::Name(String::new()),
+            Packet::Name("Ada".to_string()),
+            Packet::Name("Grace — 音楽".to_string()),
             Packet::MetroBeat { bpm: 120, beat_in_bar: 0, beats_per_bar: 4, on: true },
             Packet::MetroBeat { bpm: 240, beat_in_bar: 3, beats_per_bar: 4, on: false },
             Packet::MetroCtl { on: true, bpm: 90 },
@@ -176,7 +210,21 @@ mod tests {
         assert_eq!(Packet::decode(&[0xB0, 0, 120]), None); // too short for MetroBeat
         assert_eq!(Packet::decode(&[0xB1, 1]), None); // too short for MetroCtl
         assert_eq!(Packet::decode(&[0xB2, 2, 0, 0, 0, 0]), None); // too short for MetroBeatTable
+        assert_eq!(Packet::decode(&[0xC1, 5, b'h', b'i']), None); // name len exceeds payload
         assert_eq!(Packet::decode(&[0x7F, 0, 0]), None); // unknown status
+    }
+
+    #[test]
+    fn name_truncates_on_char_boundary() {
+        // A multibyte name longer than 255 bytes must truncate to valid UTF-8.
+        let long = "é".repeat(200); // 400 bytes
+        let encoded = Packet::Name(long).encode();
+        assert!(encoded.len() <= 2 + u8::MAX as usize);
+        // The truncated payload still decodes to a valid string (no split char).
+        match Packet::decode(&encoded) {
+            Some(Packet::Name(s)) => assert!(s.chars().all(|c| c == 'é')),
+            other => panic!("expected a Name, got {other:?}"),
+        }
     }
 }
 

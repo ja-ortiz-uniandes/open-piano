@@ -109,6 +109,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_LOCAL_COLOR: [u8; 3] = [220, 60, 60]; // warm red
 const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (until the peer announces theirs)
 
+/// Placeholder name shown for the peer until it announces its own (see the
+/// `Packet::Name` heartbeat). Transient — overwritten on the first announce.
+const DEFAULT_REMOTE_NAME: &str = "Peer";
+
 /// How often to re-broadcast our color to the peer. A low-rate heartbeat means
 /// color syncs regardless of who connects first, and recovers from a dropped
 /// announcement, at a negligible 1 datagram/sec.
@@ -282,6 +286,10 @@ struct PianoApp {
     remote_color: [u8; 3], // the peer's notes; received from the peer
     last_color_send: Instant,
 
+    // --- display names (ride the same heartbeat as colors) ---
+    local_name: String,  // our name; editable, persisted, broadcast to the peer
+    remote_name: String, // the peer's name; received from the peer
+
     // --- networking (see net.rs: host/join with a one-string invite code) ---
     // Our invite code, once the net thread reports it (hosting only). Shown
     // with a Copy button so it can be pasted to the other player.
@@ -413,6 +421,8 @@ impl PianoApp {
             local_color: prefs.local_color,
             remote_color: DEFAULT_REMOTE_COLOR,
             last_color_send: Instant::now(),
+            local_name: prefs.local_name.clone(),
+            remote_name: DEFAULT_REMOTE_NAME.to_string(),
             my_ticket: None,
             join_ticket: String::new(),
             peer: None,
@@ -458,6 +468,14 @@ impl PianoApp {
             peer.send(Packet::Color(self.local_color));
         }
         self.last_color_send = Instant::now();
+    }
+
+    /// Send our display name to the peer (if connected). Rides the color
+    /// heartbeat, so a dropped datagram self-heals within a second.
+    fn send_name(&self) {
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::Name(self.local_name.clone()));
+        }
     }
 
     /// Broadcast our per-beat click pitch/volume tables to the peer, so both
@@ -1392,9 +1410,19 @@ impl PianoApp {
                 }
             });
         }
-        // ---- My color (broadcast to the peer) ----
+        // ---- My name + color (broadcast to the peer) ----
         ui.add_space(2.0);
         ui.horizontal(|ui| {
+            ui.label("My name:");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.local_name).desired_width(120.0))
+                .changed()
+            {
+                // Push the change immediately; the heartbeat covers the rest.
+                self.send_name();
+                self.prefs.local_name = self.local_name.clone();
+                self.prefs.save();
+            }
             ui.label("My color:");
             if ui.color_edit_button_srgb(&mut self.local_color).changed() {
                 // Push the change immediately; the heartbeat covers the rest.
@@ -1404,7 +1432,7 @@ impl PianoApp {
                 self.prefs.save();
             }
             ui.separator();
-            ui.label("Peer's color:");
+            ui.label(format!("Peer: {}", self.remote_name));
             let (r, g, b) = (self.remote_color[0], self.remote_color[1], self.remote_color[2]);
             ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
             ui.weak("(chosen by the peer)");
@@ -1934,6 +1962,20 @@ impl PianoApp {
                 // ---- Appearance ----
                 ui.heading("Appearance");
                 ui.horizontal(|ui| {
+                    ui.label("My display name:");
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.prefs.local_name)
+                                .desired_width(160.0),
+                        )
+                        .changed()
+                    {
+                        self.local_name = self.prefs.local_name.clone();
+                        self.send_name();
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
                     ui.label("My note color:");
                     if ui.color_edit_button_srgb(&mut self.prefs.local_color).changed() {
                         self.local_color = self.prefs.local_color;
@@ -2280,6 +2322,7 @@ impl PianoApp {
                     // reconnect mid-chord), and the peer needs our color.
                     self.clear_remote_keys();
                     self.send_color();
+                    self.send_name();
                     self.send_metro_table();
                     // If we're the metronome authority, announce current state so
                     // a follower syncs immediately (even when it's off). The
@@ -2295,7 +2338,12 @@ impl PianoApp {
                         }
                     }
                 }
-                NetEvent::Disconnected => self.clear_remote_keys(),
+                NetEvent::Disconnected => {
+                    self.clear_remote_keys();
+                    // Drop the peer's announced name so a stale one isn't shown
+                    // while nobody's connected; it re-announces on reconnect.
+                    self.remote_name = DEFAULT_REMOTE_NAME.to_string();
+                }
                 NetEvent::Packet(Packet::Note(msg)) => {
                     apply(&mut self.remote, msg);
                     self.roll.note(roll::Who::Remote, msg, self.remote_color);
@@ -2303,6 +2351,7 @@ impl PianoApp {
                     self.play_synth(msg, synth::Channel::Peer);
                 }
                 NetEvent::Packet(Packet::Color(rgb)) => self.remote_color = rgb,
+                NetEvent::Packet(Packet::Name(name)) => self.remote_name = name,
                 NetEvent::Packet(Packet::MetroCtl { on, bpm }) => {
                     // Follower → host request: the authority adopts it as the new
                     // grid and echoes authoritative state back.
@@ -2413,6 +2462,7 @@ impl eframe::App for PianoApp {
         // The metronome tables ride along on the same cadence.
         if self.peer.is_some() && self.last_color_send.elapsed() >= COLOR_HEARTBEAT {
             self.send_color();
+            self.send_name();
             self.send_metro_table();
         }
 
@@ -2469,9 +2519,9 @@ impl eframe::App for PianoApp {
                 let lc = self.local_color;
                 let rc = self.remote_color;
                 ui.colored_label(egui::Color32::from_rgb(lc[0], lc[1], lc[2]), "■");
-                ui.label("you");
+                ui.label(format!("{} (you)", self.local_name));
                 ui.colored_label(egui::Color32::from_rgb(rc[0], rc[1], rc[2]), "■");
-                ui.label("peer");
+                ui.label(format!("{} (peer)", self.remote_name));
                 ui.separator();
                 let (device, model) = {
                     let s = self.input.status.lock().unwrap();

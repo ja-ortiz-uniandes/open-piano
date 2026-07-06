@@ -61,6 +61,9 @@ pub struct Prefs {
     // ---- Appearance ----
     /// This player's note color (sRGB), broadcast to the peer.
     pub local_color: [u8; 3],
+    /// This player's display name, shown in the status bar and broadcast to the
+    /// peer (which renders it next to the peer color). Persists across sessions.
+    pub local_name: String,
 
     // ---- Audio / mic ----
     /// Mic detection threshold (model posterior probability, 0..1).
@@ -118,6 +121,7 @@ impl Default for Prefs {
             roll_px_per_s: 40.0,
             scrollback_idle_s: 2.5,
             local_color: [220, 60, 60],
+            local_name: "Player".to_string(),
             threshold: 0.30,
             echo_holdoff_ms: 2000,
             mic_muted: false,
