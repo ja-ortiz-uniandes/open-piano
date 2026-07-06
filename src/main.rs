@@ -146,22 +146,45 @@ const PREFS_SHORTCUT: egui::KeyboardShortcut =
 const MIN_BPM: u16 = 30;
 const MAX_BPM: u16 = 240;
 
+/// A few common click pitches (Hz), offered as quick-pick stops on the preset
+/// slider ahead of each beat's precise Hz field — low/mid/high/bright.
+const METRO_FREQ_PRESETS: [f32; 4] = [800.0, 1200.0, 1800.0, 2400.0];
+
 /// Shared metronome state. The **authority** (the host, or a solo player with no
 /// peer) owns the canonical beat grid and, when connected, broadcasts a
 /// `MetroBeat` each beat; a **follower** (joined to a host) anchors a local click
 /// schedule to those markers — clicks are always generated locally, so packet
 /// loss/jitter never drops or delays one. Either side sets tempo / start-stop; a
 /// follower's edit is a `MetroCtl` request the host adopts (last-writer-wins,
-/// one grid). `muted` silences *this* player's click only (local channel gain),
-/// never the peer's.
+/// one grid). `muted`/`volume` control *this* player's click only (local channel
+/// gain), never the peer's — but `beat_freqs`/`beat_volumes` (the per-beat pitch
+/// and level tables) ARE synced (`Packet::MetroBeatTable`, no host authority:
+/// whoever edits last wins), so both sides' clicks sound identical.
 struct Metronome {
     enabled: bool,
     bpm: u16,
     beats_per_bar: u8,
     muted: bool,
-    /// When the next local click fires. Authority free-runs it from enable time;
-    /// a follower has it (re)anchored by each incoming marker. `None` = no click
-    /// scheduled (off, or a follower awaiting its first marker).
+    /// Click output level (0..1), independent of mute.
+    volume: f32,
+    /// Pitch (Hz) of each beat's click, indexed by position in the bar — index 0
+    /// is the accent/downbeat. Resized to match `beats_per_bar` by the
+    /// Preferences UI; a beat index beyond the table falls back to a plain tone
+    /// (see `drive_metronome`).
+    beat_freqs: Vec<f32>,
+    /// Per-beat click level (0..1), indexed the same way as `beat_freqs`.
+    /// Resized alongside it; a beat index beyond the table falls back to full
+    /// volume (see `drive_metronome`).
+    beat_volumes: Vec<f32>,
+    /// When the next local click fires. On enable, the authority anchors this to
+    /// the next tick of a fixed grid derived from the *roll's* clock (see
+    /// `PianoApp::metro_start_now`) — beat 0 of the grid sits at roll-time zero,
+    /// so beats always land on round absolute positions (e.g. every whole
+    /// minute) regardless of when the metronome was actually started, rather
+    /// than free-running from an arbitrary "now". It free-runs (adds `period`)
+    /// from there. A follower has it (re)anchored by each incoming marker.
+    /// `None` = no click scheduled (off, or a follower awaiting its first
+    /// marker).
     next_beat_at: Option<Instant>,
     /// The next click's position in the bar (accent when 0 = the downbeat).
     next_beat_in_bar: u8,
@@ -174,6 +197,9 @@ impl Metronome {
             bpm: bpm.clamp(MIN_BPM, MAX_BPM),
             beats_per_bar: 4,
             muted: false,
+            volume: 1.0,
+            beat_freqs: vec![1800.0, 1200.0, 1200.0, 1200.0],
+            beat_volumes: vec![1.0, 1.0, 1.0, 1.0],
             next_beat_at: None,
             next_beat_in_bar: 0,
         }
@@ -182,6 +208,19 @@ impl Metronome {
     /// Seconds per beat at the current tempo.
     fn period(&self) -> f64 {
         60.0 / self.bpm.max(1) as f64
+    }
+
+    /// The pitch (Hz) for a given position in the bar, falling back to a plain
+    /// tone if the table is shorter than `beats_per_bar` (e.g. mid-edit, or a
+    /// peer just broadcast a larger `beats_per_bar` than our local table).
+    fn freq_for_beat(&self, beat_in_bar: u8) -> f32 {
+        self.beat_freqs.get(beat_in_bar as usize).copied().unwrap_or(1200.0)
+    }
+
+    /// The click level (0..1) for a given position in the bar, falling back to
+    /// full volume if the table is shorter than `beats_per_bar`.
+    fn volume_for_beat(&self, beat_in_bar: u8) -> f32 {
+        self.beat_volumes.get(beat_in_bar as usize).copied().unwrap_or(1.0)
     }
 }
 
@@ -285,6 +324,13 @@ struct PianoApp {
     // touches `PlaybackEngine::playhead_s`, so Learn-mode gating is unaffected.
     falling_scrollback: Option<f64>,
     falling_scrollback_idle_since: Option<Instant>,
+    // The history roll's time (`roll.now_s()`) at the moment the current file
+    // was opened — i.e. where the falling panel's score-time zero sits on the
+    // roll's absolute timeline. Purely a *label* offset (see `draw_ruler`): it
+    // makes the two strips' time rulers read as one continuous timeline across
+    // the keyboard, without touching the falling panel's own score-time-based
+    // note positions, Learn-mode gating, or the roll's segment history.
+    score_roll_origin_s: f64,
     // Result of the last save attempt, shown next to the File menu.
     roll_status: String,
     // Whether the "unsaved roll" confirmation is up (close was intercepted).
@@ -342,6 +388,10 @@ impl PianoApp {
         );
         let mut roll = roll::Roll::new();
         roll.set_timing(prefs.trailing_blank.as_duration(), prefs.idle_pause.as_duration());
+        let mut metro = Metronome::new(prefs.metro_bpm);
+        metro.beats_per_bar = prefs.metro_beats_per_bar;
+        metro.beat_freqs = prefs.metro_beat_freqs.clone();
+        metro.beat_volumes = prefs.metro_beat_volumes.clone();
         Self {
             input,
             synth: synth::Synth::start(),
@@ -368,7 +418,7 @@ impl PianoApp {
             peer: None,
             net_status: "Not connected".to_string(),
             is_host: false,
-            metro: Metronome::new(prefs.metro_bpm),
+            metro,
             // Kick off the background GitHub Releases check; the UI polls its
             // state each frame (see `update_controls`).
             updater: update::start(),
@@ -380,6 +430,7 @@ impl PianoApp {
             scrollback_idle_since: None,
             falling_scrollback: None,
             falling_scrollback_idle_since: None,
+            score_roll_origin_s: 0.0,
             roll_status: String::new(),
             show_close_confirm: false,
             allow_close: false,
@@ -407,6 +458,20 @@ impl PianoApp {
             peer.send(Packet::Color(self.local_color));
         }
         self.last_color_send = Instant::now();
+    }
+
+    /// Broadcast our per-beat click pitch/volume tables to the peer, so both
+    /// sides' clicks sound identical (see `Packet::MetroBeatTable`). Sent
+    /// immediately on every Preferences edit, on connect, and alongside the
+    /// color heartbeat so a dropped datagram doesn't leave the two sides
+    /// mismatched for long.
+    fn send_metro_table(&self) {
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::MetroBeatTable {
+                freqs: self.metro.beat_freqs.clone(),
+                volumes: self.metro.beat_volumes.clone(),
+            });
+        }
     }
 
     /// Start hosting a session. Replaces any existing session (dropping the
@@ -628,6 +693,7 @@ impl PianoApp {
                 self.open_status.clear();
                 self.falling_scrollback = None;
                 self.falling_scrollback_idle_since = None;
+                self.score_roll_origin_s = 0.0;
             }
         });
     }
@@ -698,6 +764,11 @@ impl PianoApp {
                     None => format!("opened {}", path.display()),
                 };
                 self.playback = Some(playback::PlaybackEngine::new(s, path));
+                // Align the two strips' timelines: score-time zero now maps to
+                // wherever the history roll's clock currently sits, so the
+                // ruler labels on both sides of the keyboard read as one
+                // continuous timeline (see `score_roll_origin_s`'s docs).
+                self.score_roll_origin_s = self.roll.now_s();
                 self.scrollback = None;
                 self.scrollback_idle_since = None;
                 self.falling_scrollback = None;
@@ -1409,15 +1480,31 @@ impl PianoApp {
         self.synth.set_gain(synth::Channel::Local, screen);
         self.synth.set_gain(synth::Channel::Peer, peer);
         self.synth.set_gain(synth::Channel::Playback, playback);
-        // The metronome click has no volume slider — just the local mute.
-        self.synth
-            .set_gain(synth::Channel::Metronome, if self.metro.muted { 0.0 } else { 1.0 });
+        let metro = if self.metro.muted { 0.0 } else { self.metro.volume };
+        self.synth.set_gain(synth::Channel::Metronome, metro);
     }
 
     /// Whether *this* instance owns the metronome grid: true when solo (no peer)
     /// or when we're the host. A follower defers to the host's markers.
     fn metro_authority(&self) -> bool {
         self.peer.is_none() || self.is_host
+    }
+
+    /// (Re)anchor the metronome to the next roll-time-grid-aligned beat — the
+    /// smallest multiple of the beat period (measured from roll-time zero) at
+    /// or after the current roll time. Beat 0 of the grid always sits at
+    /// roll-time zero, so beats land on round absolute positions (every BPM
+    /// beats is exactly one whole minute of roll time) regardless of when the
+    /// metronome was actually started: pressing "start" mid-beat waits for the
+    /// next grid line rather than clicking immediately. Used on enable and
+    /// after a long stall; once running, beats simply free-run by adding
+    /// `period` each time (see `drive_metronome`), so a later BPM tweak doesn't
+    /// cause an audible jump — only a fresh start re-snaps to the grid.
+    fn metro_start_now(&mut self) {
+        let (delta_s, beat_in_bar) =
+            metro_grid_align(self.roll.now_s(), self.metro.period(), self.metro.beats_per_bar);
+        self.metro.next_beat_at = Some(Instant::now() + Duration::from_secs_f64(delta_s));
+        self.metro.next_beat_in_bar = beat_in_bar;
     }
 
     /// Advance the metronome and fire any clicks due this frame. Called once per
@@ -1434,16 +1521,16 @@ impl PianoApp {
         let period = Duration::from_secs_f64(self.metro.period());
         let bpb = self.metro.beats_per_bar.max(1);
 
-        // The authority free-runs; anchor to now (on the downbeat) if idle.
+        // The authority free-runs from a roll-time-grid-aligned anchor if idle.
         if authority && self.metro.next_beat_at.is_none() {
-            self.metro.next_beat_at = Some(now);
-            self.metro.next_beat_in_bar = 0;
+            self.metro_start_now();
         }
-        // Recover from a long GUI stall (window drag, file dialog, sleep) without
-        // machine-gunning every missed beat: skip ahead to now.
+        // Recover from a long GUI stall (window drag, file dialog, sleep)
+        // without machine-gunning every missed beat: re-anchor to the grid
+        // instead of firing immediately.
         if let Some(at) = self.metro.next_beat_at {
             if now.saturating_duration_since(at) > Duration::from_secs(1) {
-                self.metro.next_beat_at = Some(now);
+                self.metro_start_now();
             }
         }
 
@@ -1453,7 +1540,11 @@ impl PianoApp {
             }
             let beat_in_bar = self.metro.next_beat_in_bar;
             if !self.metro.muted {
-                self.synth.tick(beat_in_bar == 0);
+                self.synth.tick(
+                    self.metro.freq_for_beat(beat_in_bar),
+                    beat_in_bar == 0,
+                    self.metro.volume_for_beat(beat_in_bar),
+                );
             }
             if authority {
                 if let Some(peer) = &self.peer {
@@ -1483,9 +1574,9 @@ impl PianoApp {
         }
         if self.metro_authority() {
             if enabled && !was_enabled {
-                // Fresh start: click the downbeat immediately.
-                self.metro.next_beat_at = Some(Instant::now());
-                self.metro.next_beat_in_bar = 0;
+                // Fresh start: wait for the next roll-time-grid-aligned beat
+                // rather than clicking immediately (see `metro_start_now`).
+                self.metro_start_now();
             }
             // A bpm-only change keeps the running schedule (period is read live);
             // only broadcast the start/stop edge here — the per-beat markers
@@ -1562,15 +1653,21 @@ impl PianoApp {
             self.prefs.metro_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
             self.prefs.save();
         }
-        if ui
+        ui.separator();
+        let mut changed = ui
             .checkbox(&mut self.metro.muted, "Mute click")
             .on_hover_text("Silence the click on *this* machine only (the peer still hears it)")
-            .changed()
-        {
-            self.synth.set_gain(
-                synth::Channel::Metronome,
-                if self.metro.muted { 0.0 } else { 1.0 },
-            );
+            .changed();
+        changed |= ui
+            .add_enabled(
+                !self.metro.muted,
+                egui::Slider::new(&mut self.metro.volume, 0.0..=1.0)
+                    .show_value(false)
+                    .text("click volume"),
+            )
+            .changed();
+        if changed {
+            self.apply_synth_gains();
         }
     }
 
@@ -1887,6 +1984,132 @@ impl PianoApp {
                 ui.add_space(8.0);
                 ui.separator();
 
+                // ---- Metronome ----
+                ui.heading("Metronome");
+                ui.horizontal(|ui| {
+                    ui.label("Beats per bar:");
+                    let mut bpb = self.prefs.metro_beats_per_bar;
+                    if ui.add(egui::DragValue::new(&mut bpb).range(1..=12)).changed() {
+                        bpb = bpb.max(1);
+                        self.prefs.metro_beats_per_bar = bpb;
+                        resize_beat_table(&mut self.prefs.metro_beat_freqs, bpb as usize, 1200.0);
+                        resize_beat_table(&mut self.prefs.metro_beat_volumes, bpb as usize, 1.0);
+                        self.metro.beats_per_bar = bpb;
+                        self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                        self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
+                        self.metro.next_beat_in_bar %= bpb;
+                        self.send_metro_table();
+                        changed = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Pitch and level of each beat's click, synced with the peer so both \
+                         sides sound identical. The first slider quick-picks a common pitch; \
+                         fine-tune with the Hz field next to it.",
+                    )
+                    .weak(),
+                );
+                for i in 0..self.prefs.metro_beat_freqs.len() {
+                    let is_accent = i == 0;
+                    egui::Frame::none()
+                        .fill(if is_accent {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                        .rounding(egui::Rounding::same(4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Fixed-width label column so the controls line up across
+                                // rows regardless of the accent's extra sub-label or the
+                                // Hz field's digit count.
+                                ui.allocate_ui(egui::vec2(76.0, 0.0), |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(format!("Beat {}", i + 1));
+                                        if is_accent {
+                                            ui.label(egui::RichText::new("accent").small().weak());
+                                        }
+                                    });
+                                });
+
+                                // Quick-pick slider: snaps the Hz field to a common preset.
+                                // Widths below are pinned via `ui.spacing_mut()` (egui 0.29 has
+                                // no per-widget `desired_width` on Slider/DragValue) so a beat
+                                // with more Hz digits doesn't push its neighbors out of column.
+                                let freq = self.prefs.metro_beat_freqs[i];
+                                let mut preset = METRO_FREQ_PRESETS
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|(_, a), (_, b)| {
+                                        (**a - freq).abs().total_cmp(&(**b - freq).abs())
+                                    })
+                                    .map(|(idx, _)| idx)
+                                    .unwrap_or(0);
+                                ui.spacing_mut().slider_width = 56.0;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut preset, 0..=METRO_FREQ_PRESETS.len() - 1)
+                                            .show_value(false),
+                                    )
+                                    .on_hover_text("Quick-pick a common click pitch")
+                                    .changed()
+                                {
+                                    self.prefs.metro_beat_freqs[i] = METRO_FREQ_PRESETS[preset];
+                                    self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                                    self.send_metro_table();
+                                    changed = true;
+                                }
+
+                                ui.spacing_mut().interact_size.x = 64.0;
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.prefs.metro_beat_freqs[i])
+                                            .range(100.0..=4000.0)
+                                            .speed(5.0)
+                                            .suffix(" Hz"),
+                                    )
+                                    .changed()
+                                {
+                                    self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                                    self.send_metro_table();
+                                    changed = true;
+                                }
+
+                                ui.separator();
+                                ui.spacing_mut().slider_width = 80.0;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.prefs.metro_beat_volumes[i], 0.0..=1.0)
+                                            .show_value(false)
+                                            .text("volume"),
+                                    )
+                                    .changed()
+                                {
+                                    self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
+                                    self.send_metro_table();
+                                    changed = true;
+                                }
+                            });
+                        });
+                }
+                if ui.button("Reset metronome to defaults").clicked() {
+                    let d = prefs::Prefs::default();
+                    self.prefs.metro_beats_per_bar = d.metro_beats_per_bar;
+                    self.prefs.metro_beat_freqs = d.metro_beat_freqs.clone();
+                    self.prefs.metro_beat_volumes = d.metro_beat_volumes.clone();
+                    self.metro.beats_per_bar = d.metro_beats_per_bar;
+                    self.metro.beat_freqs = d.metro_beat_freqs;
+                    self.metro.beat_volumes = d.metro_beat_volumes;
+                    self.metro.next_beat_in_bar %= self.metro.beats_per_bar.max(1);
+                    self.send_metro_table();
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
                 // ---- Advanced (model / network) ----
                 egui::CollapsingHeader::new("Advanced")
                     .default_open(false)
@@ -2057,6 +2280,7 @@ impl PianoApp {
                     // reconnect mid-chord), and the peer needs our color.
                     self.clear_remote_keys();
                     self.send_color();
+                    self.send_metro_table();
                     // If we're the metronome authority, announce current state so
                     // a follower syncs immediately (even when it's off). The
                     // per-beat markers handle the running case.
@@ -2087,8 +2311,9 @@ impl PianoApp {
                         self.metro.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
                         self.metro.enabled = on;
                         if on && !was {
-                            self.metro.next_beat_at = Some(Instant::now());
-                            self.metro.next_beat_in_bar = 0;
+                            // Wait for the next roll-time-grid-aligned beat
+                            // rather than clicking immediately.
+                            self.metro_start_now();
                         } else if !on {
                             self.metro.next_beat_at = None;
                         }
@@ -2105,6 +2330,15 @@ impl PianoApp {
                 // Markers should always arrive as NetEvent::MetroBeat (net.rs
                 // splits them out to stamp RTT); ignore any that slip through.
                 NetEvent::Packet(Packet::MetroBeat { .. }) => {}
+                NetEvent::Packet(Packet::MetroBeatTable { freqs, volumes }) => {
+                    // No authority here (see Packet::MetroBeatTable): whoever
+                    // last edited wins on both ends.
+                    self.metro.beat_freqs = freqs.clone();
+                    self.metro.beat_volumes = volumes.clone();
+                    self.prefs.metro_beat_freqs = freqs;
+                    self.prefs.metro_beat_volumes = volumes;
+                    self.prefs.save();
+                }
                 NetEvent::MetroBeat { bpm, beat_in_bar, beats_per_bar, on, one_way } => {
                     self.on_metro_beat(bpm, beat_in_bar, beats_per_bar, on, one_way);
                 }
@@ -2176,8 +2410,10 @@ impl eframe::App for PianoApp {
         let still_secs = self.pointer_still_since.elapsed().as_secs_f32();
 
         // Low-rate color heartbeat so colors sync regardless of connect order.
+        // The metronome tables ride along on the same cadence.
         if self.peer.is_some() && self.last_color_send.elapsed() >= COLOR_HEARTBEAT {
             self.send_color();
+            self.send_metro_table();
         }
 
         // ---- Custom title bar (File/Edit menus, window controls, edge resize).
@@ -2397,6 +2633,7 @@ impl eframe::App for PianoApp {
                         self.range_drag,
                         self.falling_scrollback.unwrap_or(0.0),
                         self.prefs.roll_px_per_s,
+                        self.score_roll_origin_s,
                     );
                 }
             }
@@ -2635,7 +2872,7 @@ fn draw_roll(
     // = view_top_s, bottom edge = view_top_s - height/speed), never the whole
     // session, so cost is O(strip height) regardless of duration.
     let bottom_s = view_top_s - (rect.height() / px_per_s) as f64;
-    draw_ruler(&painter, rect, bottom_s, view_top_s, y_of);
+    draw_ruler(&painter, rect, bottom_s, view_top_s, y_of, 0.0);
 
     // ---- Instance separators: full-width lines where the clock resumed
     // after an idle pause (or a break was inserted by hand).
@@ -2793,6 +3030,39 @@ fn limit_row(ui: &mut egui::Ui, label: &str, limit: &mut prefs::Limit, tip: &str
     changed
 }
 
+/// Pure grid-alignment math behind `PianoApp::metro_start_now`: given the
+/// current roll time and the beat grid (period, beats per bar), returns
+/// `(delta_s, beat_in_bar)` — how many seconds until the next beat that's an
+/// exact multiple of `period` since roll-time zero, and that beat's position
+/// in the bar. Because beat 0 always sits at roll-time zero, after exactly
+/// `beats_per_bar` × (a whole number of bars) beats the target is a whole
+/// multiple of `period * beats_per_bar` since zero — in particular, after
+/// `bpm` beats at any tempo, exactly one minute has elapsed (`bpm * (60/bpm)
+/// == 60`), so beats always land on round absolute positions.
+fn metro_grid_align(roll_s: f64, period: f64, beats_per_bar: u8) -> (f64, u8) {
+    let bpb = beats_per_bar.max(1) as u64;
+    // Epsilon so a roll time that's already (almost) exactly on a grid line
+    // fires now rather than waiting a full extra period.
+    let beat_idx = ((roll_s / period) - 1e-6).ceil().max(0.0) as u64;
+    let target_roll_s = beat_idx as f64 * period;
+    let delta_s = (target_roll_s - roll_s).max(0.0);
+    (delta_s, (beat_idx % bpb) as u8)
+}
+
+/// Resize a metronome per-beat table (pitch or volume) to `len` entries: extra
+/// slots repeat the last configured value (a reasonable default for a
+/// newly-added beat), shrinking just truncates. Used when `beats_per_bar`
+/// changes; `default_fill` is used only when the table started out empty.
+fn resize_beat_table(table: &mut Vec<f32>, len: usize, default_fill: f32) {
+    let len = len.max(1);
+    if table.len() < len {
+        let fill = table.last().copied().unwrap_or(default_fill);
+        table.resize(len, fill);
+    } else {
+        table.truncate(len);
+    }
+}
+
 /// Ease `current` toward `target` (frame-rate independent exponential),
 /// returning `None` once within half a roll-pixel — i.e. "arrived". The
 /// arrival tolerance scales with the current roll zoom (`px_per_s`).
@@ -2810,12 +3080,20 @@ fn ease_toward(current: f64, target: f64, dt: f64, px_per_s: f32) -> Option<f64>
 /// in `[lo_s, hi_s]` — O(panel height), never O(session length) — and leaves
 /// the time→y mapping to the caller so the two panels' opposite scroll
 /// directions both work.
+///
+/// `label_offset_s` shifts only the printed `mm:ss` text, not `y_of`'s
+/// geometry: the falling panel's notes are positioned in *score* time, but its
+/// labels are shown in the equivalent *roll* time (score time zero maps to
+/// `PianoApp::score_roll_origin_s`), so the two strips' rulers read as one
+/// continuous timeline across the keyboard. The history roll passes `0.0`
+/// (its native time already *is* roll time).
 fn draw_ruler(
     painter: &egui::Painter,
     rect: egui::Rect,
     lo_s: f64,
     hi_s: f64,
     y_of: impl Fn(f64) -> f32,
+    label_offset_s: f64,
 ) {
     let minor = egui::Stroke::new(0.5, egui::Color32::from_gray(40));
     let major = egui::Stroke::new(1.0, egui::Color32::from_gray(60));
@@ -2825,10 +3103,11 @@ fn draw_ruler(
         let y = y_of(s as f64);
         if s % 10 == 0 {
             painter.hline(rect.x_range(), y, major);
+            let label_s = (s as f64 + label_offset_s).round() as i64;
             painter.text(
                 egui::pos2(rect.left() + 4.0, y + 2.0),
                 egui::Align2::LEFT_TOP,
-                format!("{}:{:02}", s / 60, s % 60),
+                format!("{}:{:02}", label_s / 60, label_s % 60),
                 egui::FontId::monospace(10.0),
                 egui::Color32::from_gray(140),
             );
@@ -2871,6 +3150,7 @@ fn draw_falling(
     range_drag: Option<(f32, f32)>,
     scroll_offset_s: f64,
     px_per_s: f32,
+    label_origin_s: f64,
 ) {
     let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
@@ -2883,7 +3163,9 @@ fn draw_falling(
     let y_of = |t: f64| rect.bottom() - ((t - view_playhead_s) as f32) * px_per_s;
     let top_s = view_playhead_s + (rect.height() / px_per_s) as f64;
 
-    draw_ruler(&painter, rect, view_playhead_s, top_s, y_of);
+    // Labels only (not y_of's geometry) are shifted into roll-time — see
+    // `draw_ruler`'s docs.
+    draw_ruler(&painter, rect, view_playhead_s, top_s, y_of, label_origin_s);
 
     // Make a scrubbed view unmistakable: this is a preview, not a seek.
     if scroll_offset_s != 0.0 {
@@ -3023,5 +3305,43 @@ fn draw_keyboard_layered(
         let active: Vec<egui::Color32> =
             layers.iter().filter(|(on, _)| on[idx]).map(|(_, c)| *c).collect();
         paint_key_striped(painter, key.rect, &active, base, 2.0, stroke);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metro_grid_aligns_to_next_beat_and_repeats_every_whole_minute() {
+        // 120 BPM => period 0.5s (exact in f64). Starting mid-beat waits for
+        // the next grid line instead of firing immediately.
+        let (delta, beat) = metro_grid_align(17.3, 0.5, 4);
+        assert!((delta - 0.2).abs() < 1e-9);
+        assert_eq!(beat, 3); // beat_idx 35 (17.5 / 0.5); 35 % 4 == 3
+
+        // Landing exactly on a grid line fires immediately.
+        let (delta0, beat0) = metro_grid_align(18.0, 0.5, 4);
+        assert!(delta0 < 1e-6);
+        assert_eq!(beat0, 0);
+
+        // Beat 0 of the grid always sits at roll-time zero, so after exactly
+        // `bpm` beats the target lands on a whole minute — true for ANY bpm,
+        // since bpm * (60 / bpm) == 60. Verified here at 120 BPM starting just
+        // before the 60s mark.
+        let (delta, beat) = metro_grid_align(59.9, 0.5, 4);
+        assert_eq!(59.9 + delta, 60.0);
+        assert_eq!(beat, 0);
+    }
+
+    #[test]
+    fn resize_beat_table_extends_and_truncates() {
+        let mut freqs = vec![1800.0, 1200.0];
+        resize_beat_table(&mut freqs, 4, 1200.0);
+        assert_eq!(freqs, vec![1800.0, 1200.0, 1200.0, 1200.0]); // repeats the last
+        resize_beat_table(&mut freqs, 1, 1200.0);
+        assert_eq!(freqs, vec![1800.0]);
+        resize_beat_table(&mut freqs, 0, 1200.0);
+        assert_eq!(freqs.len(), 1); // floored to at least 1
     }
 }

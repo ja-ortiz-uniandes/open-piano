@@ -74,6 +74,20 @@ pub struct Prefs {
     // ---- Metronome ----
     /// Default metronome tempo (BPM).
     pub metro_bpm: u16,
+    /// Number of beats per bar (size of `metro_beat_freqs`); also broadcast to
+    /// a connected peer with each beat, so both sides use the same bar length.
+    pub metro_beats_per_bar: u8,
+    /// Pitch (Hz) of each beat's click, indexed by position in the bar — index
+    /// 0 is the accent/downbeat. Broadcast to a connected peer (`Packet::
+    /// MetroBeatTable`) whenever it changes, so both sides' clicks sound
+    /// identical — unlike `metro_bpm`/`metro_beats_per_bar` there's no host
+    /// authority; whichever side edits last wins on both ends.
+    pub metro_beat_freqs: Vec<f32>,
+    /// Per-beat click level (0..1), indexed the same way as `metro_beat_freqs`.
+    /// Multiplies the accent/plain amplitude in `synth::Synth::tick`, so beats
+    /// can be dialed back (or muted) individually — e.g. a downbeat much
+    /// louder than the rest. Synced with the peer alongside `metro_beat_freqs`.
+    pub metro_beat_volumes: Vec<f32>,
 
     // ---- Advanced (model / network) ----
     /// Below this raw RMS a mic window is treated as silence (inference skipped).
@@ -108,6 +122,9 @@ impl Default for Prefs {
             echo_holdoff_ms: 2000,
             mic_muted: false,
             metro_bpm: 120,
+            metro_beats_per_bar: 4,
+            metro_beat_freqs: vec![1800.0, 1200.0, 1200.0, 1200.0],
+            metro_beat_volumes: vec![1.0, 1.0, 1.0, 1.0],
             silence_rms: 0.002,
             norm_max_gain: 10.0,
             frame_off: 0.10,
@@ -193,6 +210,8 @@ mod tests {
         assert_eq!(parsed.threshold, 0.5);
         assert_eq!(parsed.roll_px_per_s, 40.0);
         assert_eq!(parsed.metro_bpm, 120);
+        assert_eq!(parsed.metro_beats_per_bar, 4);
+        assert_eq!(parsed.metro_beat_freqs, vec![1800.0, 1200.0, 1200.0, 1200.0]);
         assert!(!parsed.trailing_blank.infinite);
         assert_eq!(parsed.trailing_blank.secs, 20.0);
     }

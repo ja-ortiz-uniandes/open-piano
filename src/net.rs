@@ -416,7 +416,7 @@ mod tests {
         // heartbeat papers over any individual loss).
         let exchange = |from: &Peer, to: &Peer, packet: Packet, what: &str| {
             for _ in 0..100 {
-                from.send(packet);
+                from.send(packet.clone());
                 match to.events.recv_timeout(Duration::from_millis(500)) {
                     Ok(NetEvent::Packet(p)) if p == packet => return,
                     Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => continue,

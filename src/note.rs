@@ -47,7 +47,7 @@ impl NoteMsg {
 /// A packet on the P2P wire: either a note transition or a peer announcing the
 /// color it wants its notes drawn in. Colors travel over the network so each
 /// player picks *their own* color and the other end renders it — see `net.rs`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
     Note(NoteMsg),
     /// The sender's chosen display color, as sRGB `[r, g, b]`.
@@ -67,6 +67,14 @@ pub enum Packet {
     /// tempo. The host adopts it as the new authoritative grid and echoes it
     /// back via `MetroBeat`s (last-writer-wins, single scheduler). Status `0xB1`.
     MetroCtl { on: bool, bpm: u16 },
+    /// Per-beat click pitch (Hz) and level (0..1) tables, indexed the same way
+    /// as `Metronome::beat_freqs`/`beat_volumes` in `main.rs`. Unlike
+    /// `MetroBeat`/`MetroCtl` there's no host authority here — whichever side
+    /// edits its Preferences last broadcasts its tables and the other side
+    /// adopts them verbatim, so both players' clicks sound identical. Sent on
+    /// every edit and re-sent on the color heartbeat so a dropped datagram
+    /// doesn't leave the two sides mismatched. Status `0xB2`.
+    MetroBeatTable { freqs: Vec<f32>, volumes: Vec<f32> },
 }
 
 impl Packet {
@@ -86,6 +94,22 @@ impl Packet {
                 let [hi, lo] = bpm.to_be_bytes();
                 vec![0xB1, *on as u8, hi, lo]
             }
+            Packet::MetroBeatTable { freqs, volumes } => {
+                // Both tables always have equal length (main.rs keeps them in
+                // lockstep); clamp defensively so a stray mismatch can't
+                // corrupt the frame instead of just truncating it.
+                let len = freqs.len().min(volumes.len()).min(u8::MAX as usize);
+                let mut buf = Vec::with_capacity(2 + len * 8);
+                buf.push(0xB2);
+                buf.push(len as u8);
+                for f in freqs.iter().take(len) {
+                    buf.extend_from_slice(&f.to_be_bytes());
+                }
+                for v in volumes.iter().take(len) {
+                    buf.extend_from_slice(&v.to_be_bytes());
+                }
+                buf
+            }
         }
     }
 
@@ -104,6 +128,19 @@ impl Packet {
                 on: buf[1] != 0,
                 bpm: u16::from_be_bytes([buf[2], buf[3]]),
             }),
+            0xB2 if buf.len() >= 2 => {
+                let len = buf[1] as usize;
+                if buf.len() < 2 + len * 8 {
+                    return None;
+                }
+                let read_f32 = |i: usize| {
+                    let off = 2 + i * 4;
+                    f32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+                };
+                let freqs = (0..len).map(read_f32).collect();
+                let volumes = (0..len).map(|i| read_f32(len + i)).collect();
+                Some(Packet::MetroBeatTable { freqs, volumes })
+            }
             _ => None,
         }
     }
@@ -123,8 +160,13 @@ mod tests {
             Packet::MetroBeat { bpm: 240, beat_in_bar: 3, beats_per_bar: 4, on: false },
             Packet::MetroCtl { on: true, bpm: 90 },
             Packet::MetroCtl { on: false, bpm: 200 },
+            Packet::MetroBeatTable { freqs: vec![], volumes: vec![] },
+            Packet::MetroBeatTable {
+                freqs: vec![1800.0, 1200.0, 1200.0, 1200.0],
+                volumes: vec![1.0, 0.5, 0.75, 0.25],
+            },
         ] {
-            assert_eq!(Packet::decode(&p.encode()), Some(p), "roundtrip {p:?}");
+            assert_eq!(Packet::decode(&p.encode()), Some(p.clone()), "roundtrip {p:?}");
         }
     }
 
@@ -133,6 +175,7 @@ mod tests {
         assert_eq!(Packet::decode(&[]), None);
         assert_eq!(Packet::decode(&[0xB0, 0, 120]), None); // too short for MetroBeat
         assert_eq!(Packet::decode(&[0xB1, 1]), None); // too short for MetroCtl
+        assert_eq!(Packet::decode(&[0xB2, 2, 0, 0, 0, 0]), None); // too short for MetroBeatTable
         assert_eq!(Packet::decode(&[0x7F, 0, 0]), None); // unknown status
     }
 }

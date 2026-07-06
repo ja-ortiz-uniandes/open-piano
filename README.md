@@ -51,8 +51,12 @@ Working today:
 - **Synced metronome.** A shared click both players hear together: the host is
   the timing anchor and either player can set the tempo or start/stop it (a
   guest's change is adopted by the host, so there's one grid, never two duelling
-  clocks). Each player can mute *their own* click locally without silencing the
-  other. Solo, it's just a plain metronome. (`src/synth.rs`, `src/main.rs`)
+  clocks). Beats are grid-aligned to the history roll's clock — pressing start
+  waits for the next round position (e.g. a whole minute) rather than clicking
+  immediately wherever you happened to press play. Each player has their own
+  volume/mute for the click, and (Preferences ▸ Metronome) a fully customizable,
+  peer-synced per-beat pitch/volume table and beats-per-bar. Solo, it's just a
+  plain metronome. (`src/synth.rs`, `src/main.rs`, `src/note.rs`)
 - **Preferences, persisted.** An **Edit ▸ Preferences** dialog (Ctrl+,)
   consolidates the roll timing, appearance, mic, and advanced model/network
   tunables, saved to `%LOCALAPPDATA%\open-piano\preferences.json` and restored

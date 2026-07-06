@@ -67,9 +67,11 @@ enum Cmd {
     /// Set a channel's output gain (0.0 = silent). Applied per sample, so it
     /// fades notes already sounding, not just future ones.
     Gain(Channel, f32),
-    /// Fire a one-shot metronome click (`accent` = the downbeat: higher and
-    /// louder). Routed through `Channel::Metronome`.
-    Tick(bool),
+    /// Fire a one-shot metronome click at `freq_hz` (the per-beat pitch table
+    /// lookup lives in `main.rs`); `accent` (the downbeat) is louder regardless
+    /// of pitch, and `volume` (0..1) is the per-beat level from the same table.
+    /// Routed through `Channel::Metronome`.
+    Tick(f32, bool, f32),
 }
 
 /// Where a voice is in its amplitude envelope.
@@ -152,14 +154,16 @@ impl SynthState {
         }
     }
 
-    /// Fire a one-shot metronome click. Accent (the downbeat) is higher-pitched
-    /// and louder so the bar's first beat stands out.
-    fn trigger_click(&mut self, accent: bool) {
-        let freq = if accent { 1800.0 } else { 1200.0 };
-        self.click_inc = freq / self.sample_rate;
+    /// Fire a one-shot metronome click at `freq_hz` (the per-beat pitch table is
+    /// `main.rs`'s job — this just renders whatever pitch it's given). Accent
+    /// (the downbeat) is louder regardless of pitch, so the bar's first beat
+    /// stands out even if its configured pitch happens to match another beat's.
+    /// `volume` (0..1, the per-beat level table) scales on top of that.
+    fn trigger_click(&mut self, freq_hz: f32, accent: bool, volume: f32) {
+        self.click_inc = freq_hz / self.sample_rate;
         self.click_phase = 0.0;
         self.click_env = 1.0;
-        self.click_amp = if accent { 1.1 } else { 0.75 };
+        self.click_amp = (if accent { 1.1 } else { 0.75 }) * volume.clamp(0.0, 1.0);
     }
 
     /// Start (or retrigger) the given note on a channel: reuse a voice already on
@@ -323,10 +327,12 @@ impl Synth {
         let _ = self.cmd_tx.send(Cmd::Gain(channel, gain));
     }
 
-    /// Fire a one-shot metronome click on [`Channel::Metronome`]. `accent` marks
-    /// the downbeat (higher pitch + louder). Cheap and lock-free like the rest.
-    pub fn tick(&self, accent: bool) {
-        let _ = self.cmd_tx.send(Cmd::Tick(accent));
+    /// Fire a one-shot metronome click at `freq_hz` on [`Channel::Metronome`].
+    /// `accent` marks the downbeat (louder, regardless of pitch); `volume`
+    /// (0..1) is that beat's level. Cheap and lock-free like the rest; the
+    /// per-beat pitch/volume tables live in `main.rs`.
+    pub fn tick(&self, freq_hz: f32, accent: bool, volume: f32) {
+        let _ = self.cmd_tx.send(Cmd::Tick(freq_hz, accent, volume));
     }
 
     /// Stop the audio thread and wait for it to wind down.
@@ -373,7 +379,7 @@ fn output_loop(
                     Cmd::On(m, ch) => state.note_on(m, ch),
                     Cmd::Off(m, ch) => state.note_off(m, ch),
                     Cmd::Gain(ch, g) => state.gain[ch as usize] = g,
-                    Cmd::Tick(accent) => state.trigger_click(accent),
+                    Cmd::Tick(freq_hz, accent, volume) => state.trigger_click(freq_hz, accent, volume),
                 }
             }
             for frame in $data.chunks_mut($channels) {

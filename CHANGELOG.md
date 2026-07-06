@@ -4,6 +4,38 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-05
+
+### Added
+
+- **Metronome click volume.** A dedicated volume slider next to "Mute click",
+  independent of mute — matches the existing screen/peer/playback pattern.
+- **Per-beat metronome pitch and volume tables (Preferences ▸ Metronome).**
+  Beats per bar is now configurable (1–12), and each beat's click pitch and
+  level are independently editable — beat 1 is the accent/downbeat, styled
+  with a subtle background tint. A quick-pick slider snaps the pitch to one
+  of four common presets before the precise Hz field; a Reset button restores
+  the defaults. Both tables are synced with the peer (no host authority —
+  whoever edits last wins on both ends), so the two players' clicks sound
+  identical, not just land on the same beat.
+
+### Changed
+
+- **Metronome beats are grid-aligned, not free-run from "start".** Beat 0 of
+  the metronome's grid always sits at the history roll's time zero, so
+  pressing start mid-beat waits for the next round position (e.g. every `bpm`
+  beats lands on a whole minute of roll time) instead of clicking immediately
+  wherever you happened to press play. Once running it free-runs normally, so
+  tempo tweaks don't cause an audible jump — only a fresh start re-snaps to
+  the grid.
+- **The falling-notes panel's ruler now reads on the same absolute timeline as
+  the history roll below it.** Opening a file records where the history
+  roll's clock currently sits as the score's time-zero, so the two strips'
+  `mm:ss` labels line up continuously across the keyboard instead of each
+  panel numbering from its own zero. Only the *printed labels* shift — note
+  positions, Learn-mode gating, and looping are unaffected. The history roll
+  stays the ground truth: it can run longer than the (fixed-length) score.
+
 ## [0.4.0] - 2026-07-05
 
 ### Added
