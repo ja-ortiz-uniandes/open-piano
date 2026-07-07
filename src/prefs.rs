@@ -101,6 +101,18 @@ pub struct Prefs {
     pub frame_off: f32,
     /// How often the input supervisor rescans MIDI ports, in milliseconds.
     pub midi_poll_ms: u64,
+
+    // ---- Startup & window ----
+    /// Restore compact/normal window mode from the last session at startup.
+    pub remember_window_state: bool,
+    /// Last active compact-mode state; only consulted at startup when
+    /// `remember_window_state` is true.
+    pub compact_mode: bool,
+    /// Reload the most recently opened MIDI/JSONL file at startup.
+    pub reopen_last_file: bool,
+    /// The most recently opened score file; only consulted at startup when
+    /// `reopen_last_file` is true. Cleared on explicit File ▸ Close.
+    pub last_file_path: Option<PathBuf>,
 }
 
 // Defaults mirror the former compile-time constants in roll.rs / main.rs /
@@ -133,6 +145,10 @@ impl Default for Prefs {
             norm_max_gain: 10.0,
             frame_off: 0.10,
             midi_poll_ms: 1000,
+            remember_window_state: false,
+            compact_mode: false,
+            reopen_last_file: false,
+            last_file_path: None,
         }
     }
 }

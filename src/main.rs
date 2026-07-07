@@ -31,6 +31,8 @@ mod update;
 
 use eframe::egui;
 
+use std::path::PathBuf;
+
 use std::time::{Duration, Instant};
 
 use input::{InputEngine, Source};
@@ -69,10 +71,20 @@ fn main() -> eframe::Result<()> {
 
     let icon = eframe::icon_data::from_png_bytes(bundle::ICON_PNG)
         .expect("assets/icon.png must be a valid PNG (embedded at compile time)");
+    // Load prefs here (not inside `PianoApp::new`) so the OS window can be
+    // created *already* at the remembered compact size — no post-launch
+    // resize flash.
+    let prefs = prefs::Prefs::load();
+    let start_compact = prefs.remember_window_state && prefs.compact_mode;
+    let (inner_size, min_size) = if start_compact {
+        ([DEFAULT_WINDOW_SIZE[0], COMPACT_WINDOW_H], COMPACT_MIN_SIZE)
+    } else {
+        (DEFAULT_WINDOW_SIZE, NORMAL_MIN_SIZE)
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 620.0])
-            .with_min_inner_size([640.0, 420.0])
+            .with_inner_size(inner_size)
+            .with_min_inner_size(min_size)
             .with_icon(icon)
             // Custom window chrome: we draw our own title bar (File/Edit menus,
             // min/max/close) so the menus are always the topmost row, and add
@@ -92,7 +104,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "open-piano",
         options,
-        Box::new(|_cc| Ok(Box::new(PianoApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(PianoApp::new(prefs)))),
     )
 }
 
@@ -131,6 +143,16 @@ const SCROLLBACK_EASE_RATE: f64 = 12.0;
 /// than `MIN_KEYBOARD_H` so keys stay playable in a short window.
 const KEYBOARD_FRACTION: f32 = 0.45;
 const MIN_KEYBOARD_H: f32 = 140.0;
+
+/// Compact mode ("alternate minimize"): the window shrinks to just the title
+/// bar + keyboard. Height chosen so the keys stay comfortably playable; the
+/// compact minimum still leaves room for the full 88-key span.
+const COMPACT_WINDOW_H: f32 = 230.0;
+const COMPACT_MIN_SIZE: [f32; 2] = [640.0, 190.0];
+/// Normal-mode window sizing — one source of truth shared by `main()`'s
+/// `ViewportBuilder` and the compact-mode restore path.
+const NORMAL_MIN_SIZE: [f32; 2] = [640.0, 420.0];
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 620.0];
 
 /// With a score loaded, the space not taken by the keyboard splits between
 /// the falling-notes panel (above the keys) and the history roll (below).
@@ -360,6 +382,17 @@ struct PianoApp {
     segment_row_visible: bool,
     // Whether the top config panel is collapsed to its title strip (chevron).
     config_collapsed: bool,
+    // Compact mode ("alternate minimize" — keyboard + title bar only). This is
+    // user *intent*, toggled by the title-bar button and persisted when
+    // "Remember window state" is on.
+    compact_mode: bool,
+    // Window size to restore to when leaving compact mode, snapshotted on entry.
+    normal_size: Option<egui::Vec2>,
+    // What's actually been applied to the OS window right now. Reconciled once
+    // per frame against `compact_mode && !show_prefs` (see
+    // `sync_compact_viewport`), so resizes fire only on real transitions and
+    // opening Preferences transparently un-shrinks the window.
+    compact_applied: bool,
     // Whether the Learn side panel is expanded ("‹"/"›" arrows). Preserved
     // across Learn-mode exits, so re-entering restores the last choice.
     learn_panel_expanded: bool,
@@ -385,10 +418,10 @@ struct PianoApp {
 }
 
 impl PianoApp {
-    fn new() -> Self {
+    fn new(prefs: prefs::Prefs) -> Self {
         // Preferences drive the startup seeds below (and the input backend's
-        // initial tunables), so load them first.
-        let prefs = prefs::Prefs::load();
+        // initial tunables). Loaded by `main()` — which also sized the OS
+        // window from them — and passed in.
         let input = input::start(
             prefs.threshold,
             audio::InferenceTunables::new(prefs.silence_rms, prefs.norm_max_gain, prefs.frame_off),
@@ -400,7 +433,16 @@ impl PianoApp {
         metro.beats_per_bar = prefs.metro_beats_per_bar;
         metro.beat_freqs = prefs.metro_beat_freqs.clone();
         metro.beat_volumes = prefs.metro_beat_volumes.clone();
-        Self {
+        // Mirror `main()`'s startup decision: the OS window was already created
+        // compact when this is true, so `compact_applied` MUST be seeded equal
+        // to `compact_mode` — seeding `false` would make frame 1 see a spurious
+        // transition and snapshot the already-compact rect as "normal".
+        let compact_mode = prefs.remember_window_state && prefs.compact_mode;
+        let reopen_path = prefs
+            .reopen_last_file
+            .then(|| prefs.last_file_path.clone())
+            .flatten();
+        let mut app = Self {
             input,
             synth: synth::Synth::start(),
             screen_volume: 1.0,
@@ -450,6 +492,9 @@ impl PianoApp {
             open_status: String::new(),
             segment_row_visible: true,
             config_collapsed: false,
+            compact_mode,
+            normal_size: None,
+            compact_applied: compact_mode,
             learn_panel_expanded: true,
             pending_break_t: None,
             range_drag: None,
@@ -459,7 +504,14 @@ impl PianoApp {
             instance_edit: String::new(),
             segment_edit: String::new(),
             segment_edit_idx: 0,
+        };
+        // Startup reopen (opt-in): reload the last-opened score. A moved/deleted
+        // file falls through to `load_score_path`'s non-panicking "open failed"
+        // status — startup never blocks on a stale path.
+        if let Some(path) = reopen_path {
+            app.load_score_path(path);
         }
+        app
     }
 
     /// Send our chosen color to the peer (if connected) and reset the heartbeat.
@@ -712,6 +764,12 @@ impl PianoApp {
                 self.falling_scrollback = None;
                 self.falling_scrollback_idle_since = None;
                 self.score_roll_origin_s = 0.0;
+                // Explicit close is a deliberate "forget this file" signal —
+                // don't reopen it on the next launch.
+                if self.prefs.last_file_path.is_some() {
+                    self.prefs.last_file_path = None;
+                    self.prefs.save();
+                }
             }
         });
     }
@@ -768,6 +826,12 @@ impl PianoApp {
         else {
             return; // cancelled
         };
+        self.load_score_path(path);
+    }
+
+    /// Load a score file into a playback engine — the dialog-free tail of
+    /// [`open_score`], reused by the startup "reopen last file" path.
+    fn load_score_path(&mut self, path: PathBuf) {
         match score::Score::load(&path) {
             Ok(s) => {
                 self.peer = None;
@@ -781,7 +845,7 @@ impl PianoApp {
                     Some(w) => format!("opened {} ({w})", path.display()),
                     None => format!("opened {}", path.display()),
                 };
-                self.playback = Some(playback::PlaybackEngine::new(s, path));
+                self.playback = Some(playback::PlaybackEngine::new(s, path.clone()));
                 // Align the two strips' timelines: score-time zero now maps to
                 // wherever the history roll's clock currently sits, so the
                 // ruler labels on both sides of the keyboard read as one
@@ -792,6 +856,10 @@ impl PianoApp {
                 self.falling_scrollback = None;
                 self.falling_scrollback_idle_since = None;
                 self.range_drag = None;
+                if self.prefs.reopen_last_file {
+                    self.prefs.last_file_path = Some(path);
+                    self.prefs.save();
+                }
             }
             Err(e) => self.open_status = format!("open failed: {e}"),
         }
@@ -1798,6 +1866,16 @@ impl PianoApp {
                         if window_button(ui, WinBtn::Minimize) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
+                        // Compact toggle: flips intent (and persists it) only —
+                        // `sync_compact_viewport`, called right after
+                        // `title_bar()` returns, owns the actual resize.
+                        if window_button(ui, WinBtn::Compact(self.compact_mode)) {
+                            self.compact_mode = !self.compact_mode;
+                            if self.prefs.remember_window_state {
+                                self.prefs.compact_mode = self.compact_mode;
+                                self.prefs.save();
+                            }
+                        }
                     },
                 );
 
@@ -1880,6 +1958,53 @@ impl PianoApp {
         }
     }
 
+    /// Reconcile the OS window against compact-mode intent, once per frame.
+    /// `compact_applied` tracks what's actually been sent to the window, so a
+    /// resize fires only on real transitions — and because the *wanted* state
+    /// folds in `show_prefs`, opening Preferences while compact transparently
+    /// restores normal size (its content is far taller than a compact window)
+    /// and closing it re-shrinks. If other dialogs ever prove too cramped,
+    /// extend `want_compact`'s condition the same way.
+    fn sync_compact_viewport(&mut self, ctx: &egui::Context) {
+        let want_compact = self.compact_mode && !self.show_prefs;
+        if want_compact == self.compact_applied {
+            return;
+        }
+        if want_compact {
+            self.apply_compact_size(ctx);
+        } else {
+            self.apply_normal_size(ctx);
+        }
+        self.compact_applied = want_compact;
+    }
+
+    /// Shrink to keyboard + title bar: snapshot the current size for restore,
+    /// keep the width, clamp the height.
+    fn apply_compact_size(&mut self, ctx: &egui::Context) {
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            self.normal_size = Some(rect.size());
+        }
+        let width = self.normal_size.map_or(DEFAULT_WINDOW_SIZE[0], |s| s.x);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(COMPACT_MIN_SIZE.into()));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            width,
+            COMPACT_WINDOW_H,
+        )));
+    }
+
+    /// Restore normal size after compact mode.
+    fn apply_normal_size(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(NORMAL_MIN_SIZE.into()));
+        // Keep whatever width the user resized to while compact (still-resizable
+        // per spec); only height needs restoring since compact clamps it down.
+        let live_w = ctx.input(|i| i.viewport().inner_rect).map(|r| r.width());
+        let height = self.normal_size.map_or(DEFAULT_WINDOW_SIZE[1], |s| s.y);
+        let width = live_w
+            .or(self.normal_size.map(|s| s.x))
+            .unwrap_or(DEFAULT_WINDOW_SIZE[0]);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
+    }
+
     /// The Edit menu. Currently just Preferences; shares the title bar's menu
     /// bar with File.
     fn edit_menu(&mut self, ui: &mut egui::Ui) {
@@ -1916,6 +2041,37 @@ impl PianoApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
+                // ---- Startup & window ----
+                ui.heading("Startup & window");
+                if ui
+                    .checkbox(&mut self.prefs.remember_window_state, "Remember window state")
+                    .on_hover_text("Restore compact/normal window mode from your last session")
+                    .changed()
+                {
+                    if self.prefs.remember_window_state {
+                        // Capture the current state immediately — otherwise it
+                        // only persists on the next toggle.
+                        self.prefs.compact_mode = self.compact_mode;
+                    }
+                    changed = true;
+                }
+                if ui
+                    .checkbox(&mut self.prefs.reopen_last_file, "Reopen last file on launch")
+                    .on_hover_text("Reload the most recently opened MIDI/JSONL file at startup")
+                    .changed()
+                {
+                    self.prefs.last_file_path = if self.prefs.reopen_last_file {
+                        // Capture the currently-open file immediately, if any.
+                        self.playback.as_ref().map(|pb| pb.source_path.clone())
+                    } else {
+                        None // don't keep a stale path once the feature is off
+                    };
+                    changed = true;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
                 // ---- Roll & history ----
                 ui.heading("Roll & history");
                 changed |= limit_row(
@@ -2469,110 +2625,127 @@ impl eframe::App for PianoApp {
         // ---- Custom title bar (File/Edit menus, window controls, edge resize).
         // MUST be the first panel shown so it's the topmost row. ----
         self.title_bar(ctx);
+        // Reconcile the OS window against the compact toggle immediately, so a
+        // click on the title-bar button lands the same frame.
+        self.sync_compact_viewport(ctx);
 
         // ---- Top: networking + audio config, collapsible to a title strip
         // via the chevron. The collapsed/expanded variants animate between
         // two *distinct* panel ids — sharing one would corrupt the height
         // lerp `show_animated_between` stores per id. ----
-        let collapsed_panel = egui::TopBottomPanel::top("config_collapsed")
-            .resizable(false)
-            .exact_height(24.0);
-        let expanded_panel = egui::TopBottomPanel::top("config").resizable(false);
-        egui::TopBottomPanel::show_animated_between(
-            ctx,
-            !self.config_collapsed,
-            collapsed_panel,
-            expanded_panel,
-            // Branch on `config_collapsed`, not `how_expanded`: contents are
-            // only drawn at the fully-collapsed and fully-expanded endpoints,
-            // which line up exactly with that flag.
-            |ui, _how_expanded| {
+        // Hidden entirely in compact mode (keyboard + title bar only).
+        if !self.compact_mode {
+            let collapsed_panel = egui::TopBottomPanel::top("config_collapsed")
+                .resizable(false)
+                .exact_height(24.0);
+            let expanded_panel = egui::TopBottomPanel::top("config").resizable(false);
+            egui::TopBottomPanel::show_animated_between(
+                ctx,
+                !self.config_collapsed,
+                collapsed_panel,
+                expanded_panel,
+                // Branch on `config_collapsed`, not `how_expanded`: contents are
+                // only drawn at the fully-collapsed and fully-expanded endpoints,
+                // which line up exactly with that flag.
+                |ui, _how_expanded| {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        // ⏶/⏷, not ⌃/⌄: the latter aren't in egui's default
+                        // fonts (they render as tofu boxes); these come from the
+                        // same block as the transport glyphs, which do render.
+                        let (chevron, hover) = if self.config_collapsed {
+                            ("⏷", "Show settings")
+                        } else {
+                            ("⏶", "Hide settings")
+                        };
+                        if ui.small_button(chevron).on_hover_text(hover).clicked() {
+                            self.config_collapsed = !self.config_collapsed;
+                        }
+                        ui.label(
+                            egui::RichText::new(concat!("open-piano v", env!("CARGO_PKG_VERSION")))
+                                .weak(),
+                        );
+                    });
+                    if !self.config_collapsed {
+                        ui.add_space(4.0);
+                        self.config_panel_body(ui);
+                    }
+                },
+            );
+        }
+
+        // ---- Bottom status bar (hidden in compact mode) ----
+        if !self.compact_mode {
+            egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    // ⏶/⏷, not ⌃/⌄: the latter aren't in egui's default
-                    // fonts (they render as tofu boxes); these come from the
-                    // same block as the transport glyphs, which do render.
-                    let (chevron, hover) = if self.config_collapsed {
-                        ("⏷", "Show settings")
-                    } else {
-                        ("⏶", "Hide settings")
-                    };
-                    if ui.small_button(chevron).on_hover_text(hover).clicked() {
-                        self.config_collapsed = !self.config_collapsed;
-                    }
-                    ui.label(
-                        egui::RichText::new(concat!("open-piano v", env!("CARGO_PKG_VERSION")))
-                            .weak(),
-                    );
-                });
-                if !self.config_collapsed {
-                    ui.add_space(4.0);
-                    self.config_panel_body(ui);
-                }
-            },
-        );
-
-        // ---- Bottom status bar ----
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let lc = self.local_color;
-                let rc = self.remote_color;
-                ui.colored_label(egui::Color32::from_rgb(lc[0], lc[1], lc[2]), "■");
-                ui.label(format!("{} (you)", self.local_name));
-                ui.colored_label(egui::Color32::from_rgb(rc[0], rc[1], rc[2]), "■");
-                ui.label(format!("{} (peer)", self.remote_name));
-                ui.separator();
-                let (device, model) = {
-                    let s = self.input.status.lock().unwrap();
-                    (s.device.clone(), s.model.clone())
-                };
-                ui.label(device);
-                ui.separator();
-                ui.label(model);
-                ui.separator();
-                ui.label(&self.net_status);
-                // While the history roll is scrolled back (or easing home), an
-                // instant way out: a deliberate click deserves an immediate
-                // snap, unlike the idle timer's gentle ease.
-                if self.scrollback.is_some() {
+                    let lc = self.local_color;
+                    let rc = self.remote_color;
+                    ui.colored_label(egui::Color32::from_rgb(lc[0], lc[1], lc[2]), "■");
+                    ui.label(format!("{} (you)", self.local_name));
+                    ui.colored_label(egui::Color32::from_rgb(rc[0], rc[1], rc[2]), "■");
+                    ui.label(format!("{} (peer)", self.remote_name));
                     ui.separator();
-                    if ui
-                        .small_button("⏵ Live")
-                        .on_hover_text("Jump back to the live edge")
-                        .clicked()
-                    {
-                        self.scrollback = None;
-                        self.scrollback_idle_since = None;
+                    let (device, model) = {
+                        let s = self.input.status.lock().unwrap();
+                        (s.device.clone(), s.model.clone())
+                    };
+                    ui.label(device);
+                    ui.separator();
+                    ui.label(model);
+                    ui.separator();
+                    ui.label(&self.net_status);
+                    // While the history roll is scrolled back (or easing home), an
+                    // instant way out: a deliberate click deserves an immediate
+                    // snap, unlike the idle timer's gentle ease.
+                    if self.scrollback.is_some() {
+                        ui.separator();
+                        if ui
+                            .small_button("⏵ Live")
+                            .on_hover_text("Jump back to the live edge")
+                            .clicked()
+                        {
+                            self.scrollback = None;
+                            self.scrollback_idle_since = None;
+                        }
                     }
-                }
-                // Version chip pinned to the right edge; opens the About window.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button(format!("v{VERSION}"))
-                        .on_hover_text("About open-piano")
-                        .clicked()
-                    {
-                        self.show_about = true;
-                    }
+                    // Version chip pinned to the right edge; opens the About window.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(format!("v{VERSION}"))
+                            .on_hover_text("About open-piano")
+                            .clicked()
+                        {
+                            self.show_about = true;
+                        }
+                    });
                 });
+                ui.add_space(2.0);
             });
-            ui.add_space(2.0);
-        });
+        }
 
         self.about_window(ctx);
         self.preferences_window(ctx);
         self.unsaved_dialog(ctx);
         self.refine_range_window(ctx);
         // Side panels reserve space in show order — must precede CentralPanel.
-        self.learn_panel(ctx);
+        // Hidden in compact mode (only the keyboard is drawn).
+        if !self.compact_mode {
+            self.learn_panel(ctx);
+        }
 
         // ---- Center: the 88-key keyboard (also playable with the mouse),
         // the piano-roll history strip on the paper below it, and — with a
         // score loaded — the falling-notes panel above it ----
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
-            let kb_h = (avail.y * KEYBOARD_FRACTION).max(MIN_KEYBOARD_H).min(avail.y);
+            // Compact mode: the keyboard IS the window — no falling panel or
+            // roll strip below, so it takes the full central-panel height.
+            let kb_h = if self.compact_mode {
+                avail.y
+            } else {
+                (avail.y * KEYBOARD_FRACTION).max(MIN_KEYBOARD_H).min(avail.y)
+            };
 
             // Falling-notes panel first (it sits on top, ending at the keys).
             // Its height animates open/closed on file open/close — the one
@@ -2588,7 +2761,11 @@ impl eframe::App for PianoApp {
             );
             let falling_full_h = ((avail.y - kb_h).max(0.0) * FALLING_FRACTION).floor();
             let falling_h = (falling_full_h * falling_factor).floor();
-            let falling_resp = if falling_h > 0.0 {
+            let falling_resp = if self.compact_mode {
+                // Compact: no falling panel (kb_h == avail.y makes its height 0
+                // anyway, but be explicit — the keyboard owns the whole panel).
+                None
+            } else if falling_h > 0.0 {
                 Some(ui.allocate_response(
                     egui::vec2(avail.x, falling_h),
                     egui::Sense::click_and_drag(),
@@ -2689,58 +2866,62 @@ impl eframe::App for PianoApp {
             }
 
             // ---- The roll strip: everything below the keyboard. Dragging it
-            // reviews history; releasing eases back to the live edge. ----
-            let roll_resp =
-                ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
-            // Dragging up (negative delta.y) pulls older paper into view: a
-            // mark sits at y ∝ (view_top − t), so moving marks up means
-            // lowering the view-top time. Wheel/trackpad scroll does the same.
-            let px_per_s = self.prefs.roll_px_per_s;
-            let scrollback_idle_s = self.prefs.scrollback_idle_s;
-            let roll_delta_px = scroll_or_drag_delta_y(ctx, &roll_resp);
-            if roll_delta_px != 0.0 {
-                let top = self.scrollback.unwrap_or(self.roll.now_s());
-                let new_top = (top + (roll_delta_px / px_per_s) as f64)
-                    .clamp(0.0, self.roll.now_s());
-                self.scrollback = Some(new_top);
-                self.scrollback_idle_since = None;
-            } else if let Some(top) = self.scrollback {
-                // No input: hold the view for the idle window, then ease home.
-                let idle = *self.scrollback_idle_since.get_or_insert_with(Instant::now);
-                if idle.elapsed().as_secs_f64() >= scrollback_idle_s {
-                    let dt = ctx.input(|i| i.stable_dt) as f64;
-                    self.scrollback = ease_toward(top, self.roll.now_s(), dt, px_per_s);
-                    if self.scrollback.is_none() {
-                        self.scrollback_idle_since = None;
+            // reviews history; releasing eases back to the live edge.
+            // (Hidden in compact mode — the keyboard already took the full
+            // height, so there's no space below it anyway.) ----
+            if !self.compact_mode {
+                let roll_resp =
+                    ui.allocate_response(ui.available_size(), egui::Sense::click_and_drag());
+                // Dragging up (negative delta.y) pulls older paper into view: a
+                // mark sits at y ∝ (view_top − t), so moving marks up means
+                // lowering the view-top time. Wheel/trackpad scroll does the same.
+                let px_per_s = self.prefs.roll_px_per_s;
+                let scrollback_idle_s = self.prefs.scrollback_idle_s;
+                let roll_delta_px = scroll_or_drag_delta_y(ctx, &roll_resp);
+                if roll_delta_px != 0.0 {
+                    let top = self.scrollback.unwrap_or(self.roll.now_s());
+                    let new_top = (top + (roll_delta_px / px_per_s) as f64)
+                        .clamp(0.0, self.roll.now_s());
+                    self.scrollback = Some(new_top);
+                    self.scrollback_idle_since = None;
+                } else if let Some(top) = self.scrollback {
+                    // No input: hold the view for the idle window, then ease home.
+                    let idle = *self.scrollback_idle_since.get_or_insert_with(Instant::now);
+                    if idle.elapsed().as_secs_f64() >= scrollback_idle_s {
+                        let dt = ctx.input(|i| i.stable_dt) as f64;
+                        self.scrollback = ease_toward(top, self.roll.now_s(), dt, px_per_s);
+                        if self.scrollback.is_none() {
+                            self.scrollback_idle_since = None;
+                        }
                     }
                 }
-            }
-            let view_top_s = self.scrollback.unwrap_or(self.roll.now_s());
+                let view_top_s = self.scrollback.unwrap_or(self.roll.now_s());
 
-            // Manual instance breaks on the history roll: Ctrl+click inserts
-            // one at the clicked time; right-click offers the same via menu.
-            let roll_t_of_y =
-                |y: f32| view_top_s - ((y - roll_resp.rect.top()) / px_per_s) as f64;
-            if roll_resp.clicked() && ui.input(|i| i.modifiers.command) {
-                if let Some(pos) = roll_resp.interact_pointer_pos() {
-                    self.roll.insert_separator(roll_t_of_y(pos.y));
-                }
-            }
-            if roll_resp.secondary_clicked() {
-                if let Some(pos) = roll_resp.interact_pointer_pos() {
-                    self.pending_break_t = Some(roll_t_of_y(pos.y));
-                }
-            }
-            roll_resp.context_menu(|ui| {
-                if ui.button("Insert segment break here").clicked() {
-                    if let Some(t) = self.pending_break_t.take() {
-                        self.roll.insert_separator(t);
+                // Manual instance breaks on the history roll: Ctrl+click inserts
+                // one at the clicked time; right-click offers the same via menu.
+                let roll_t_of_y =
+                    |y: f32| view_top_s - ((y - roll_resp.rect.top()) / px_per_s) as f64;
+                if roll_resp.clicked() && ui.input(|i| i.modifiers.command) {
+                    if let Some(pos) = roll_resp.interact_pointer_pos() {
+                        self.roll.insert_separator(roll_t_of_y(pos.y));
                     }
-                    ui.close_menu();
                 }
-            });
+                if roll_resp.secondary_clicked() {
+                    if let Some(pos) = roll_resp.interact_pointer_pos() {
+                        self.pending_break_t = Some(roll_t_of_y(pos.y));
+                    }
+                }
+                roll_resp.context_menu(|ui| {
+                    if ui.button("Insert segment break here").clicked() {
+                        if let Some(t) = self.pending_break_t.take() {
+                            self.roll.insert_separator(t);
+                        }
+                        ui.close_menu();
+                    }
+                });
 
-            draw_roll(ui.painter(), roll_resp.rect, &keys, &self.roll, view_top_s, px_per_s);
+                draw_roll(ui.painter(), roll_resp.rect, &keys, &self.roll, view_top_s, px_per_s);
+            }
         });
 
         // Keep redrawing for smooth real-time updates.
@@ -3000,6 +3181,9 @@ enum WinBtn {
     Minimize,
     Maximize(bool),
     Close,
+    /// Compact mode toggle (`true` = currently compact). An "alternate
+    /// minimize" — see `PianoApp::sync_compact_viewport`.
+    Compact(bool),
 }
 
 /// Draw one custom window-caption button and return whether it was clicked. The
@@ -3057,8 +3241,31 @@ fn window_button(ui: &mut egui::Ui, kind: WinBtn) -> bool {
             painter.line_segment([egui::pos2(c.x - e, c.y - e), egui::pos2(c.x + e, c.y + e)], stroke);
             painter.line_segment([egui::pos2(c.x - e, c.y + e), egui::pos2(c.x + e, c.y - e)], stroke);
         }
+        WinBtn::Compact(active) => {
+            // Keyboard-only silhouette: a wide low outline, with the bottom
+            // "keys" bar filled in while compact mode is active.
+            let outline = egui::Rect::from_center_size(c, egui::vec2(2.0 * e + 2.0, 2.0 * e - 2.0));
+            painter.rect_stroke(outline, 0.0, stroke);
+            if active {
+                let keys = egui::Rect::from_min_max(
+                    egui::pos2(outline.left(), outline.bottom() - 3.0),
+                    outline.max,
+                );
+                painter.rect_filled(keys.shrink(1.0), 0.0, fg);
+            }
+        }
     }
-    resp.clicked()
+    let clicked = resp.clicked();
+    // Unlike Minimize/Maximize/Close this isn't a self-explanatory OS
+    // convention, so it gets a tooltip.
+    if let WinBtn::Compact(active) = kind {
+        resp.on_hover_text(if active {
+            "Exit compact mode"
+        } else {
+            "Compact mode — piano only"
+        });
+    }
+    clicked
 }
 
 /// A Preferences row for a [`prefs::Limit`]: a seconds `DragValue` (greyed but
