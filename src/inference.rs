@@ -218,7 +218,9 @@ pub fn run(
                     on[m] = true;
                     absent[m] = 0;
                     present[m] = 0;
-                    let _ = note_tx.send(NoteMsg::On(m as u8));
+                    // The posteriorgram carries no force signal, so the mic
+                    // path reports the flat placeholder velocity by design.
+                    let _ = note_tx.send(NoteMsg::On(m as u8, crate::note::DEFAULT_VELOCITY));
                 }
             }
         }

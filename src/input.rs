@@ -56,6 +56,10 @@ pub enum Source {
 /// that thread to tear everything down.
 pub struct InputEngine {
     pub notes: Receiver<NoteMsg>,
+    /// Sustain-pedal (CC64) levels, 0..=127. Only the MIDI backend is ever
+    /// handed the sending half (see [`start`]), so the mic path is
+    /// *structurally* incapable of producing pedal events — no runtime gate.
+    pub pedal: Receiver<u8>,
     pub threshold: Threshold,
     /// Live-editable ONNX/DSP tunables shared with the inference thread
     /// (Preferences ▸ Advanced writes them; the detector reads them each hop).
@@ -115,6 +119,7 @@ pub fn start(
 ) -> InputEngine {
     let threshold = Threshold::new(initial_threshold);
     let (note_tx, note_rx) = mpsc::channel::<NoteMsg>();
+    let (pedal_tx, pedal_rx) = mpsc::channel::<u8>();
     let status = Arc::new(Mutex::new(EngineStatus {
         device: "Input: detecting…".to_string(),
         model: String::new(),
@@ -138,8 +143,8 @@ pub fn start(
             .name("input-supervisor".into())
             .spawn(move || {
                 supervise(
-                    note_tx, threshold, tunables, status, source, epoch, stop_all, midi_poll_ms,
-                    recorder,
+                    note_tx, pedal_tx, threshold, tunables, status, source, epoch, stop_all,
+                    midi_poll_ms, recorder,
                 )
             })
             .expect("failed to spawn input supervisor thread")
@@ -147,6 +152,7 @@ pub fn start(
 
     InputEngine {
         notes: note_rx,
+        pedal: pedal_rx,
         threshold,
         tunables,
         midi_poll_ms,
@@ -175,6 +181,7 @@ enum Active {
 #[allow(clippy::too_many_arguments)]
 fn supervise(
     note_tx: Sender<NoteMsg>,
+    pedal_tx: Sender<u8>,
     threshold: Threshold,
     tunables: InferenceTunables,
     status: Arc<Mutex<EngineStatus>>,
@@ -216,7 +223,15 @@ fn supervise(
                 }
                 epoch.fetch_add(1, Ordering::Relaxed);
 
-                active = match midi::connect_to(note_tx.clone(), &status, want, recorder.clone()) {
+                // Only MIDI gets the pedal sender: the mic backend below is
+                // never wired to it (the pedal feature's structural guarantee).
+                active = match midi::connect_to(
+                    note_tx.clone(),
+                    &status,
+                    want,
+                    recorder.clone(),
+                    pedal_tx.clone(),
+                ) {
                     Ok(conn) => {
                         source.store(SRC_MIDI, Ordering::Relaxed);
                         Active::Midi {

@@ -425,7 +425,7 @@ mod tests {
             }
             panic!("never received {what}");
         };
-        exchange(&joiner, &host, Packet::Note(NoteMsg::On(60)), "note at host");
+        exchange(&joiner, &host, Packet::Note(NoteMsg::On(60, 100)), "note at host");
         exchange(&host, &joiner, Packet::Color([1, 2, 3]), "color at joiner");
 
         // Metronome beat markers surface as a distinct `NetEvent::MetroBeat`

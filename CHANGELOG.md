@@ -4,6 +4,38 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-07
+
+### Added
+
+- **Evaluation mode.** A third playback mode alongside Listen/Learn: one score
+  track goes silent while you play it live and the take is scored against the
+  original (timing, and — MIDI input only — velocity and sustain-pedal use),
+  with Strict/Normal/Lenient presets or custom tolerances. The playhead never
+  gates in this mode; the run always completes and can't freeze. On take
+  completion the engine flips into **Evaluation review**: a passive replay of
+  a synthetic two-track score (original vs. what you actually played) with
+  independent show/hear toggles per side, plus an "Evaluation results" window
+  (score, streaks, best/worst pitches). (`src/playback.rs`, `src/main.rs`)
+- **MIDI note velocity.** Real note-on velocity now flows end to end — MIDI
+  input → `NoteMsg` → the wire protocol → the history roll — and tints each
+  roll mark's saturation by how hard the key was struck. Older peers /
+  velocity-less sources (mouse clicks, the mic path) fall back to a flat
+  default rather than being rejected. (`src/note.rs`, `src/midi.rs`,
+  `src/roll.rs`)
+- **Sustain-pedal lane.** CC64 pedal activity is captured, drawn as a slim
+  tinted strip at the roll's left edge (including half-pedaling as adjacent
+  spans of differing depth), synced to the peer, and written into saved
+  MIDI/jsonl sessions. Structurally MIDI-only end to end — the mic backend is
+  never wired to the pedal channel, so the toggle and lane simply aren't
+  present on that path. (`src/midi.rs`, `src/input.rs`, `src/roll.rs`,
+  `src/note.rs`)
+
+### Changed
+
+- Loaded scores now also carry per-note velocity and per-track pedal streams
+  (from SMF CC64 / jsonl), used only by Evaluation's scorer. (`src/score.rs`)
+
 ## [0.4.1] - 2026-07-05
 
 ### Added

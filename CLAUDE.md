@@ -163,6 +163,27 @@ the Windows SmartScreen/Smart App Control situation are documented in the README
   runs on GitHub's runners and is unaffected. Do **not** `cargo clean` on a SAC
   machine unless you can rebuild elsewhere.
 
+## Pending manual verification (v0.5.0)
+
+v0.5.0 (velocity-graded roll marks, the sustain-pedal lane, and Evaluation
+mode + review) was committed and tagged **without hardware-in-the-loop
+testing** — `cargo test`/`cargo build` pass, but nobody has yet played it on
+a real MIDI keyboard or mic, or checked a live peer session. Before trusting
+this release, run through:
+
+- Resize the app below ~700px tall, open Preferences — title bar should stay
+  visible, body scrolls.
+- With a MIDI keyboard: check velocity-graded mark saturation, enable and
+  exercise the pedal lane (including half-pedaling), then unplug/switch to
+  mic and confirm the toggle and lane disappear. Check both over a live peer
+  session if possible.
+- Load a score, pick Evaluation, play through with some deliberate mistakes —
+  the roll should never freeze, the results window should pop at the end, and
+  the review toggles should switch between original/played/both for both eyes
+  and ears.
+
+Delete this section once it's been run through.
+
 ## Next steps (see README Roadmap for context)
 
 1. **Code signing** in the release workflow for SmartScreen/SAC.

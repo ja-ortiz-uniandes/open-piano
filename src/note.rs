@@ -6,38 +6,49 @@ pub const MIDI_LOW: u8 = 21; // A0
 pub const MIDI_HIGH: u8 = 108; // C8
 pub const KEY_COUNT: usize = (MIDI_HIGH - MIDI_LOW + 1) as usize; // 88
 
+/// The velocity used for note-ons that have no real velocity behind them —
+/// mouse clicks on the on-screen keyboard and the mic/ONNX path (a
+/// posteriorgram has no force signal). Chosen mezzo-forte-ish so the flat
+/// placeholder doesn't render as either a ghost note or a hammered one.
+pub const DEFAULT_VELOCITY: u8 = 100;
+
 /// A note-on / note-off transition. This is the unit of communication on every
-/// channel in the app: audio-thread -> UI, net-thread -> UI, and the
-/// 2-byte wire format sent to the peer (as an unreliable QUIC datagram).
+/// channel in the app: audio-thread -> UI, net-thread -> UI, and the wire
+/// format sent to the peer (as an unreliable QUIC datagram) — 3 bytes for an
+/// On (`[0x90, note, velocity]`), 2 for an Off (`[0x80, note]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoteMsg {
-    On(u8),
+    /// Note on: `(midi, velocity 1..=127)`. Callers with no real velocity
+    /// (mouse clicks, the mic path) use [`DEFAULT_VELOCITY`].
+    On(u8, u8),
     Off(u8),
 }
 
 impl NoteMsg {
     pub fn midi(&self) -> u8 {
         match self {
-            NoteMsg::On(n) | NoteMsg::Off(n) => *n,
+            NoteMsg::On(n, _) | NoteMsg::Off(n) => *n,
         }
     }
 
-    /// Encode to the 2-byte wire format: `[status, note]`, using MIDI-style
+    /// Encode to the wire format (see the type docs), using MIDI-style
     /// status bytes (0x90 = note on, 0x80 = note off).
-    pub fn encode(&self) -> [u8; 2] {
+    pub fn encode(&self) -> Vec<u8> {
         match self {
-            NoteMsg::On(n) => [0x90, *n],
-            NoteMsg::Off(n) => [0x80, *n],
+            NoteMsg::On(n, v) => vec![0x90, *n, *v],
+            NoteMsg::Off(n) => vec![0x80, *n],
         }
     }
 
-    /// Decode a received datagram. Returns `None` for malformed / unknown data.
+    /// Decode a received datagram. Returns `None` for malformed / unknown
+    /// data. A velocity-less 2-byte On (an older peer) decodes with
+    /// [`DEFAULT_VELOCITY`] rather than being dropped.
     pub fn decode(buf: &[u8]) -> Option<NoteMsg> {
         if buf.len() < 2 {
             return None;
         }
         match buf[0] {
-            0x90 => Some(NoteMsg::On(buf[1])),
+            0x90 => Some(NoteMsg::On(buf[1], buf.get(2).copied().unwrap_or(DEFAULT_VELOCITY))),
             0x80 => Some(NoteMsg::Off(buf[1])),
             _ => None,
         }
@@ -80,16 +91,24 @@ pub enum Packet {
     /// every edit and re-sent on the color heartbeat so a dropped datagram
     /// doesn't leave the two sides mismatched. Status `0xB2`.
     MetroBeatTable { freqs: Vec<f32>, volumes: Vec<f32> },
+    /// The sender's sustain-pedal (CC64) level, 0..=127. Deliberately its own
+    /// `Packet` variant, never folded into [`NoteMsg`]: pedal events must be
+    /// structurally unable to reach `Roll::note()` — and with it the roll's
+    /// idle-timer reset (see `roll::Roll::pedal`). Sent on change only (no
+    /// heartbeat: CC64 fires frequently while half-pedaling, so a dropped
+    /// datagram self-heals on the next change). Status `0xB3`.
+    Pedal { level: u8 },
 }
 
 impl Packet {
-    /// Encode to the wire format. Notes are the existing 2-byte form (`0x90`/
-    /// `0x80`); a color is `[0xC0, r, g, b]`; metronome markers/control use
-    /// `0xB0`/`0xB1`. None of these status bytes collide, so `decode` is
-    /// unambiguous. (`bpm` is big-endian u16.)
+    /// Encode to the wire format. Notes are the 2/3-byte `NoteMsg` form
+    /// (`0x90`/`0x80`); a color is `[0xC0, r, g, b]`; metronome markers/
+    /// control use `0xB0`/`0xB1`; pedal is `[0xB3, level]`. None of these
+    /// status bytes collide, so `decode` is unambiguous. (`bpm` is big-endian
+    /// u16.)
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Packet::Note(n) => n.encode().to_vec(),
+            Packet::Note(n) => n.encode(),
             Packet::Color([r, g, b]) => vec![0xC0, *r, *g, *b],
             Packet::Name(name) => {
                 // `[0xC1, len, ..utf8..]`. Length-prefixed with a single byte so
@@ -133,6 +152,7 @@ impl Packet {
                 }
                 buf
             }
+            Packet::Pedal { level } => vec![0xB3, *level],
         }
     }
 
@@ -172,6 +192,7 @@ impl Packet {
                 let volumes = (0..len).map(|i| read_f32(len + i)).collect();
                 Some(Packet::MetroBeatTable { freqs, volumes })
             }
+            0xB3 if buf.len() >= 2 => Some(Packet::Pedal { level: buf[1] }),
             _ => None,
         }
     }
@@ -184,8 +205,11 @@ mod tests {
     #[test]
     fn packet_encode_decode_roundtrips() {
         for p in [
-            Packet::Note(NoteMsg::On(60)),
+            Packet::Note(NoteMsg::On(60, 100)),
+            Packet::Note(NoteMsg::On(108, 1)),
             Packet::Note(NoteMsg::Off(21)),
+            Packet::Pedal { level: 0 },
+            Packet::Pedal { level: 127 },
             Packet::Color([220, 60, 60]),
             Packet::Name(String::new()),
             Packet::Name("Ada".to_string()),
@@ -211,7 +235,18 @@ mod tests {
         assert_eq!(Packet::decode(&[0xB1, 1]), None); // too short for MetroCtl
         assert_eq!(Packet::decode(&[0xB2, 2, 0, 0, 0, 0]), None); // too short for MetroBeatTable
         assert_eq!(Packet::decode(&[0xC1, 5, b'h', b'i']), None); // name len exceeds payload
+        assert_eq!(Packet::decode(&[0xB3]), None); // too short for Pedal
         assert_eq!(Packet::decode(&[0x7F, 0, 0]), None); // unknown status
+    }
+
+    #[test]
+    fn velocity_less_note_on_decodes_with_the_default() {
+        // An older peer's 2-byte On: degrade to the flat placeholder velocity
+        // instead of dropping the note.
+        assert_eq!(
+            Packet::decode(&[0x90, 60]),
+            Some(Packet::Note(NoteMsg::On(60, DEFAULT_VELOCITY)))
+        );
     }
 
     #[test]

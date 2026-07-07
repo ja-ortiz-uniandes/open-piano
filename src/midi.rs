@@ -33,7 +33,10 @@ pub fn port_names() -> Vec<String> {
 }
 
 /// Connect to the MIDI input port whose name is `want_name` and start
-/// forwarding note events into `note_tx`.
+/// forwarding note events into `note_tx` and sustain-pedal (CC64) levels into
+/// `pedal_tx`. Only this backend ever gets a `pedal_tx` — the mic path has no
+/// pedal signal, which is what makes the pedal feature structurally MIDI-only
+/// (see `input::start`).
 ///
 /// On success returns the live connection — the caller **must keep it alive**
 /// (dropping it closes the port, exactly like dropping a cpal stream). Fails if
@@ -44,6 +47,7 @@ pub fn connect_to(
     status: &Arc<Mutex<EngineStatus>>,
     want_name: &str,
     recorder: Recorder,
+    pedal_tx: Sender<u8>,
 ) -> Result<MidiInputConnection<()>, Box<dyn std::error::Error>> {
     let mut midi_in = MidiInput::new("open-piano")?;
     // Ignore sysex/timing/active-sensing chatter. Note on/off *and* control
@@ -71,6 +75,9 @@ pub fn connect_to(
                 if let Some(msg) = parse_midi(message) {
                     // UI gone -> ignore; nothing else to do from the MIDI callback.
                     let _ = note_tx.send(msg);
+                }
+                if let Some(level) = parse_pedal(message) {
+                    let _ = pedal_tx.send(level);
                 }
             },
             (),
@@ -100,9 +107,22 @@ fn parse_midi(message: &[u8]) -> Option<NoteMsg> {
     let note = message[1];
     let velocity = message[2];
     match status {
-        0x90 if velocity > 0 => Some(NoteMsg::On(note)),
+        0x90 if velocity > 0 => Some(NoteMsg::On(note, velocity)),
         0x90 => Some(NoteMsg::Off(note)), // note-on, velocity 0 == note-off
         0x80 => Some(NoteMsg::Off(note)),
         _ => None,
     }
+}
+
+/// The sustain-pedal (CC64) level from a raw MIDI message, if that's what the
+/// message is. Deliberately a sibling of [`parse_midi`] that can never produce
+/// a [`NoteMsg`]: pedal events travel their own channel end to end so they are
+/// structurally unable to reach the roll's note path (and its idle-timer
+/// reset — see `roll::Roll::pedal`).
+fn parse_pedal(message: &[u8]) -> Option<u8> {
+    if message.len() < 3 {
+        return None;
+    }
+    // 0xB0 = control change (any channel); controller 64 = sustain pedal.
+    (message[0] & 0xF0 == 0xB0 && message[1] == 64).then(|| message[2])
 }

@@ -14,24 +14,56 @@ use std::path::Path;
 use crate::note::{MIDI_HIGH, MIDI_LOW};
 use crate::roll::seconds;
 
+/// The velocity assumed for score notes from files that don't carry one
+/// (older exports, hand-made jsonl) — the constant this app's own exports
+/// historically wrote.
+const FILE_DEFAULT_VELOCITY: u8 = 64;
+
 /// One note of a loaded score. Times are seconds from the start of the file.
+#[derive(Clone)]
 pub struct Note {
     pub start_s: f64,
     pub end_s: f64,
     pub midi: u8,
+    /// Note-on velocity (1..=127), the evaluation scorer's force target.
+    /// [`FILE_DEFAULT_VELOCITY`] when the file carries none.
+    pub velocity: u8,
 }
 
 /// One player's part: notes sorted by `start_s`, plus that player's display
 /// color (from the color sidecar / jsonl header, or the app defaults).
+#[derive(Clone)]
 pub struct Track {
     pub notes: Vec<Note>,
     pub color: [u8; 3],
+    /// Sustain-pedal (CC64) stream as `(time, level)` pairs, sorted by time —
+    /// from SMF CC64 events / jsonl `"pedal"` events. Empty when the file
+    /// carries no pedal data, which disables pedal evaluation for the track.
+    pub pedal_events: Vec<(f64, u8)>,
+}
+
+impl Track {
+    /// Whether the sustain pedal is down (CC64 >= 64) at `t` per this track's
+    /// pedal stream — `None` when the track carries no pedal data at all.
+    pub fn pedal_down_at(&self, t: f64) -> Option<bool> {
+        if self.pedal_events.is_empty() {
+            return None;
+        }
+        let level = self
+            .pedal_events
+            .iter()
+            .take_while(|(at, _)| *at <= t)
+            .last()
+            .map_or(0, |(_, level)| *level);
+        Some(level >= 64)
+    }
 }
 
 /// A contiguous, named span of the score — the playback-side counterpart of
 /// roll.rs's "instances", derived from the file's markers plus any manual
 /// breaks from the `.segments.json` sidecar. Always covers the whole score
 /// end to end with no gaps.
+#[derive(Clone)]
 pub struct ScoreSegment {
     pub name: String,
     pub start_s: f64,
@@ -206,12 +238,13 @@ impl Score {
 
         let mut markers: Vec<(f64, String)> = Vec::new();
         let mut first_marker_name: Option<String> = None;
-        let mut tracks: Vec<Vec<Note>> = Vec::new();
+        let mut tracks: Vec<(Vec<Note>, Vec<(f64, u8)>)> = Vec::new();
         let mut duration_s: f64 = 0.0;
 
         for track in &smf.tracks {
             let mut abs_ticks = 0u32;
             let mut notes: Vec<Note> = Vec::new();
+            let mut pedal: Vec<(f64, u8)> = Vec::new();
             // Open-note index per MIDI number, same idea as roll::Roll::note.
             let mut open: [Option<usize>; 128] = [None; 128];
             for ev in track {
@@ -228,7 +261,12 @@ impl Score {
                             }
                             if open[midi as usize].is_none() {
                                 open[midi as usize] = Some(notes.len());
-                                notes.push(Note { start_s: t, end_s: t, midi });
+                                notes.push(Note {
+                                    start_s: t,
+                                    end_s: t,
+                                    midi,
+                                    velocity: vel.as_int(),
+                                });
                             }
                         }
                         // NoteOn with velocity 0 is a NoteOff by convention.
@@ -237,6 +275,13 @@ impl Score {
                             if let Some(i) = open[key.as_int() as usize].take() {
                                 notes[i].end_s = t;
                             }
+                        }
+                        // Sustain pedal (CC64): the evaluation scorer's
+                        // pedal-intent stream. Other controllers are ignored.
+                        midly::MidiMessage::Controller { controller, value }
+                            if controller.as_int() == 64 =>
+                        {
+                            pedal.push((t, value.as_int()));
                         }
                         _ => {}
                     },
@@ -257,8 +302,10 @@ impl Score {
             for slot in open.into_iter().flatten() {
                 notes[slot].end_s = notes[slot].end_s.max(track_end);
             }
+            // A track with pedal data but no notes is dropped along with any
+            // other noteless track — pedal only means anything under notes.
             if !notes.is_empty() {
-                tracks.push(notes);
+                tracks.push((notes, pedal));
             }
         }
         markers.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -273,8 +320,8 @@ impl Score {
         let [local_color, remote_color] = load_color_sidecar(path);
         Ok(Score {
             tracks: [
-                Track { notes: local, color: local_color },
-                Track { notes: remote, color: remote_color },
+                Track { notes: local.0, color: local_color, pedal_events: local.1 },
+                Track { notes: remote.0, color: remote_color, pedal_events: remote.1 },
             ],
             duration_s,
             markers,
@@ -310,6 +357,7 @@ impl Score {
         let first_marker_name = header["first_instance_name"].as_str().map(String::from);
 
         let mut tracks: [Vec<Note>; 2] = [Vec::new(), Vec::new()];
+        let mut pedal: [Vec<(f64, u8)>; 2] = [Vec::new(), Vec::new()];
         let mut open: [[Option<usize>; 128]; 2] = [[None; 128]; 2];
         let mut markers: Vec<(f64, String)> = Vec::new();
         let mut duration_s: f64 = 0.0;
@@ -341,11 +389,23 @@ impl Score {
                     if kind == "on" {
                         if open[w][midi as usize].is_none() {
                             open[w][midi as usize] = Some(tracks[w].len());
-                            tracks[w].push(Note { start_s: t, end_s: t, midi });
+                            let velocity = ev["v"]
+                                .as_u64()
+                                .map_or(FILE_DEFAULT_VELOCITY, |v| (v as u8).clamp(1, 127));
+                            tracks[w].push(Note { start_s: t, end_s: t, midi, velocity });
                         }
                     } else if let Some(i) = open[w][midi as usize].take() {
                         tracks[w][i].end_s = t;
                     }
+                }
+                // Sustain-pedal (CC64) level events, as written by
+                // roll::save_jsonl since pedal capture landed.
+                Some("pedal") => {
+                    let (Some(v), Some(who)) = (ev["v"].as_u64(), ev["who"].as_str()) else {
+                        continue;
+                    };
+                    let w = if who == "r" { 1 } else { 0 };
+                    pedal[w].push((t, (v as u8).min(127)));
                 }
                 _ => {}
             }
@@ -357,10 +417,11 @@ impl Score {
         }
 
         let [local, remote] = tracks;
+        let [local_pedal, remote_pedal] = pedal;
         Ok(Score {
             tracks: [
-                Track { notes: local, color: local_color },
-                Track { notes: remote, color: remote_color },
+                Track { notes: local, color: local_color, pedal_events: local_pedal },
+                Track { notes: remote, color: remote_color, pedal_events: remote_pedal },
             ],
             duration_s,
             markers,
@@ -409,15 +470,17 @@ mod tests {
         let base = Instant::now();
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [220, 60, 60]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [220, 60, 60]);
+        roll.pedal(Who::Local, 90);
         roll.rename_current_instance("warmup".into());
         roll.tick(t(base, 0.5));
         roll.note(Who::Local, NoteMsg::Off(60), [220, 60, 60]);
-        roll.note(Who::Remote, NoteMsg::On(64), [60, 110, 230]);
+        roll.pedal(Who::Local, 0);
+        roll.note(Who::Remote, NoteMsg::On(64, 100), [60, 110, 230]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Remote, NoteMsg::Off(64), [60, 110, 230]);
         roll.tick(t(base, 60.0)); // idle -> pause
-        roll.note(Who::Local, NoteMsg::On(62), [220, 60, 60]); // resume, separator
+        roll.note(Who::Local, NoteMsg::On(62, 100), [220, 60, 60]); // resume, separator
         roll.rename_current_instance("piece".into());
         roll.tick(t(base, 61.0));
         roll.note(Who::Local, NoteMsg::Off(62), [220, 60, 60]);
@@ -439,6 +502,15 @@ mod tests {
         let n0 = &score.tracks[0].notes[0];
         assert_eq!(n0.midi, 60);
         assert!((n0.start_s - 0.0).abs() < 2e-3 && (n0.end_s - 0.5).abs() < 2e-3);
+        assert_eq!(n0.velocity, 100); // real velocity survives the round trip
+        // The pedal press round-trips as a CC64 pair: 90 at 0.0, 0 at 0.5.
+        let pe = &score.tracks[0].pedal_events;
+        assert_eq!(pe.len(), 2);
+        assert_eq!((pe[0].1, pe[1].1), (90, 0));
+        assert!((pe[0].0 - 0.0).abs() < 2e-3 && (pe[1].0 - 0.5).abs() < 2e-3);
+        assert_eq!(score.tracks[0].pedal_down_at(0.2), Some(true));
+        assert_eq!(score.tracks[0].pedal_down_at(0.7), Some(false));
+        assert_eq!(score.tracks[1].pedal_down_at(0.2), None); // no data at all
         // Both instance names survived: tick-0 marker + the separator marker.
         assert_eq!(score.segments.len(), 2);
         assert_eq!(score.segments[0].name, "warmup");
@@ -458,6 +530,8 @@ mod tests {
 
         let mut score = Score::load(&path).unwrap();
         assert_eq!(score.tracks[0].color, [7, 8, 9]);
+        assert_eq!(score.tracks[0].notes[0].velocity, 100);
+        assert_eq!(score.tracks[0].pedal_events, vec![(0.0, 90), (0.5, 0)]);
         assert_eq!(score.segments.len(), 2);
         assert_eq!(score.segments[0].name, "warmup");
         assert_eq!(score.segments[1].name, "piece");
@@ -485,8 +559,12 @@ mod tests {
     fn segment_breaks_are_idempotent_and_bounded() {
         let mut score = Score {
             tracks: [
-                Track { notes: vec![Note { start_s: 0.0, end_s: 10.0, midi: 60 }], color: [0; 3] },
-                Track { notes: Vec::new(), color: [0; 3] },
+                Track {
+                    notes: vec![Note { start_s: 0.0, end_s: 10.0, midi: 60, velocity: 64 }],
+                    color: [0; 3],
+                    pedal_events: Vec::new(),
+                },
+                Track { notes: Vec::new(), color: [0; 3], pedal_events: Vec::new() },
             ],
             duration_s: 10.0,
             markers: Vec::new(),

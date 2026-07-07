@@ -77,6 +77,25 @@ pub struct Segment {
     /// repaint history. (A save persists only the *current* two player colors;
     /// mid-session color changes are a live-view nicety, not saved fidelity.)
     pub color: [u8; 3],
+    /// Note-on velocity (1..=127). Real dynamics on the MIDI path; the flat
+    /// [`crate::note::DEFAULT_VELOCITY`] placeholder everywhere else. Drives
+    /// the roll's velocity→saturation tint and is written into saves.
+    pub velocity: u8,
+}
+
+/// One sustain-pedal press on the roll, deliberately kept apart from the note
+/// [`Segment`]s and never routed through [`Roll::note`]: pedal activity is
+/// recorded, drawn, and saved, but must be structurally unable to reset the
+/// idle timer that auto-pauses the clock (see [`Roll::pedal`]).
+pub struct PedalSegment {
+    pub who: Who,
+    pub start_s: f64,
+    /// `None` while the pedal is still down (the renderer extends the mark to
+    /// the live edge; a save synthesizes the release, like open notes).
+    pub end_s: Option<f64>,
+    /// CC64 level over this span (1..=127). A depth change while down closes
+    /// the span and opens a new one, so half-pedaling is preserved.
+    pub level: u8,
 }
 
 /// The roll: an append-only list of note segments on a pausable clock.
@@ -90,7 +109,14 @@ pub struct Roll {
     /// Index into `segments` of the still-open segment per (player, key).
     open: [[Option<usize>; KEY_COUNT]; 2],
     /// How many segments are currently open (held keys, both players).
+    /// Deliberately notes-only: a held *pedal* must not keep the clock alive.
     open_count: usize,
+    /// Sustain-pedal history, parallel to `segments` (see [`PedalSegment`]).
+    pub pedal_segments: Vec<PedalSegment>,
+    /// Index into `pedal_segments` of the still-open span per player.
+    open_pedal: [Option<usize>; 2],
+    /// Last seen CC64 level per player, for no-op dedupe on repeated values.
+    pedal_level: [u8; 2],
     /// Boundaries where the clock resumed after a pause (or a break was
     /// inserted by hand) — drawn as full-width lines separating "instances"
     /// of play, kept sorted by time. These delimit instance 2, 3, ...
@@ -127,6 +153,9 @@ impl Roll {
             segments: Vec::new(),
             open: [[None; KEY_COUNT]; 2],
             open_count: 0,
+            pedal_segments: Vec::new(),
+            open_pedal: [None; 2],
+            pedal_level: [0; 2],
             separators: Vec::new(),
             first_instance_name: None,
             roll_now_s: 0.0,
@@ -190,7 +219,7 @@ impl Roll {
             return;
         };
         match msg {
-            NoteMsg::On(midi) => {
+            NoteMsg::On(midi, velocity) => {
                 // Idempotent, like main.rs's `apply()`: the mic path's
                 // hysteresis (or a reconnect race) can emit On twice.
                 if self.open[who.idx()][key].is_some() {
@@ -212,6 +241,7 @@ impl Roll {
                     start_s: self.roll_now_s,
                     end_s: None,
                     color,
+                    velocity,
                 });
             }
             NoteMsg::Off(_) => {
@@ -241,6 +271,48 @@ impl Roll {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Record a sustain-pedal (CC64) level for `who`. Opens a span on
+    /// 0 → non-zero, closes it on → 0, and closes + reopens on a depth change
+    /// so half-pedaling is preserved as adjacent spans; repeated identical
+    /// levels are no-ops.
+    ///
+    /// Deliberately does NOT touch `last_event`/`last_event_roll_s` (unlike
+    /// [`Roll::note`]), and pedal spans don't count into `open_count`: holding
+    /// or pumping the pedal alone must never keep the idle clock alive or
+    /// delay the auto-pause. This is load-bearing — see the test
+    /// `pedal_never_resets_the_idle_timer`.
+    pub fn pedal(&mut self, who: Who, level: u8) {
+        if level == self.pedal_level[who.idx()] {
+            return;
+        }
+        self.pedal_level[who.idx()] = level;
+        if let Some(i) = self.open_pedal[who.idx()].take() {
+            self.pedal_segments[i].end_s = Some(self.roll_now_s);
+        }
+        if level > 0 {
+            self.open_pedal[who.idx()] = Some(self.pedal_segments.len());
+            self.pedal_segments.push(PedalSegment {
+                who,
+                start_s: self.roll_now_s,
+                end_s: None,
+                level,
+            });
+        }
+        self.dirty = true;
+    }
+
+    /// Force-close any open pedal span for `who` — the pedal analogue of
+    /// [`Roll::release_all`], for the same call sites (input-backend epoch
+    /// switch, peer connect/disconnect), where the matching pedal-up will
+    /// never arrive. Also never touches the idle timer.
+    pub fn release_pedal(&mut self, who: Who) {
+        if let Some(i) = self.open_pedal[who.idx()].take() {
+            self.pedal_segments[i].end_s = Some(self.roll_now_s);
+            self.dirty = true;
+        }
+        self.pedal_level[who.idx()] = 0;
     }
 
     /// The current roll time — the live (top) edge of the paper.
@@ -407,25 +479,40 @@ pub fn save_midi(
         (Who::Local, &b"open-piano: local player"[..]),
         (Who::Remote, &b"open-piano: remote player"[..]),
     ] {
-        // Absolute-tick events: (tick, is_on, key). Sorted with offs before
-        // ons at equal times so a retriggered note never nests.
-        let mut events: Vec<(u32, bool, u8)> = Vec::new();
+        // Absolute-tick events: (tick, order, data, value) with order 0 = note
+        // off, 1 = pedal CC64, 2 = note on. Sorted (stably) with offs before
+        // ons at equal times so a retriggered note never nests; pedal sits
+        // between so a re-pedal at a chord boundary releases before the ons.
+        let mut events: Vec<(u32, u8, u8, u8)> = Vec::new();
         for seg in roll.segments.iter().filter(|s| s.who == who) {
-            events.push((ticks(seg.start_s), true, seg.midi));
-            events.push((ticks(seg.end_s.unwrap_or(roll.now_s())), false, seg.midi));
+            events.push((ticks(seg.start_s), 2, seg.midi, seg.velocity.max(1)));
+            events.push((ticks(seg.end_s.unwrap_or(roll.now_s())), 0, seg.midi, 0));
         }
-        events.sort_by_key(|&(t, is_on, key)| (t, is_on, key));
+        // Pedal spans as CC64 level/0 pairs. A depth change is stored as
+        // adjacent spans meeting at one instant; skip the release there so the
+        // written CC stream is a clean level→level transition, not a blip to 0.
+        let pedal: Vec<&PedalSegment> =
+            roll.pedal_segments.iter().filter(|p| p.who == who).collect();
+        for (i, ps) in pedal.iter().enumerate() {
+            events.push((ticks(ps.start_s), 1, 64, ps.level));
+            let end = ps.end_s.unwrap_or(roll.now_s());
+            let continues = pedal.get(i + 1).is_some_and(|n| ticks(n.start_s) == ticks(end));
+            if !continues {
+                events.push((ticks(end), 1, 64, 0));
+            }
+        }
+        events.sort_by_key(|&(t, order, data, _)| (t, order, data));
 
         let mut track: Vec<TrackEvent> = vec![TrackEvent {
             delta: u28::from(0),
             kind: TrackEventKind::Meta(MetaMessage::TrackName(name)),
         }];
         let mut prev = 0u32;
-        for (at, is_on, key) in events {
-            let message = if is_on {
-                MidiMessage::NoteOn { key: u7::from(key), vel: u7::from(64) }
-            } else {
-                MidiMessage::NoteOff { key: u7::from(key), vel: u7::from(0) }
+        for (at, order, data, value) in events {
+            let message = match order {
+                2 => MidiMessage::NoteOn { key: u7::from(data), vel: u7::from(value) },
+                0 => MidiMessage::NoteOff { key: u7::from(data), vel: u7::from(0) },
+                _ => MidiMessage::Controller { controller: u7::from(64), value: u7::from(value) },
             };
             track.push(TrackEvent {
                 delta: u28::from(at - prev),
@@ -475,8 +562,8 @@ pub fn save_jsonl(
         "first_instance_name": roll.first_instance_name,
     })];
 
-    // (time, order-within-time, json): offs (0) before separators (1) before
-    // ons (2) at equal timestamps, so instances read cleanly.
+    // (time, order-within-time, json): offs (0) before separators/pedal (1)
+    // before ons (2) at equal timestamps, so instances read cleanly.
     let mut events: Vec<(f64, u8, serde_json::Value)> = Vec::new();
     for seg in &roll.segments {
         let who = match seg.who {
@@ -486,7 +573,8 @@ pub fn save_jsonl(
         events.push((
             seg.start_s,
             2,
-            serde_json::json!({"t": ms(seg.start_s), "e": "on", "n": seg.midi, "who": who}),
+            serde_json::json!({"t": ms(seg.start_s), "e": "on", "n": seg.midi, "who": who,
+                               "v": seg.velocity}),
         ));
         let end = seg.end_s.unwrap_or(roll.now_s());
         events.push((
@@ -494,6 +582,33 @@ pub fn save_jsonl(
             0,
             serde_json::json!({"t": ms(end), "e": "off", "n": seg.midi, "who": who}),
         ));
+    }
+    // Pedal (CC64) levels: one event per span start, a 0 at each release —
+    // except between adjacent spans (a depth change), which write as a clean
+    // level→level transition. Same convention as the .mid export.
+    for who in [Who::Local, Who::Remote] {
+        let tag = match who {
+            Who::Local => "l",
+            Who::Remote => "r",
+        };
+        let spans: Vec<&PedalSegment> =
+            roll.pedal_segments.iter().filter(|p| p.who == who).collect();
+        for (i, ps) in spans.iter().enumerate() {
+            events.push((
+                ps.start_s,
+                1,
+                serde_json::json!({"t": ms(ps.start_s), "e": "pedal", "v": ps.level, "who": tag}),
+            ));
+            let end = ps.end_s.unwrap_or(roll.now_s());
+            let continues = spans.get(i + 1).is_some_and(|n| (n.start_s - end).abs() < 1e-9);
+            if !continues {
+                events.push((
+                    end,
+                    1,
+                    serde_json::json!({"t": ms(end), "e": "pedal", "v": 0, "who": tag}),
+                ));
+            }
+        }
     }
     for sep in &roll.separators {
         events.push((
@@ -534,7 +649,7 @@ mod tests {
         assert_eq!(roll.now_s(), 0.0);
 
         // First note: unpauses, no separator.
-        roll.note(Who::Local, NoteMsg::On(60), [1, 2, 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [1, 2, 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [1, 2, 3]);
         assert!(roll.separators.is_empty());
@@ -550,7 +665,7 @@ mod tests {
         assert_eq!(roll.now_s(), frozen); // ...and stays there.
 
         // Next note resumes and records a separator at the frozen time.
-        roll.note(Who::Local, NoteMsg::On(61), [1, 2, 3]);
+        roll.note(Who::Local, NoteMsg::On(61, 100), [1, 2, 3]);
         assert_eq!(roll.separators.len(), 1);
         assert_eq!(roll.separators[0].at, frozen);
         assert_eq!(roll.separators[0].name, None);
@@ -564,7 +679,7 @@ mod tests {
         let mut roll = Roll::new();
         roll.set_timing(Some(Duration::from_secs(20)), Some(Duration::from_secs(30)));
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
         // A 10 s pause is under the 20 s cap: the full gap stays on the paper.
@@ -579,7 +694,7 @@ mod tests {
         // Trailing blank infinite, idle pause finite at 30 s.
         roll.set_timing(None, Some(Duration::from_secs(30)));
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
         // Before the idle pause fires the clock is never clamped: 25 s of gap.
@@ -599,7 +714,7 @@ mod tests {
         let mut roll = Roll::new();
         roll.set_timing(None, None);
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
         // Minutes of silence: the paper keeps scrolling and the clock never
@@ -607,7 +722,7 @@ mod tests {
         roll.tick(t(base, 300.0));
         assert_eq!(roll.now_s(), 300.0);
         // The next note is part of the same instance — no separator inserted.
-        roll.note(Who::Local, NoteMsg::On(61), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(61, 100), [0; 3]);
         assert!(roll.separators.is_empty());
     }
 
@@ -616,7 +731,7 @@ mod tests {
         let base = Instant::now();
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         assert_eq!(roll.current_instance_name(), "instance 1");
         roll.rename_current_instance("warmup".into());
         assert_eq!(roll.current_instance_name(), "warmup");
@@ -641,11 +756,67 @@ mod tests {
     }
 
     #[test]
+    fn pedal_never_resets_the_idle_timer() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.set_timing(Some(Duration::from_secs(2)), Some(Duration::from_secs(30)));
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+
+        // Pump the pedal across (and far past) the idle window with no note
+        // on/off: the clock must clamp at last-note + trailing-blank and then
+        // formally pause on schedule, exactly as if the pedal were untouched
+        // (compare `clock_pauses_after_idle_and_separates_instances`).
+        for (at, level) in [(5.0, 127u8), (10.0, 64), (20.0, 0), (40.0, 96)] {
+            roll.tick(t(base, at));
+            roll.pedal(Who::Local, level);
+        }
+        roll.tick(t(base, 100.0));
+        assert_eq!(roll.now_s(), 3.0); // clamped: last note (1.0) + cap (2.0)
+
+        // The pause fired despite the pedal traffic: the next *note* opens a
+        // new instance with a separator at the frozen time.
+        roll.note(Who::Local, NoteMsg::On(61, 100), [0; 3]);
+        assert_eq!(roll.separators.len(), 1);
+        assert_eq!(roll.separators[0].at, 3.0);
+    }
+
+    #[test]
+    fn pedal_spans_open_close_and_dedupe() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.tick(t(base, 0.0));
+        // A note first, so the clock is running and times are meaningful.
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
+        roll.pedal(Who::Local, 90);
+        roll.pedal(Who::Local, 90); // repeat: no-op
+        assert_eq!(roll.pedal_segments.len(), 1);
+        roll.tick(t(base, 1.0));
+        roll.pedal(Who::Local, 40); // depth change: close + reopen
+        assert_eq!(roll.pedal_segments.len(), 2);
+        assert_eq!(roll.pedal_segments[0].end_s, Some(1.0));
+        assert_eq!(roll.pedal_segments[1].level, 40);
+        roll.tick(t(base, 2.0));
+        roll.pedal(Who::Local, 0); // release closes the open span
+        assert_eq!(roll.pedal_segments[1].end_s, Some(2.0));
+        // Each player's pedal is independent; release_pedal force-closes.
+        roll.pedal(Who::Remote, 127);
+        roll.tick(t(base, 3.0));
+        roll.release_pedal(Who::Remote);
+        assert_eq!(roll.pedal_segments[2].end_s, Some(3.0));
+        // ...and a following press opens a fresh span (level was reset to 0).
+        roll.pedal(Who::Remote, 127);
+        assert_eq!(roll.pedal_segments.len(), 4);
+    }
+
+    #[test]
     fn held_key_keeps_the_clock_running() {
         let base = Instant::now();
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         // Held far past IDLE_PAUSE: the paper must keep moving.
         roll.tick(t(base, 120.0));
         assert_eq!(roll.now_s(), 120.0);
@@ -658,10 +829,10 @@ mod tests {
         let base = Instant::now();
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
-        roll.note(Who::Remote, NoteMsg::On(60), [0; 3]);
-        roll.note(Who::Remote, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Remote, NoteMsg::On(60, 100), [0; 3]);
+        roll.note(Who::Remote, NoteMsg::On(60, 100), [0; 3]);
         assert_eq!(roll.segments.len(), 1);
-        roll.note(Who::Remote, NoteMsg::On(72), [0; 3]);
+        roll.note(Who::Remote, NoteMsg::On(72, 100), [0; 3]);
         roll.tick(t(base, 2.0));
         roll.release_all(Who::Remote);
         assert!(roll.segments.iter().all(|s| s.end_s == Some(2.0)));
@@ -676,7 +847,7 @@ mod tests {
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
         assert!(!roll.has_unsaved()); // empty roll never warns
-        roll.note(Who::Local, NoteMsg::On(60), [0; 3]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         assert!(roll.has_unsaved());
         roll.mark_saved();
         assert!(!roll.has_unsaved());
@@ -698,14 +869,14 @@ mod tests {
         let base = Instant::now();
         let mut roll = Roll::new();
         roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60), [220, 60, 60]);
+        roll.note(Who::Local, NoteMsg::On(60, 100), [220, 60, 60]);
         roll.tick(t(base, 0.5));
         roll.note(Who::Local, NoteMsg::Off(60), [220, 60, 60]);
-        roll.note(Who::Remote, NoteMsg::On(64), [60, 110, 230]);
+        roll.note(Who::Remote, NoteMsg::On(64, 100), [60, 110, 230]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Remote, NoteMsg::Off(64), [60, 110, 230]);
         roll.tick(t(base, 60.0)); // idle -> pause
-        roll.note(Who::Local, NoteMsg::On(62), [220, 60, 60]); // resume, separator
+        roll.note(Who::Local, NoteMsg::On(62, 100), [220, 60, 60]); // resume, separator
         roll.tick(t(base, 61.0)); // note 62 left open on purpose
         roll
     }

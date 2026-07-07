@@ -57,6 +57,11 @@ pub struct Prefs {
     pub roll_px_per_s: f32,
     /// Seconds a scrolled-back roll view holds before easing home.
     pub scrollback_idle_s: f64,
+    /// Show the sustain-pedal (CC64) lane at the history roll's left edge.
+    /// Opt-in (the roll's default look is unchanged), and only meaningful on
+    /// MIDI input — the mic path has no pedal signal, so the toggle is hidden
+    /// and the lane not drawn on the mic fallback.
+    pub pedal_lane_visible: bool,
 
     // ---- Appearance ----
     /// This player's note color (sRGB), broadcast to the peer.
@@ -132,6 +137,7 @@ impl Default for Prefs {
             idle_pause: default_idle_pause(),
             roll_px_per_s: 40.0,
             scrollback_idle_s: 2.5,
+            pedal_lane_visible: false,
             local_color: [220, 60, 60],
             local_name: "Player".to_string(),
             threshold: 0.30,

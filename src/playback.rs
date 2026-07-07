@@ -1,5 +1,5 @@
 //! Playback of a loaded score (see score.rs): one shared playhead driving
-//! both tracks, in two modes.
+//! both tracks, in several modes.
 //!
 //! **Listen**: the playhead advances in real time (scaled by the speed
 //! slider) and both tracks are auto-played through the built-in synth.
@@ -14,19 +14,30 @@
 //!   between note onsets, freeze exactly at the next practiced onset until
 //!   the required notes are struck, then continue — releasing early is fine.
 //!
+//! **Evaluation**: one chosen track goes silent and the playhead *never*
+//! gates — a full, non-stopping playthrough is scored live against the score
+//! ([`EvaluationState`]), then the engine flips itself into
+//! **EvaluationReview**: a passive Listen-like replay of a synthetic
+//! two-track score — the original part next to what was actually played —
+//! with per-side show/hear toggles ([`ReviewSettings`]). Review is never a
+//! mode the user picks directly; it's entered on take completion and left
+//! via "Retake" or by picking another mode.
+//!
 //! The current segment (see `score::ScoreSegment`) can loop a chosen number
-//! of times (or indefinitely) with a short silent pad before each repeat.
+//! of times (or indefinitely) with a short silent pad before each repeat
+//! (disabled during an evaluation take — scoring a looped pass isn't
+//! well-defined).
 //!
 //! All synth output goes to `Channel::Playback` via `Synth::note_on/off`
 //! directly — never through main.rs's `synth_note_on`/`synth_note_off`,
 //! whose mic-echo bookkeeping is sized for the two live channels only.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::note::{midi_to_key_index, KEY_COUNT};
 use crate::roll::Who;
-use crate::score::{Note, Score};
+use crate::score::{Note, Score, Track};
 use crate::synth::{Channel, Synth};
 
 /// Silent breather inserted before each loop repeat, so the pickup of the
@@ -41,10 +52,38 @@ const GATE_EPS: f64 = 1e-6;
 /// media-player double-tap convention).
 const PREV_SEGMENT_WINDOW_S: f64 = 0.5;
 
+/// Evaluation: score deducted per extra (unmatched) press, in note-score
+/// units — two stray presses cost as much as one missed note. Tunable.
+const EXTRA_PENALTY_WEIGHT: f32 = 0.5;
+
+/// Evaluation: a press that lands inside the temporal window is never worth
+/// less than this, so an edge-of-window hit still beats a miss outright.
+const TIMING_SCORE_FLOOR: f32 = 0.1;
+
+/// Evaluation: a judged note must score at least this to count as "clean"
+/// for the streak stat.
+const STREAK_SCORE_MIN: f32 = 0.5;
+
+/// Evaluation: minimum attempts before a pitch is eligible for the best/worst
+/// lists, so one unlucky note can't dominate them.
+const PITCH_MIN_ATTEMPTS: u32 = 2;
+
+/// How many pitches the best/worst breakdown lists at most.
+const PITCH_LIST_LEN: usize = 3;
+
+/// Color of the review's "what you played" track (the original track keeps
+/// its own color). Amber: distinct from both players' defaults.
+pub const PLAYED_TRACK_COLOR: [u8; 3] = [235, 185, 60];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Listen,
     Learn,
+    /// The live, free-running, scored take (see the module docs).
+    Evaluation,
+    /// The passive post-take dual-track replay. Never a direct radio target —
+    /// entered automatically when an evaluation take finishes.
+    EvaluationReview,
 }
 
 pub struct LearnSettings {
@@ -71,6 +110,426 @@ pub struct LoopState {
     pub pad_left_s: Option<f64>,
 }
 
+/// How forgiving evaluation scoring is. The presets fix all three tolerances
+/// at once; `Custom` exposes them individually.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Strictness {
+    Strict,
+    Normal,
+    Lenient,
+    Custom {
+        /// Half-width (±s) of the window around a note's start in which a
+        /// press can match it at all.
+        temporal_tolerance_s: f64,
+        /// Fraction of the full velocity range (0..1) at which the force
+        /// score bottoms out.
+        force_tolerance: f32,
+        /// Fraction of the full CC64 range (0..1) at which the pedal score
+        /// bottoms out.
+        pedal_tolerance: f32,
+    },
+}
+
+impl Strictness {
+    /// `(temporal ±s, force tolerance, pedal tolerance)` — the preset tuples,
+    /// or `Custom`'s own values. Starting points; tune by feel.
+    pub fn tolerances(&self) -> (f64, f32, f32) {
+        match *self {
+            Strictness::Strict => (0.06, 0.25, 0.5),
+            Strictness::Normal => (0.15, 0.5, 0.75),
+            Strictness::Lenient => (0.30, 0.8, 1.0),
+            Strictness::Custom { temporal_tolerance_s, force_tolerance, pedal_tolerance } => {
+                (temporal_tolerance_s, force_tolerance, pedal_tolerance)
+            }
+        }
+    }
+}
+
+/// Settings for [`Mode::Evaluation`]. Evaluation always scores exactly one
+/// track — the take is "the original vs. what you played", not both parts at
+/// once. Key-range scoping reuses `LearnSettings::key_range` (already
+/// mode-agnostic) rather than duplicating it here.
+pub struct EvaluationSettings {
+    /// Which score track the player performs; `None` = nothing selected yet
+    /// (the take free-runs but there's nothing to score).
+    pub evaluate: Option<Who>,
+    pub strictness: Strictness,
+    /// Whether key force counts toward the score at all — the tier only sets
+    /// how forgiving it is *when* it does. Ignored (no effect on scoring)
+    /// unless the live input is MIDI: the mic path's flat placeholder
+    /// velocity must not be graded as if genuine.
+    pub evaluate_velocity: bool,
+    /// Whether pedal use counts. Ignored unless the live input is MIDI *and*
+    /// the evaluated track carries pedal data to score against. Pedal is only
+    /// ever judged at the instant of a required note's press — never
+    /// free-floating during gaps.
+    pub evaluate_pedal: bool,
+}
+
+/// Per-side toggles for [`Mode::EvaluationReview`]: one flag per track drives
+/// both its visibility on the falling panel and its audibility. Deliberately
+/// not `LearnSettings::practice` — that means "silence until the player
+/// produces it", which has no sense in a passive post-hoc comparison.
+pub struct ReviewSettings {
+    pub show_original: bool,
+    pub show_played: bool,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        ReviewSettings { show_original: true, show_played: true }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation scoring. Live state accrues in `EvaluationState` while the take
+// free-runs; `finalize`/`result` turn it into the immutable
+// `EvaluationResult` + the synthetic review score.
+// ---------------------------------------------------------------------------
+
+/// One note the evaluated track requires, precomputed at take start.
+#[derive(Clone, Copy)]
+struct RequiredNote {
+    /// Index into the evaluated track's `notes` (unique per note — the key
+    /// judgements are looked up by).
+    note_index: usize,
+    midi: u8,
+    start_s: f64,
+    target_velocity: u8,
+    /// Whether the score wants the sustain pedal down at this note's start;
+    /// `None` when the track has no pedal data (dimension not scored).
+    required_pedal_down: Option<bool>,
+}
+
+enum Outcome {
+    Correct,
+    Missed,
+}
+
+/// The verdict on one required note.
+struct NoteJudgement {
+    note_index: usize,
+    midi: u8,
+    outcome: Outcome,
+    /// Press time minus required time (matched notes only).
+    press_delta_s: Option<f64>,
+    timing_score: f32,
+    /// `None` when force wasn't scored (dimension off / not applicable).
+    velocity_score: Option<f32>,
+    /// `None` when pedal wasn't scored.
+    pedal_score: Option<f32>,
+}
+
+impl NoteJudgement {
+    /// Equal-weight mean of whichever dimensions were scored, in [0, 1];
+    /// a miss is flat 0. (Equal weight is a starting point, not sacred.)
+    fn score(&self) -> f32 {
+        if matches!(self.outcome, Outcome::Missed) {
+            return 0.0;
+        }
+        let parts = [Some(self.timing_score), self.velocity_score, self.pedal_score];
+        let (sum, n) = parts
+            .iter()
+            .flatten()
+            .fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+        if n == 0 { 0.0 } else { sum / n as f32 }
+    }
+}
+
+/// A press that matched no pending required note — penalized in the total.
+struct ExtraPress {
+    at_s: f64,
+    midi: u8,
+}
+
+/// Live scoring state for one evaluation take. The applicability of the
+/// velocity/pedal dimensions and the tolerances are *frozen at take start*,
+/// so a mid-take input-backend flap (or settings edit — those restart the
+/// take) can't retroactively invalidate already-recorded judgements.
+struct EvaluationState {
+    required: Vec<RequiredNote>,
+    /// Indices into `required` not yet matched or missed, in score order.
+    pending: VecDeque<usize>,
+    judged: Vec<NoteJudgement>,
+    extra_presses: Vec<ExtraPress>,
+    /// Everything actually played, time-aligned to the playhead — becomes the
+    /// review's "played" track. Built here, NOT from `roll::Roll`: the roll
+    /// spans the whole app session across pieces and warm-ups and has no
+    /// notion of "just this take".
+    played_notes: Vec<Note>,
+    /// Index into `played_notes` of the still-open note per MIDI number.
+    open_played: [Option<usize>; 128],
+    /// Last frame's held set, to diff for releases.
+    prev_held: BTreeSet<u8>,
+    // -- frozen at take start --
+    score_velocity: bool,
+    score_pedal: bool,
+    window_s: f64,
+    force_tol: f32,
+    pedal_tol: f32,
+}
+
+impl EvaluationState {
+    /// Feed one frame of live input. `playhead_s` is the post-advance
+    /// playhead; `onsets` are this frame's note-ons as `(midi, velocity)`.
+    fn record_frame(
+        &mut self,
+        playhead_s: f64,
+        held: &BTreeSet<u8>,
+        onsets: &[(u8, u8)],
+        pedal_level: u8,
+    ) {
+        // Releases close their "played" note at the current playhead.
+        for &m in self.prev_held.difference(held) {
+            if let Some(i) = self.open_played[m as usize].take() {
+                self.played_notes[i].end_s = playhead_s;
+            }
+        }
+
+        // Required notes whose window has fully passed become misses as the
+        // playhead sweeps by (`pending` is in score order, so only the front
+        // can have expired).
+        while let Some(&i) = self.pending.front() {
+            if self.required[i].start_s + self.window_s < playhead_s {
+                self.pending.pop_front();
+                self.judge_missed(i);
+            } else {
+                break;
+            }
+        }
+
+        for &(midi, velocity) in onsets {
+            // The played track records every press, matched or not.
+            if self.open_played[midi as usize].is_none() {
+                self.open_played[midi as usize] = Some(self.played_notes.len());
+                self.played_notes.push(Note {
+                    start_s: playhead_s,
+                    end_s: playhead_s,
+                    midi,
+                    velocity,
+                });
+            }
+            // Match in FIFO score order — oldest pending first, a simple,
+            // accepted approximation over full bipartite matching.
+            let hit = self.pending.iter().position(|&i| {
+                let r = &self.required[i];
+                r.midi == midi && (playhead_s - r.start_s).abs() <= self.window_s
+            });
+            match hit {
+                Some(pos) => {
+                    let i = self.pending.remove(pos).expect("position came from iter");
+                    self.judge_match(i, playhead_s, velocity, pedal_level);
+                }
+                None => self.extra_presses.push(ExtraPress { at_s: playhead_s, midi }),
+            }
+        }
+
+        self.prev_held = held.clone();
+    }
+
+    fn judge_match(&mut self, i: usize, playhead_s: f64, velocity: u8, pedal_level: u8) {
+        let r = self.required[i];
+        let delta = playhead_s - r.start_s;
+        let timing_score =
+            (1.0 - (delta.abs() / self.window_s.max(1e-9)) as f32).max(TIMING_SCORE_FLOOR);
+        let velocity_score = self.score_velocity.then(|| {
+            let diff = (velocity as f32 - r.target_velocity as f32).abs() / 127.0;
+            (1.0 - diff / self.force_tol.max(1e-3)).clamp(0.0, 1.0)
+        });
+        // Pedal is judged only here — at the instant of a required note's
+        // press — never independently during silence.
+        let pedal_score = match (self.score_pedal, r.required_pedal_down) {
+            (true, Some(down)) => {
+                let target = if down { 127.0 } else { 0.0 };
+                let diff = (pedal_level as f32 - target).abs() / 127.0;
+                Some((1.0 - diff / self.pedal_tol.max(1e-3)).clamp(0.0, 1.0))
+            }
+            _ => None,
+        };
+        self.judged.push(NoteJudgement {
+            note_index: r.note_index,
+            midi: r.midi,
+            outcome: Outcome::Correct,
+            press_delta_s: Some(delta),
+            timing_score,
+            velocity_score,
+            pedal_score,
+        });
+    }
+
+    fn judge_missed(&mut self, i: usize) {
+        let r = self.required[i];
+        self.judged.push(NoteJudgement {
+            note_index: r.note_index,
+            midi: r.midi,
+            outcome: Outcome::Missed,
+            press_delta_s: None,
+            timing_score: 0.0,
+            velocity_score: None,
+            pedal_score: None,
+        });
+    }
+
+    /// Close the books at the end of the take: open played notes end at the
+    /// piece's end, and everything still pending is a miss (even a final note
+    /// whose window straddles the end — the take is over).
+    fn finalize(&mut self, duration_s: f64) {
+        for m in 0..128 {
+            if let Some(i) = self.open_played[m].take() {
+                self.played_notes[i].end_s = duration_s;
+            }
+        }
+        while let Some(i) = self.pending.pop_front() {
+            self.judge_missed(i);
+        }
+    }
+
+    /// Wipe everything recorded but keep `required` and the frozen
+    /// tolerances/applicability — for restarting the take (transport jumps).
+    fn restart(&mut self) {
+        self.pending = (0..self.required.len()).collect();
+        self.judged.clear();
+        self.extra_presses.clear();
+        self.played_notes.clear();
+        self.open_played = [None; 128];
+        self.prev_held.clear();
+    }
+
+    /// Crunch the judged take into the displayed breakdown.
+    fn result(&self) -> EvaluationResult {
+        let raw_points: f32 = self.judged.iter().map(|j| j.score()).sum();
+        let penalty = self.extra_presses.len() as f32 * EXTRA_PENALTY_WEIGHT;
+        let percent = if self.required.is_empty() {
+            0.0
+        } else {
+            100.0 * ((raw_points - penalty) / self.required.len() as f32).clamp(0.0, 1.0)
+        };
+
+        let mut per_pitch: BTreeMap<u8, PitchStats> = BTreeMap::new();
+        for j in &self.judged {
+            let s = per_pitch.entry(j.midi).or_insert(PitchStats { attempts: 0, avg_score: 0.0 });
+            s.attempts += 1;
+            s.avg_score += j.score(); // sum for now; divided just below
+        }
+        for s in per_pitch.values_mut() {
+            s.avg_score /= s.attempts as f32;
+        }
+        let mut eligible: Vec<(u8, f32)> = per_pitch
+            .iter()
+            .filter(|(_, s)| s.attempts >= PITCH_MIN_ATTEMPTS)
+            .map(|(&midi, s)| (midi, s.avg_score))
+            .collect();
+        eligible.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let worst_pitches: Vec<u8> =
+            eligible.iter().take(PITCH_LIST_LEN).map(|&(m, _)| m).collect();
+        let best_pitches: Vec<u8> =
+            eligible.iter().rev().take(PITCH_LIST_LEN).map(|&(m, _)| m).collect();
+
+        let mean_of = |scores: &mut dyn Iterator<Item = f32>| -> Option<f32> {
+            let (sum, n) = scores.fold((0.0f32, 0u32), |(s, n), v| (s + v, n + 1));
+            (n > 0).then(|| sum / n as f32)
+        };
+        let velocity_accuracy = mean_of(&mut self.judged.iter().filter_map(|j| j.velocity_score));
+        let pedal_accuracy = mean_of(&mut self.judged.iter().filter_map(|j| j.pedal_score));
+        // Signed mean of the matched press deltas: a systematic rush (-) or
+        // drag (+), as opposed to the unsigned spread timing_score captures.
+        let deltas: Vec<f64> = self.judged.iter().filter_map(|j| j.press_delta_s).collect();
+        let timing_bias_s = (!deltas.is_empty())
+            .then(|| deltas.iter().sum::<f64>() / deltas.len() as f64);
+
+        // Longest streak of clean *steps* in score order: chord notes sharing
+        // an onset (same epsilon-grouping convention as `required_set`/
+        // `gate_at_or_after`'s checkpoints) collapse to one step, which is
+        // clean iff every note in it judged Correct above the threshold and
+        // no extra press landed inside its window.
+        let by_note: BTreeMap<usize, f32> = self
+            .judged
+            .iter()
+            .map(|j| {
+                let s = if matches!(j.outcome, Outcome::Correct) { j.score() } else { -1.0 };
+                (j.note_index, s)
+            })
+            .collect();
+        let (mut streak, mut longest_streak) = (0u32, 0u32);
+        let mut k = 0;
+        while k < self.required.len() {
+            let t = self.required[k].start_s;
+            let mut clean = true;
+            while k < self.required.len() && (self.required[k].start_s - t).abs() < 1e-6 {
+                clean &= by_note
+                    .get(&self.required[k].note_index)
+                    .is_some_and(|&s| s >= STREAK_SCORE_MIN);
+                k += 1;
+            }
+            clean = clean
+                && !self.extra_presses.iter().any(|e| (e.at_s - t).abs() <= self.window_s);
+            if clean {
+                streak += 1;
+                longest_streak = longest_streak.max(streak);
+            } else {
+                streak = 0;
+            }
+        }
+
+        // Where the stray presses cluster, if anywhere — often one wrong
+        // neighbor key hit over and over.
+        let mut extra_by_pitch: BTreeMap<u8, u32> = BTreeMap::new();
+        for e in &self.extra_presses {
+            *extra_by_pitch.entry(e.midi).or_insert(0) += 1;
+        }
+        let extra_hotspot = extra_by_pitch
+            .into_iter()
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, n)| n >= 2)
+            .map(|(midi, _)| midi);
+
+        let missed_count =
+            self.judged.iter().filter(|j| matches!(j.outcome, Outcome::Missed)).count();
+        EvaluationResult {
+            percent,
+            per_pitch,
+            worst_pitches,
+            best_pitches,
+            longest_streak,
+            velocity_accuracy,
+            pedal_accuracy,
+            timing_bias_s,
+            extra_press_count: self.extra_presses.len(),
+            extra_hotspot,
+            missed_count,
+            matched_count: self.judged.len() - missed_count,
+        }
+    }
+}
+
+pub struct PitchStats {
+    pub attempts: u32,
+    pub avg_score: f32,
+}
+
+/// The finished take's breakdown, shown in the results window and the review
+/// panel. `velocity_accuracy`/`pedal_accuracy` are `None` when that dimension
+/// wasn't evaluated (the UI omits the line entirely rather than showing N/A).
+pub struct EvaluationResult {
+    pub percent: f32,
+    pub per_pitch: BTreeMap<u8, PitchStats>,
+    pub worst_pitches: Vec<u8>,
+    pub best_pitches: Vec<u8>,
+    /// Longest run of consecutive clean onset-steps, in score order.
+    pub longest_streak: u32,
+    pub velocity_accuracy: Option<f32>,
+    pub pedal_accuracy: Option<f32>,
+    /// Signed mean press offset (matched notes only): negative = rushing,
+    /// positive = dragging. `None` when nothing matched.
+    pub timing_bias_s: Option<f64>,
+    pub extra_press_count: usize,
+    /// The key most of the stray presses landed on, when there's a repeat
+    /// offender (>= 2 on the same pitch).
+    pub extra_hotspot: Option<u8>,
+    pub missed_count: usize,
+    pub matched_count: usize,
+}
+
 pub struct PlaybackEngine {
     pub score: Score,
     /// The score file this engine was loaded from — where the segment-name
@@ -86,6 +545,19 @@ pub struct PlaybackEngine {
     pub mode: Mode,
     pub learn: LearnSettings,
     pub loop_state: LoopState,
+    pub eval: EvaluationSettings,
+    pub review: ReviewSettings,
+    /// Live scoring state; `Some` exactly while `mode == Evaluation`.
+    eval_state: Option<EvaluationState>,
+    /// The finished take's breakdown; `Some` while reviewing.
+    pub eval_result: Option<EvaluationResult>,
+    /// The synthetic original+played score EvaluationReview renders and
+    /// sounds (see [`Self::display_score`]). `self.score` is never
+    /// overwritten by evaluation.
+    review_score: Option<Score>,
+    /// One-shot edge flag set when a take finishes; main.rs consumes it (via
+    /// [`Self::take_review_transition`]) to pop the results window.
+    review_just_started: bool,
     /// Notes currently sounding on the synth per track (edge detection for
     /// note_on/note_off as the playhead moves).
     sounding: [BTreeSet<u8>; 2],
@@ -108,17 +580,52 @@ impl PlaybackEngine {
                 key_range: None,
             },
             loop_state: LoopState { enabled: false, remaining: None, pad_left_s: None },
+            eval: EvaluationSettings {
+                evaluate: None,
+                strictness: Strictness::Normal,
+                evaluate_velocity: false,
+                evaluate_pedal: false,
+            },
+            review: ReviewSettings::default(),
+            eval_state: None,
+            eval_result: None,
+            review_score: None,
+            review_just_started: false,
             sounding: [BTreeSet::new(), BTreeSet::new()],
         }
     }
 
     /// Whether the player (not the synth) is responsible for this track.
     pub fn practiced(&self, who: Who) -> bool {
-        self.mode == Mode::Learn && self.learn.practice[who.idx()]
+        match self.mode {
+            Mode::Learn => self.learn.practice[who.idx()],
+            Mode::Evaluation => self.eval.evaluate == Some(who),
+            Mode::Listen | Mode::EvaluationReview => false,
+        }
+    }
+
+    /// The score the render/audio paths should read: the synthetic
+    /// original+played pair while reviewing, the loaded file otherwise.
+    pub fn display_score(&self) -> &Score {
+        match (&self.mode, &self.review_score) {
+            (Mode::EvaluationReview, Some(review)) => review,
+            _ => &self.score,
+        }
+    }
+
+    /// Whether a track should be drawn/heard right now. Only EvaluationReview
+    /// makes tracks toggleable (per [`ReviewSettings`]: slot 0 = original,
+    /// slot 1 = played); every other mode always shows both.
+    pub fn track_visible(&self, who: Who) -> bool {
+        match (self.mode, who) {
+            (Mode::EvaluationReview, Who::Local) => self.review.show_original,
+            (Mode::EvaluationReview, Who::Remote) => self.review.show_played,
+            _ => true,
+        }
     }
 
     fn active_at(&self, who: Who, t: f64) -> impl Iterator<Item = &Note> {
-        self.score.tracks[who.idx()]
+        self.display_score().tracks[who.idx()]
             .notes
             .iter()
             .filter(move |n| n.start_s <= t && t < n.end_s)
@@ -165,8 +672,19 @@ impl PlaybackEngine {
     }
 
     /// Advance one frame. `held` is the player's live held-key set (MIDI
-    /// numbers); `dt_s` is the frame's wall-clock delta.
-    pub fn tick(&mut self, dt_s: f64, held: &BTreeSet<u8>, synth: &Synth) {
+    /// numbers); `onsets` are this frame's note-ons as `(midi, velocity)` and
+    /// `pedal_level` the live CC64 level — both consumed only by Evaluation
+    /// (velocity exists only at the instant of attack, so it must arrive
+    /// here, not be reconstructed from `held`); `dt_s` is the frame's
+    /// wall-clock delta.
+    pub fn tick(
+        &mut self,
+        dt_s: f64,
+        held: &BTreeSet<u8>,
+        onsets: &[(u8, u8)],
+        pedal_level: u8,
+        synth: &Synth,
+    ) {
         // Loop pad first, with an early return: a single frame must never
         // both finish padding *and* re-cross the segment end below, or a
         // finite repeat count would double-decrement. Gating is deliberately
@@ -195,6 +713,9 @@ impl PlaybackEngine {
             let no_practice = !self.learn.practice[0] && !self.learn.practice[1];
             match self.mode {
                 Mode::Listen => self.advance(dt_s),
+                // The review replay free-runs exactly like Listen.
+                Mode::EvaluationReview => self.advance(dt_s),
+                Mode::Evaluation => self.evaluation_advance(dt_s, held, onsets, pedal_level),
                 // Nothing selected to practice: intentionally identical to
                 // Listen (the Learn panel hints this).
                 Mode::Learn if no_practice => self.advance(dt_s),
@@ -260,14 +781,166 @@ impl PlaybackEngine {
         self.finished = self.playhead_s >= self.score.duration_s;
     }
 
+    /// The Evaluation frame: **always free-runs** — the playhead is never
+    /// gated on what's played (the take must not stop) — then feeds the
+    /// frame's live input to the scorer. On the finished edge the take
+    /// finalizes and the engine flips itself into review.
+    fn evaluation_advance(
+        &mut self,
+        dt_s: f64,
+        held: &BTreeSet<u8>,
+        onsets: &[(u8, u8)],
+        pedal_level: u8,
+    ) {
+        // `tick` only dispatches here while !finished, so `self.finished`
+        // turning true below IS the finished edge.
+        self.advance(dt_s);
+        let playhead_s = self.playhead_s;
+        if let Some(state) = &mut self.eval_state {
+            state.record_frame(playhead_s, held, onsets, pedal_level);
+        }
+        if self.finished {
+            self.finalize_evaluation();
+        }
+    }
+
+    /// (Re)start an evaluation take from the top. `live_midi` — whether the
+    /// live input source is a real MIDI device — is what velocity/pedal
+    /// applicability is frozen from (see [`EvaluationState`]). Called on
+    /// entering the mode, on any evaluation-settings change, and by "Retake".
+    pub fn start_evaluation(&mut self, live_midi: bool, synth: &Synth) {
+        self.silence(synth);
+        self.mode = Mode::Evaluation;
+        self.playhead_s = 0.0;
+        self.finished = false;
+        // A take is running by definition (review parks paused, and a Retake
+        // from there must not start frozen).
+        self.playing = true;
+        // Scoring a looped pass isn't well-defined; the loop checkbox is also
+        // greyed out while evaluating.
+        self.loop_state.enabled = false;
+        self.loop_state.pad_left_s = None;
+        self.eval_result = None;
+        self.review_score = None;
+        self.eval_state = Some(self.build_eval_state(live_midi));
+    }
+
+    /// Drop all evaluation/review state — for leaving via the Listen/Learn
+    /// radios. (The mode itself was already changed by the radio.)
+    pub fn exit_evaluation(&mut self, synth: &Synth) {
+        self.silence(synth);
+        self.eval_state = None;
+        self.eval_result = None;
+        self.review_score = None;
+    }
+
+    /// One-shot: true exactly once per Evaluation → EvaluationReview
+    /// transition. main.rs polls this after `tick` to pop the results window.
+    pub fn take_review_transition(&mut self) -> bool {
+        std::mem::take(&mut self.review_just_started)
+    }
+
+    fn build_eval_state(&self, live_midi: bool) -> EvaluationState {
+        let (window_s, force_tol, pedal_tol) = self.eval.strictness.tolerances();
+        let mut required: Vec<RequiredNote> = Vec::new();
+        if let Some(who) = self.eval.evaluate {
+            let track = &self.score.tracks[who.idx()];
+            for (note_index, n) in track.notes.iter().enumerate() {
+                // Reuse the Learn key range: out-of-range notes still render
+                // and auto-play, they just aren't required — same meaning the
+                // one "Key range" control has everywhere else.
+                if !self.in_key_range(n.midi) {
+                    continue;
+                }
+                required.push(RequiredNote {
+                    note_index,
+                    midi: n.midi,
+                    start_s: n.start_s,
+                    target_velocity: n.velocity,
+                    required_pedal_down: track.pedal_down_at(n.start_s),
+                });
+            }
+            // Score notes are start-sorted already; keep the invariant
+            // explicit — `pending`'s FIFO order and the expiry sweep rely on it.
+            required.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+        }
+        // Freeze applicability now (see EvaluationState docs): force needs
+        // real (MIDI) velocity; pedal additionally needs score pedal data.
+        let score_pedal = self.eval.evaluate_pedal
+            && live_midi
+            && self
+                .eval
+                .evaluate
+                .is_some_and(|w| !self.score.tracks[w.idx()].pedal_events.is_empty());
+        EvaluationState {
+            pending: (0..required.len()).collect(),
+            required,
+            judged: Vec::new(),
+            extra_presses: Vec::new(),
+            played_notes: Vec::new(),
+            open_played: [None; 128],
+            prev_held: BTreeSet::new(),
+            score_velocity: self.eval.evaluate_velocity && live_midi,
+            score_pedal,
+            window_s,
+            force_tol,
+            pedal_tol,
+        }
+    }
+
+    /// The take just ended: crunch the result, materialize the dual-track
+    /// review score, and flip into EvaluationReview — parked paused at the
+    /// top, ready to replay.
+    fn finalize_evaluation(&mut self) {
+        let Some(mut state) = self.eval_state.take() else { return };
+        state.finalize(self.score.duration_s);
+        self.eval_result = Some(state.result());
+
+        // Slot 0 = the original evaluated part, slot 1 = what was played.
+        // Both review slots are spoken for, so the *other* (auto-played)
+        // track, if any, is deliberately dropped from the review view.
+        let who = self.eval.evaluate.unwrap_or(Who::Local);
+        let original = &self.score.tracks[who.idx()];
+        self.review_score = Some(Score {
+            tracks: [
+                Track {
+                    notes: original.notes.clone(),
+                    color: original.color,
+                    pedal_events: original.pedal_events.clone(),
+                },
+                Track {
+                    notes: state.played_notes,
+                    color: PLAYED_TRACK_COLOR,
+                    pedal_events: Vec::new(),
+                },
+            ],
+            duration_s: self.score.duration_s,
+            markers: self.score.markers.clone(),
+            first_marker_name: self.score.first_marker_name.clone(),
+            segments: self.score.segments.clone(),
+            warning: None,
+        });
+
+        self.mode = Mode::EvaluationReview;
+        self.review = ReviewSettings::default();
+        self.playhead_s = 0.0;
+        self.finished = false;
+        self.playing = false;
+        self.review_just_started = true;
+    }
+
     /// Sound the unpracticed tracks: diff "should be sounding at the
     /// playhead" against "is sounding" and send the edges to the synth.
     /// Practiced tracks are the player's job — their sound (and their marks
     /// on the live history roll) comes from the real input path, unchanged.
+    /// In EvaluationReview both tracks are passive; the [`ReviewSettings`]
+    /// toggles gate audibility instead (visibility rides the same flags —
+    /// see `track_visible`).
     fn drive_auto(&mut self, synth: &Synth) {
         for who in [Who::Local, Who::Remote] {
             let idx = who.idx();
-            if self.practiced(who) || !self.playing {
+            let audible = self.playing && !self.practiced(who) && self.track_visible(who);
+            if !audible {
                 let old = std::mem::take(&mut self.sounding[idx]);
                 for m in old {
                     synth.note_off(m, Channel::Playback);
@@ -317,6 +990,16 @@ impl PlaybackEngine {
 
     pub fn jump_to(&mut self, t: f64, synth: &Synth) {
         self.silence(synth);
+        // Scoring a scrubbed partial pass isn't well-defined: any jump while
+        // evaluating wipes the scorer and restarts the take from the top.
+        let t = if self.mode == Mode::Evaluation {
+            if let Some(state) = &mut self.eval_state {
+                state.restart();
+            }
+            0.0
+        } else {
+            t
+        };
         self.playhead_s = t.clamp(0.0, self.score.duration_s);
         self.finished = self.playhead_s >= self.score.duration_s;
         // A stale pad countdown must not survive a jump — it would resume
@@ -378,22 +1061,22 @@ mod tests {
     use super::*;
     use crate::score::{ScoreSegment, Track};
 
-    /// Local track: notes at [1,2) on 60 and [3,4) on 62+64 (a chord).
-    /// Remote track: one note at [1.5, 2.5) on 70. Two segments split at 2.5.
+    /// Local track: notes at [1,2) on 60 and [3,4) on 62+64 (a chord), with
+    /// pedal down over the chord. Remote track: one note at [1.5, 2.5) on 70.
+    /// Two segments split at 2.5.
     fn engine() -> PlaybackEngine {
+        let n = |start_s: f64, end_s: f64, midi: u8| Note { start_s, end_s, midi, velocity: 80 };
         let score = Score {
             tracks: [
                 Track {
-                    notes: vec![
-                        Note { start_s: 1.0, end_s: 2.0, midi: 60 },
-                        Note { start_s: 3.0, end_s: 4.0, midi: 62 },
-                        Note { start_s: 3.0, end_s: 4.0, midi: 64 },
-                    ],
+                    notes: vec![n(1.0, 2.0, 60), n(3.0, 4.0, 62), n(3.0, 4.0, 64)],
                     color: [0; 3],
+                    pedal_events: vec![(2.8, 127), (4.2, 0)],
                 },
                 Track {
-                    notes: vec![Note { start_s: 1.5, end_s: 2.5, midi: 70 }],
+                    notes: vec![n(1.5, 2.5, 70)],
                     color: [0; 3],
+                    pedal_events: Vec::new(),
                 },
             ],
             duration_s: 5.0,
@@ -416,7 +1099,7 @@ mod tests {
     fn listen_mode_advances_and_finishes() {
         let (mut pb, synth) = (engine(), Synth::disconnected());
         for _ in 0..60 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         assert!(pb.finished);
         assert_eq!(pb.playhead_s, 5.0);
@@ -426,7 +1109,7 @@ mod tests {
     fn speed_scales_the_playhead() {
         let (mut pb, synth) = (engine(), Synth::disconnected());
         pb.speed = 0.5;
-        pb.tick(1.0, &held(&[]), &synth);
+        pb.tick(1.0, &held(&[]), &[], 0, &synth);
         assert!((pb.playhead_s - 0.5).abs() < 1e-9);
     }
 
@@ -436,19 +1119,19 @@ mod tests {
         pb.mode = Mode::Learn;
         pb.learn.practice = [true, false];
         pb.jump_to(1.2, &synth); // inside local note 60
-        pb.tick(0.1, &held(&[]), &synth);
+        pb.tick(0.1, &held(&[]), &[], 0, &synth);
         assert_eq!(pb.playhead_s, 1.2); // frozen: 60 not held
-        pb.tick(0.1, &held(&[60]), &synth);
+        pb.tick(0.1, &held(&[60]), &[], 0, &synth);
         assert!((pb.playhead_s - 1.3).abs() < 1e-9); // held -> advances
         // Extra notes don't block unless block_wrong.
-        pb.tick(0.1, &held(&[60, 99]), &synth);
+        pb.tick(0.1, &held(&[60, 99]), &[], 0, &synth);
         assert!((pb.playhead_s - 1.4).abs() < 1e-9);
         pb.learn.block_wrong = true;
-        pb.tick(0.1, &held(&[60, 99]), &synth);
+        pb.tick(0.1, &held(&[60, 99]), &[], 0, &synth);
         assert!((pb.playhead_s - 1.4).abs() < 1e-9); // strict: extra blocks
         // Remote track is not practiced: its active note (70) is not required.
         pb.learn.block_wrong = false;
-        pb.tick(0.1, &held(&[60]), &synth);
+        pb.tick(0.1, &held(&[60]), &[], 0, &synth);
         assert!((pb.playhead_s - 1.5).abs() < 1e-9);
     }
 
@@ -460,20 +1143,20 @@ mod tests {
         pb.learn.require_hold = false;
         // Free-runs to the first onset (1.0) and freezes there.
         for _ in 0..30 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         assert!((pb.playhead_s - 1.0).abs() < 1e-9);
         // Strike it: continues, and releasing immediately is fine.
-        pb.tick(0.1, &held(&[60]), &synth);
+        pb.tick(0.1, &held(&[60]), &[], 0, &synth);
         assert!(pb.playhead_s > 1.0);
         for _ in 0..30 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         assert!((pb.playhead_s - 3.0).abs() < 1e-9); // next gate: the chord
         // The whole chord is required at once.
-        pb.tick(0.1, &held(&[62]), &synth);
+        pb.tick(0.1, &held(&[62]), &[], 0, &synth);
         assert!((pb.playhead_s - 3.0).abs() < 1e-9);
-        pb.tick(0.1, &held(&[62, 64]), &synth);
+        pb.tick(0.1, &held(&[62, 64]), &[], 0, &synth);
         assert!(pb.playhead_s > 3.0);
     }
 
@@ -485,11 +1168,11 @@ mod tests {
         pb.learn.require_hold = false;
         pb.learn.key_range = Some((63, 80)); // excludes 60 and 62, includes 64
         for _ in 0..30 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         // Skipped the 1.0 onset (60 out of range); frozen at 3.0 needing only 64.
         assert!((pb.playhead_s - 3.0).abs() < 1e-9);
-        pb.tick(0.1, &held(&[64]), &synth);
+        pb.tick(0.1, &held(&[64]), &[], 0, &synth);
         assert!(pb.playhead_s > 3.0);
     }
 
@@ -516,23 +1199,23 @@ mod tests {
         pb.loop_state.remaining = Some(1);
         // Reach the segment end (2.5): pad starts, one repeat consumed.
         for _ in 0..6 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         assert!(pb.loop_state.pad_left_s.is_some());
         assert_eq!(pb.loop_state.remaining, Some(0));
         // The pad freezes the playhead just inside the segment.
         let parked = pb.playhead_s;
-        pb.tick(1.0, &held(&[]), &synth);
+        pb.tick(1.0, &held(&[]), &[], 0, &synth);
         assert_eq!(pb.playhead_s, parked);
         // Burn the rest of the pad (3.9s left): snaps back to segment start.
         for _ in 0..4 {
-            pb.tick(1.0, &held(&[]), &synth);
+            pb.tick(1.0, &held(&[]), &[], 0, &synth);
         }
         assert!((pb.playhead_s - 0.0).abs() < 1e-6);
         assert!(pb.loop_state.pad_left_s.is_none());
         // Second arrival at the end: remaining == 0 -> disengage, play on.
         for _ in 0..26 {
-            pb.tick(0.1, &held(&[]), &synth);
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
         }
         assert!(!pb.loop_state.enabled);
         assert!(pb.playhead_s > 2.5);
@@ -560,5 +1243,123 @@ mod tests {
         // ⏭ to the very end reports finished immediately.
         pb.jump_to(pb.score.duration_s, &synth);
         assert!(pb.finished);
+    }
+
+    /// Run one whole evaluation take: `plays` maps a playhead time (matched
+    /// to the tick grid) to the onsets fired that frame.
+    fn run_take(pb: &mut PlaybackEngine, synth: &Synth, plays: &[(f64, &[(u8, u8)], u8)]) {
+        let mut t = 0.0;
+        while pb.mode == Mode::Evaluation {
+            t += 0.1;
+            let frame = plays
+                .iter()
+                .find(|(at, _, _)| (t - at).abs() < 1e-9)
+                .map_or((&[][..], 0), |&(_, onsets, pedal)| (onsets, pedal));
+            pb.tick(0.1, &held(&[]), frame.0, frame.1, synth);
+            assert!(t < 10.0, "take never finished");
+        }
+    }
+
+    #[test]
+    fn evaluation_free_runs_scores_and_flips_into_review() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.start_evaluation(true, &synth);
+        assert_eq!(pb.playhead_s, 0.0);
+        assert!(matches!(pb.mode, Mode::Evaluation));
+
+        // Hit 60 dead on time (an extra 99 rings at 2.0); miss the chord
+        // entirely. The playhead must never stall on any of it.
+        run_take(
+            &mut pb,
+            &synth,
+            &[(1.0, &[(60, 80)], 0), (2.0, &[(99, 90)], 0)],
+        );
+
+        // The take finished -> review, parked paused at the top, edge flagged.
+        assert!(matches!(pb.mode, Mode::EvaluationReview));
+        assert!(pb.take_review_transition());
+        assert!(!pb.take_review_transition(), "edge flag is one-shot");
+        assert_eq!(pb.playhead_s, 0.0);
+        assert!(!pb.playing);
+
+        let r = pb.eval_result.as_ref().expect("result must exist in review");
+        assert_eq!((r.matched_count, r.missed_count, r.extra_press_count), (1, 2, 1));
+        // 60 was matched with |delta| ~0 and no velocity/pedal dimensions on:
+        // 1.0 point, minus the extra-press penalty, over 3 required notes.
+        let expect = 100.0 * (1.0 - EXTRA_PENALTY_WEIGHT) / 3.0;
+        assert!((r.percent - expect).abs() < 1.0, "got {}", r.percent);
+        assert_eq!(r.longest_streak, 1);
+
+        // The review score pairs the original part with what was played.
+        let review = pb.display_score();
+        assert_eq!(review.tracks[0].notes.len(), 3);
+        assert_eq!(review.tracks[1].notes.len(), 2); // 60 + the stray 99
+        assert_eq!(review.tracks[1].color, PLAYED_TRACK_COLOR);
+        // Review toggles gate visibility/audibility per side.
+        assert!(pb.track_visible(Who::Local) && pb.track_visible(Who::Remote));
+        pb.review.show_played = false;
+        assert!(!pb.track_visible(Who::Remote));
+
+        // Leaving review drops the synthetic score.
+        pb.mode = Mode::Listen;
+        pb.exit_evaluation(&synth);
+        assert_eq!(pb.display_score().tracks[1].notes.len(), 1); // the real remote track
+        assert!(pb.eval_result.is_none());
+    }
+
+    #[test]
+    fn evaluation_scores_velocity_and_pedal_when_frozen_applicable() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.eval.evaluate_velocity = true;
+        pb.eval.evaluate_pedal = true;
+        pb.start_evaluation(true, &synth);
+
+        // Perfect take: right notes, right times, exact target velocity (80),
+        // pedal up at 1.0 and down at the 3.0 chord — matching the score's
+        // pedal stream (down from 2.8).
+        run_take(
+            &mut pb,
+            &synth,
+            &[(1.0, &[(60, 80)], 0), (3.0, &[(62, 80), (64, 80)], 127)],
+        );
+
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!(r.missed_count, 0);
+        assert!(r.percent > 99.0, "got {}", r.percent);
+        assert_eq!(r.velocity_accuracy, Some(1.0));
+        assert_eq!(r.pedal_accuracy, Some(1.0));
+        assert_eq!(r.longest_streak, 2); // note step + chord step
+
+        // Mic input: both extra dimensions must freeze OFF even when the
+        // checkboxes are on — a placeholder velocity is never graded.
+        pb.start_evaluation(false, &synth);
+        run_take(&mut pb, &synth, &[(1.0, &[(60, 100)], 0)]);
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!(r.velocity_accuracy, None);
+        assert_eq!(r.pedal_accuracy, None);
+    }
+
+    #[test]
+    fn evaluation_jump_restarts_the_take_from_the_top() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.start_evaluation(true, &synth);
+        // Play the first note (on time: the playhead sits at 1.0 after the
+        // tenth tick), then scrub: everything recorded is wiped and the
+        // playhead is forced back to 0 regardless of the jump target.
+        for _ in 0..9 {
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
+        }
+        pb.tick(0.1, &held(&[60]), &[(60, 80)], 0, &synth);
+        pb.jump_to(4.0, &synth);
+        assert_eq!(pb.playhead_s, 0.0);
+        assert!(matches!(pb.mode, Mode::Evaluation));
+        // Finish without playing anything: all three notes are misses — the
+        // pre-jump match did not survive.
+        run_take(&mut pb, &synth, &[]);
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!((r.matched_count, r.missed_count), (0, 3));
     }
 }
