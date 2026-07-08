@@ -76,6 +76,11 @@ pub struct Prefs {
     /// This player's display name, shown in the status bar and broadcast to the
     /// peer (which renders it next to the peer color). Persists across sessions.
     pub local_name: String,
+    /// User-dragged keyboard height, as a fraction of the central panel's
+    /// height so it scales with the window. Set by dragging the keyboard's
+    /// top/bottom edge; saved on drag release. `None` = the built-in default
+    /// split (`KEYBOARD_FRACTION` in main.rs).
+    pub keyboard_height_frac: Option<f32>,
 
     // ---- Audio / mic ----
     /// Mic detection threshold (model posterior probability, 0..1).
@@ -152,6 +157,7 @@ impl Default for Prefs {
             pedal_deadzone: 0,
             local_color: [220, 60, 60],
             local_name: "Player".to_string(),
+            keyboard_height_frac: None,
             threshold: 0.30,
             echo_holdoff_ms: 2000,
             mic_muted: false,

@@ -143,6 +143,12 @@ const SCROLLBACK_EASE_RATE: f64 = 12.0;
 /// than `MIN_KEYBOARD_H` so keys stay playable in a short window.
 const KEYBOARD_FRACTION: f32 = 0.45;
 const MIN_KEYBOARD_H: f32 = 140.0;
+/// Cap on a user-dragged keyboard height override, as a fraction of the
+/// central panel's height.
+const MAX_KEYBOARD_FRACTION: f32 = 0.85;
+/// Thickness (px) of the invisible drag-handle strip straddling the
+/// keyboard's top/bottom edge.
+const KB_RESIZE_HANDLE_H: f32 = 6.0;
 
 /// Compact mode ("alternate minimize"): the window shrinks to just the title
 /// bar + keyboard. Height chosen so the keys stay comfortably playable; the
@@ -441,6 +447,10 @@ struct PianoApp {
     segment_row_visible: bool,
     // Whether the top config panel is collapsed to its title strip (chevron).
     config_collapsed: bool,
+    // User-dragged keyboard height as a fraction of the central panel's
+    // height (None = the KEYBOARD_FRACTION default). Mirrors
+    // `prefs.keyboard_height_frac`, which persists it on drag-stop.
+    keyboard_height_frac: Option<f32>,
     // Compact mode ("alternate minimize" — keyboard + title bar only). This is
     // user *intent*, toggled by the title-bar button and persisted when
     // "Remember window state" is on.
@@ -516,6 +526,7 @@ impl PianoApp {
             .reopen_last_file
             .then(|| prefs.last_file_path.clone())
             .flatten();
+        let keyboard_height_frac = prefs.keyboard_height_frac;
         let mut app = Self {
             input,
             synth: synth::Synth::start(),
@@ -571,6 +582,7 @@ impl PianoApp {
             open_status: String::new(),
             segment_row_visible: true,
             config_collapsed: false,
+            keyboard_height_frac,
             compact_mode,
             normal_size,
             compact_applied: compact_mode,
@@ -1768,7 +1780,7 @@ impl PianoApp {
                 self.prefs.save();
             }
             ui.label("My color:");
-            if color_picker_row(ui, &mut self.local_color, "config_bar") {
+            if ui.color_edit_button_srgb(&mut self.local_color).changed() {
                 // Push the change immediately; the heartbeat covers the rest.
                 self.send_color();
                 // Persist as the new default color.
@@ -2475,7 +2487,7 @@ impl PianoApp {
         });
         ui.horizontal(|ui| {
             ui.label("My note color:");
-            if color_picker_row(ui, &mut self.prefs.local_color, "prefs_appearance") {
+            if ui.color_edit_button_srgb(&mut self.prefs.local_color).changed() {
                 self.local_color = self.prefs.local_color;
                 self.send_color();
                 changed = true;
@@ -2485,38 +2497,42 @@ impl PianoApp {
     }
 
     /// The "Pedal" tab: lane visibility (relocated from Roll & history) +
-    /// input sensitivity. Pedal is MIDI-only end to end — the mic path has no
-    /// CC64 signal — so the controls only render with a MIDI source, the same
-    /// gating the lane itself uses.
+    /// input sensitivity. Always editable — a user can dial in settings before
+    /// plugging in a keyboard — but only *effective* on MIDI input, since the
+    /// mic path has no CC64 signal (the lane's render gate enforces that).
     fn prefs_pedal_section(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
         ui.heading("Pedal");
-        if self.input.source() == Source::Midi {
+        changed |= ui
+            .checkbox(&mut self.prefs.pedal_lane_visible, "Show pedal lane")
+            .on_hover_text(
+                "Draw sustain-pedal (CC64) activity as a slim strip at the \
+                 roll's left edge, tinted by pedal depth. Only takes effect \
+                 with a MIDI keyboard — the mic path has no CC64 signal.",
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Pedal sensitivity deadzone:");
             changed |= ui
-                .checkbox(&mut self.prefs.pedal_lane_visible, "Show pedal lane")
+                .add(
+                    egui::DragValue::new(&mut self.prefs.pedal_deadzone)
+                        .range(0..=32)
+                        .speed(0.1),
+                )
                 .on_hover_text(
-                    "Draw sustain-pedal (CC64) activity as a slim strip at the \
-                     roll's left edge, tinted by pedal depth",
+                    "Minimum CC64 change (out of 127) before a new pedal \
+                     position registers. Raise it to settle a jittery \
+                     analog pedal; too high coarsens half-pedaling. \
+                     0 = record every distinct level. Only takes effect \
+                     with a MIDI keyboard.",
                 )
                 .changed();
-            ui.horizontal(|ui| {
-                ui.label("Pedal sensitivity deadzone:");
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(&mut self.prefs.pedal_deadzone)
-                            .range(0..=32)
-                            .speed(0.1),
-                    )
-                    .on_hover_text(
-                        "Minimum CC64 change (out of 127) before a new pedal \
-                         position registers. Raise it to settle a jittery \
-                         analog pedal; too high coarsens half-pedaling. \
-                         0 = record every distinct level.",
-                    )
-                    .changed();
-            });
-        } else {
-            ui.weak("Pedal settings need a MIDI keyboard — the mic path has no pedal signal.");
+        });
+        if self.input.source() != Source::Midi {
+            ui.weak(
+                "Not in effect on mic input — the mic path has no pedal signal. \
+                 Settings are saved and apply once a MIDI keyboard is connected.",
+            );
         }
         changed
     }
@@ -3181,6 +3197,10 @@ impl eframe::App for PianoApp {
             // roll strip below, so it takes the full central-panel height.
             let kb_h = if self.compact_mode {
                 avail.y
+            } else if let Some(frac) = self.keyboard_height_frac {
+                let lo_h = MIN_KEYBOARD_H.min(avail.y);
+                let hi_h = (avail.y * MAX_KEYBOARD_FRACTION).max(lo_h).min(avail.y);
+                (frac * avail.y).clamp(lo_h, hi_h)
             } else {
                 (avail.y * KEYBOARD_FRACTION).max(MIN_KEYBOARD_H).min(avail.y)
             };
@@ -3215,6 +3235,64 @@ impl eframe::App for PianoApp {
             let response =
                 ui.allocate_response(egui::vec2(avail.x, kb_h), egui::Sense::click_and_drag());
             let rect = response.rect;
+
+            // Drag-to-resize handles on the keyboard's edges: thin strips
+            // straddling the top (against the falling panel) and bottom
+            // (against the roll strip). Registered after `response` so they
+            // win hover/drag priority over the keyboard's own click-and-drag
+            // for their overlap (same interact-last-wins convention as the
+            // title bar). The dragged height lands next frame — consistent
+            // with the rest of the immediate-mode drag state here.
+            let lo_h = MIN_KEYBOARD_H.min(avail.y);
+            let hi_h = (avail.y * MAX_KEYBOARD_FRACTION).max(lo_h).min(avail.y);
+
+            if !self.compact_mode {
+                let bottom_handle_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.bottom() - KB_RESIZE_HANDLE_H / 2.0),
+                    egui::pos2(rect.right(), rect.bottom() + KB_RESIZE_HANDLE_H / 2.0),
+                );
+                let handle = ui.interact(
+                    bottom_handle_rect,
+                    response.id.with("kb_resize_bottom"),
+                    egui::Sense::drag(),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if handle.dragged() {
+                    // Bottom edge moving down (positive dy) grows the keyboard.
+                    let new_h = (kb_h + handle.drag_delta().y).clamp(lo_h, hi_h);
+                    self.keyboard_height_frac = Some(new_h / avail.y.max(1.0));
+                }
+                if handle.drag_stopped() {
+                    self.prefs.keyboard_height_frac = self.keyboard_height_frac;
+                    self.prefs.save();
+                }
+            }
+
+            if falling_resp.is_some() {
+                let top_handle_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top() - KB_RESIZE_HANDLE_H / 2.0),
+                    egui::pos2(rect.right(), rect.top() + KB_RESIZE_HANDLE_H / 2.0),
+                );
+                let handle = ui.interact(
+                    top_handle_rect,
+                    response.id.with("kb_resize_top"),
+                    egui::Sense::drag(),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if handle.dragged() {
+                    // Top edge moving up (negative dy) grows the keyboard, so negate.
+                    let new_h = (kb_h - handle.drag_delta().y).clamp(lo_h, hi_h);
+                    self.keyboard_height_frac = Some(new_h / avail.y.max(1.0));
+                }
+                if handle.drag_stopped() {
+                    self.prefs.keyboard_height_frac = self.keyboard_height_frac;
+                    self.prefs.save();
+                }
+            }
 
             // Mouse play is disabled while capturing training data (a click
             // makes no real sound and isn't in the MIDI labels) and while a
@@ -4032,152 +4110,6 @@ fn eval_results_body(ui: &mut egui::Ui, result: &playback::EvaluationResult) {
     if !result.worst_pitches.is_empty() {
         ui.label(format!("Weakest keys: {}", names(&result.worst_pitches)));
     }
-}
-
-/// A preview-first note-color picker: an always-visible hue spectrum bar with
-/// a live swatch next to it, plus a collapsed "Fine-tune" panel (brightness +
-/// saturation bars). Replaces the stock `color_edit_button_srgb` at both
-/// entry points (config panel and Preferences ▸ Appearance).
-///
-/// The working color lives as `Hsva` in egui temp memory keyed by `id_salt`,
-/// re-derived from `color` only when the stored copy no longer matches it —
-/// the same technique egui's own picker uses internally, avoiding the classic
-/// hue loss when saturation or brightness hits zero (an rgb round-trip at
-/// s == 0 forgets h). A mismatch means the color was edited elsewhere (the
-/// other picker entry point, or the peer-independent prefs reload).
-///
-/// Returns whether the color changed this frame — callers keep their existing
-/// `.changed()`-style `send_color()`/`prefs.save()` logic, and neither the
-/// wire format (`Packet::Color([u8; 3])`) nor `Prefs::local_color` changes.
-fn color_picker_row(ui: &mut egui::Ui, color: &mut [u8; 3], id_salt: &str) -> bool {
-    use egui::ecolor::Hsva;
-    let id = egui::Id::new(("color_picker_row", id_salt));
-    let mut hsva: Hsva = match ui.data(|d| d.get_temp::<(Hsva, [u8; 3])>(id)) {
-        Some((h, rgb)) if rgb == *color => h,
-        _ => Hsva::from(egui::Color32::from_rgb(color[0], color[1], color[2])),
-    };
-
-    let mut changed = false;
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            // Full-strength spectrum for the rail; the swatch next to it
-            // previews the actual working color.
-            changed |= gradient_bar(ui, &mut hsva.h, egui::vec2(140.0, 16.0), false, |t| {
-                Hsva { h: t, s: 1.0, v: 1.0, a: 1.0 }.into()
-            })
-            .on_hover_text("Hue")
-            .changed();
-            egui::color_picker::show_color(
-                ui,
-                egui::Color32::from(hsva),
-                egui::vec2(24.0, 16.0),
-            )
-            .on_hover_text("Current color");
-        });
-        egui::CollapsingHeader::new("Fine-tune")
-            .id_salt(id.with("fine_tune"))
-            .default_open(false)
-            .show(ui, |ui| {
-                let (h, s, v) = (hsva.h, hsva.s, hsva.v);
-                ui.horizontal(|ui| {
-                    // Vertical brightness (value) bar, dark at the bottom…
-                    changed |= gradient_bar(ui, &mut hsva.v, egui::vec2(16.0, 48.0), true, |t| {
-                        Hsva { h, s, v: t, a: 1.0 }.into()
-                    })
-                    .on_hover_text("Brightness")
-                    .changed();
-                    // …next to a horizontal saturation bar.
-                    ui.vertical(|ui| {
-                        ui.label("Saturation");
-                        changed |= gradient_bar(
-                            ui,
-                            &mut hsva.s,
-                            egui::vec2(140.0, 16.0),
-                            false,
-                            |t| Hsva { h, s: t, v, a: 1.0 }.into(),
-                        )
-                        .changed();
-                    });
-                });
-            });
-    });
-
-    if changed {
-        let c = egui::Color32::from(hsva);
-        *color = [c.r(), c.g(), c.b()];
-    }
-    // Stored even when unchanged, so the first-frame derivation (and its
-    // preserved hue) sticks across frames.
-    ui.data_mut(|d| d.insert_temp(id, (hsva, *color)));
-    changed
-}
-
-/// A hand-rolled 1D gradient slider: a mesh strip colored by `color_at` with
-/// a contrast-stroked marker at the current value, draggable/clickable along
-/// its long axis (`vertical` = bottom-to-top). egui 0.29's own
-/// `color_slider_1d` is private, so this reimplements the same look with a
-/// public seam; the response has `changed()` set when the value moved.
-fn gradient_bar(
-    ui: &mut egui::Ui,
-    value: &mut f32,
-    size: egui::Vec2,
-    vertical: bool,
-    color_at: impl Fn(f32) -> egui::Color32,
-) -> egui::Response {
-    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-    if let Some(pos) = response.interact_pointer_pos() {
-        let t = if vertical {
-            egui::remap_clamp(pos.y, rect.bottom()..=rect.top(), 0.0..=1.0)
-        } else {
-            egui::remap_clamp(pos.x, rect.left()..=rect.right(), 0.0..=1.0)
-        };
-        if t != *value {
-            *value = t;
-            response.mark_changed();
-        }
-    }
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        // Gradient fill: a strip of quads, one color stop per step.
-        const STEPS: usize = 32;
-        let mut mesh = egui::Mesh::default();
-        for i in 0..=STEPS {
-            let t = i as f32 / STEPS as f32;
-            let color = color_at(t);
-            let (a, b) = if vertical {
-                let y = egui::lerp(rect.bottom()..=rect.top(), t);
-                (egui::pos2(rect.left(), y), egui::pos2(rect.right(), y))
-            } else {
-                let x = egui::lerp(rect.left()..=rect.right(), t);
-                (egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom()))
-            };
-            mesh.colored_vertex(a, color);
-            mesh.colored_vertex(b, color);
-            if i < STEPS {
-                let i = 2 * i as u32;
-                mesh.add_triangle(i, i + 1, i + 2);
-                mesh.add_triangle(i + 1, i + 2, i + 3);
-            }
-        }
-        painter.add(egui::Shape::mesh(mesh));
-        painter.rect_stroke(rect, 0.0, ui.style().interact(&response).bg_stroke);
-
-        // Marker: a line across the bar at the value, stroked to contrast
-        // with the color under it so it reads on both ends of the gradient.
-        let under = color_at(*value);
-        let lum =
-            0.299 * under.r() as f32 + 0.587 * under.g() as f32 + 0.114 * under.b() as f32;
-        let contrast = if lum > 128.0 { egui::Color32::BLACK } else { egui::Color32::WHITE };
-        let stroke = egui::Stroke::new(2.0, contrast);
-        if vertical {
-            let y = egui::lerp(rect.bottom()..=rect.top(), *value);
-            painter.hline(rect.x_range(), y, stroke);
-        } else {
-            let x = egui::lerp(rect.left()..=rect.right(), *value);
-            painter.vline(x, rect.y_range(), stroke);
-        }
-    }
-    response
 }
 
 /// A Preferences row for a [`prefs::Limit`]: a seconds `DragValue` (greyed but
