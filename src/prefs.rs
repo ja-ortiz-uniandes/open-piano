@@ -46,13 +46,16 @@ impl Limit {
 #[serde(default)]
 pub struct Prefs {
     // ---- Roll & history ----
-    /// Cap on trailing blank paper past the last note (`infinite` = never clamp).
-    pub trailing_blank: Limit,
-    /// Idle time before the clock pauses / a new instance is separated
-    /// (`infinite` = never auto-pause). A truly unbounded gap needs BOTH this
-    /// and `trailing_blank` infinite — a finite idle pause freezes the clock
-    /// when it fires, which itself caps blank paper at the idle length.
+    /// Section-break threshold: idle time before the roll clock pauses and
+    /// the next note starts a new instance (`infinite` = never auto-break).
+    /// Gaps shorter than this show on the paper in full; once crossed, the
+    /// blank tail is trimmed to `section_tail_s`.
     pub idle_pause: Limit,
+    /// Blank paper (s) kept after a section's last note when a break fires.
+    pub section_tail_s: f64,
+    /// Blank paper (s) before the first note of the section that resumes
+    /// after a break.
+    pub section_lead_in_s: f64,
     /// Pixels of paper per second in the roll / falling panels (zoom).
     pub roll_px_per_s: f32,
     /// Seconds a scrolled-back roll view holds before easing home.
@@ -62,6 +65,10 @@ pub struct Prefs {
     /// MIDI input — the mic path has no pedal signal, so the toggle is hidden
     /// and the lane not drawn on the mic fallback.
     pub pedal_lane_visible: bool,
+    /// Minimum change in CC64 level (0..=127) required to register as a new
+    /// pedal position. Filters analog-pedal jitter without losing half-pedal
+    /// nuance. 0 = accept every distinct value (today's behavior).
+    pub pedal_deadzone: u8,
 
     // ---- Appearance ----
     /// This player's note color (sRGB), broadcast to the peer.
@@ -113,6 +120,12 @@ pub struct Prefs {
     /// Last active compact-mode state; only consulted at startup when
     /// `remember_window_state` is true.
     pub compact_mode: bool,
+    /// Last known normal-mode window size, snapshotted on every compact-mode
+    /// entry. Seeds `PianoApp::normal_size` at startup so a session that
+    /// launches directly into compact mode never falls back to a mismatched
+    /// default height. Default `None`; only meaningful with
+    /// `remember_window_state`.
+    pub normal_window_size: Option<[f32; 2]>,
     /// Reload the most recently opened MIDI/JSONL file at startup.
     pub reopen_last_file: bool,
     /// The most recently opened score file; only consulted at startup when
@@ -123,9 +136,6 @@ pub struct Prefs {
 // Defaults mirror the former compile-time constants in roll.rs / main.rs /
 // inference.rs / input.rs. Kept as free fns so `#[serde(default)]` can name them
 // per field and `Default` can reuse them.
-fn default_trailing_blank() -> Limit {
-    Limit::finite(20.0)
-}
 fn default_idle_pause() -> Limit {
     Limit::finite(30.0)
 }
@@ -133,11 +143,13 @@ fn default_idle_pause() -> Limit {
 impl Default for Prefs {
     fn default() -> Self {
         Prefs {
-            trailing_blank: default_trailing_blank(),
             idle_pause: default_idle_pause(),
+            section_tail_s: 2.0,
+            section_lead_in_s: 2.0,
             roll_px_per_s: 40.0,
             scrollback_idle_s: 2.5,
             pedal_lane_visible: false,
+            pedal_deadzone: 0,
             local_color: [220, 60, 60],
             local_name: "Player".to_string(),
             threshold: 0.30,
@@ -153,6 +165,7 @@ impl Default for Prefs {
             midi_poll_ms: 1000,
             remember_window_state: false,
             compact_mode: false,
+            normal_window_size: None,
             reopen_last_file: false,
             last_file_path: None,
         }
@@ -238,8 +251,12 @@ mod tests {
         assert_eq!(parsed.metro_bpm, 120);
         assert_eq!(parsed.metro_beats_per_bar, 4);
         assert_eq!(parsed.metro_beat_freqs, vec![1800.0, 1200.0, 1200.0, 1200.0]);
-        assert!(!parsed.trailing_blank.infinite);
-        assert_eq!(parsed.trailing_blank.secs, 20.0);
+        assert!(!parsed.idle_pause.infinite);
+        assert_eq!(parsed.idle_pause.secs, 30.0);
+        assert_eq!(parsed.section_tail_s, 2.0);
+        assert_eq!(parsed.section_lead_in_s, 2.0);
+        assert_eq!(parsed.pedal_deadzone, 0);
+        assert_eq!(parsed.normal_window_size, None);
     }
 
     #[test]

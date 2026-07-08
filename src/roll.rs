@@ -3,11 +3,12 @@
 //!
 //! The roll is the data behind the paper-roll strip drawn under the keyboard
 //! (see `draw_roll` in main.rs): each key press opens a [`Segment`] at the
-//! current roll time and closes it on release. To keep the data (and the
-//! on-screen paper) bounded, the paper stops scrolling once [`TRAILING_BLANK`]
-//! of blank paper has accrued past the last note, and after [`IDLE_PAUSE`] of
-//! inactivity the clock formally pauses so the next note opens a new "instance"
-//! (separated in the record).
+//! current roll time and closes it on release. Gaps in the playing are shown
+//! faithfully up to a section-break threshold ([`DEFAULT_IDLE_PAUSE`]) of
+//! inactivity; once crossed, the clock formally pauses and the blank tail is
+//! trimmed to [`DEFAULT_SECTION_TAIL`], so the next note opens a new
+//! "instance" (separated in the record) a [`DEFAULT_SECTION_LEAD_IN`] margin
+//! past the boundary — which also bounds the data and the on-screen paper.
 //!
 //! Saving writes an open, universally-readable Standard MIDI File (format 1,
 //! one track per player, separators as SMF marker meta-events) plus a tiny
@@ -21,24 +22,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::note::{midi_to_key_index, NoteMsg, KEY_COUNT};
 
-/// Default idle time (no note on/off from either player, and no key held) after
-/// which the roll clock formally *pauses*: the next note then opens a new
-/// "instance" (a separator in the record). Now a live, per-`Roll` setting
-/// (see [`Roll::set_timing`]) seeded from user preferences; `None` disables the
-/// auto-pause entirely.
+/// Default section-break threshold: idle time (no note on/off from either
+/// player, and no key held) after which the roll clock formally *pauses* —
+/// trimming the blank tail to the section tail — so the next note opens a new
+/// "instance" (a separator in the record). Gaps *shorter* than this are shown
+/// faithfully: a 25 s breath leaves ~25 s of blank paper, because that is how
+/// the phrase was played. A live, per-`Roll` setting (see
+/// [`Roll::set_timing`]) seeded from user preferences; `None` disables the
+/// auto-break entirely.
 const DEFAULT_IDLE_PAUSE: Duration = Duration::from_secs(30);
 
-/// Default cap on blank paper past the last note while idle. Once this much has
-/// accrued the paper stops scrolling (the clock clamps in place rather than
-/// snapping back, so there's no visible jump). Gaps *shorter* than the cap are
-/// shown faithfully — a 10 s pause in the playing leaves ~10 s of blank paper,
-/// because that is how the phrase was played. Now a live, per-`Roll` setting
-/// (see [`Roll::set_timing`]); `None` never clamps.
-///
-/// NOTE: a truly unbounded blank gap requires BOTH this and the idle pause set
-/// to `None`. A finite idle pause freezes the clock when it fires, which itself
-/// caps trailing blank paper at the idle-pause length regardless of this value.
-const DEFAULT_TRAILING_BLANK: Duration = Duration::from_secs(20);
+/// Default blank margin kept after a section's last note when the break
+/// fires: the clock snaps back to last-note + this, trimming the dead air the
+/// threshold let accrue. The same snap trims trailing silence at the very end
+/// of a session. See [`Roll::set_timing`].
+const DEFAULT_SECTION_TAIL: Duration = Duration::from_secs(2);
+
+/// Default blank margin inserted between a section boundary and the first
+/// note of the section that resumes there, so a new section never starts
+/// flush against its separator line. See [`Roll::set_timing`].
+const DEFAULT_SECTION_LEAD_IN: Duration = Duration::from_secs(2);
 
 /// Which player produced a segment. Doubles as an index (0 = local,
 /// 1 = remote) into per-player tables.
@@ -132,14 +135,18 @@ pub struct Roll {
     last_frame: Instant,
     /// Wall time of the last note on/off, for idle detection.
     last_event: Option<Instant>,
-    /// Roll time (`roll_now_s`) at the last note on/off. The idle paper stops
-    /// scrolling once it reaches this plus [`Roll::trailing_blank`].
+    /// Roll time (`roll_now_s`) at the last note on/off. When the break
+    /// fires, the clock snaps back to this plus [`Roll::section_tail`].
     last_event_roll_s: f64,
-    /// Cap on trailing blank paper (`None` = never clamp). See
-    /// [`Roll::set_timing`] and [`DEFAULT_TRAILING_BLANK`].
-    trailing_blank: Option<Duration>,
-    /// Idle window before the clock auto-pauses (`None` = never pause). See
-    /// [`Roll::set_timing`] and [`DEFAULT_IDLE_PAUSE`].
+    /// Blank margin kept after a section's last note when the break fires.
+    /// See [`Roll::set_timing`] and [`DEFAULT_SECTION_TAIL`].
+    section_tail: Duration,
+    /// Blank margin before the first note of a resumed section. See
+    /// [`Roll::set_timing`] and [`DEFAULT_SECTION_LEAD_IN`].
+    section_lead_in: Duration,
+    /// Section-break threshold: idle window before the clock auto-pauses
+    /// (`None` = never break). See [`Roll::set_timing`] and
+    /// [`DEFAULT_IDLE_PAUSE`].
     idle_pause: Option<Duration>,
     /// Starts paused: no paper accumulates before the first note.
     paused: bool,
@@ -162,22 +169,26 @@ impl Roll {
             last_frame: Instant::now(),
             last_event: None,
             last_event_roll_s: 0.0,
-            trailing_blank: Some(DEFAULT_TRAILING_BLANK),
+            section_tail: DEFAULT_SECTION_TAIL,
+            section_lead_in: DEFAULT_SECTION_LEAD_IN,
             idle_pause: Some(DEFAULT_IDLE_PAUSE),
             paused: true,
             dirty: false,
         }
     }
 
-    /// Update the trailing-blank cap and idle-pause threshold live. `None` for
-    /// either means "infinite" (never clamp / never auto-pause). Seeded from
-    /// user preferences at startup and re-applied whenever they change.
-    ///
-    /// A truly unbounded blank gap needs BOTH `None`: a finite idle pause
-    /// freezes the clock when it fires, capping blank paper at the idle length
-    /// no matter how large the trailing-blank cap is.
-    pub fn set_timing(&mut self, trailing_blank: Option<Duration>, idle_pause: Option<Duration>) {
-        self.trailing_blank = trailing_blank;
+    /// Update the section timing live: the tail/lead-in margins and the break
+    /// threshold (`idle_pause`; `None` = never auto-break, one continuous
+    /// instance). Seeded from user preferences at startup and re-applied
+    /// whenever they change.
+    pub fn set_timing(
+        &mut self,
+        section_tail: Duration,
+        section_lead_in: Duration,
+        idle_pause: Option<Duration>,
+    ) {
+        self.section_tail = section_tail;
+        self.section_lead_in = section_lead_in;
         self.idle_pause = idle_pause;
     }
 
@@ -189,22 +200,19 @@ impl Roll {
             // still an extending mark, and the paper must keep moving under it.
             if self.open_count == 0 {
                 if let Some(last) = self.last_event {
-                    // Stop scrolling once the trailing-blank cap of empty paper
-                    // has accrued — clamp in place (no snap) so the live edge
-                    // stays tidy long before the full idle window elapses.
-                    // Skipped entirely when the cap is infinite (`None`).
-                    if let Some(cap_dur) = self.trailing_blank {
-                        let cap = self.last_event_roll_s + cap_dur.as_secs_f64();
-                        if self.roll_now_s > cap {
-                            self.roll_now_s = cap;
-                        }
-                    }
-                    // ...but only mark a full pause (→ new instance on the next
-                    // note) after the longer idle window. Infinite (`None`)
-                    // idle pause never auto-pauses, so play stays one instance.
+                    // Real elapsed time displays faithfully right up to the
+                    // break threshold — a 25 s breath leaves 25 s of paper.
+                    // Once crossed, the clock pauses (→ new instance on the
+                    // next note) and snaps back to the section tail, trimming
+                    // the dead air to a tidy margin. The same snap trims
+                    // trailing silence at the very end of a session — no
+                    // separate "last note" detection needed. Infinite (`None`)
+                    // never auto-breaks, so play stays one instance.
                     if let Some(idle) = self.idle_pause {
                         if now.saturating_duration_since(last) > idle {
                             self.paused = true;
+                            self.roll_now_s =
+                                self.last_event_roll_s + self.section_tail.as_secs_f64();
                         }
                     }
                 }
@@ -228,9 +236,13 @@ impl Roll {
                 if self.paused {
                     self.paused = false;
                     // A resume after a pause starts a new "instance"; the
-                    // very first note of the session gets no separator.
+                    // very first note of the session gets no separator. The
+                    // boundary sits at the tail-trimmed clock (see `tick`);
+                    // the lead-in then pushes this first note a fixed margin
+                    // past the separator line.
                     if !self.segments.is_empty() {
                         self.separators.push(Instance { at: self.roll_now_s, name: None });
+                        self.roll_now_s += self.section_lead_in.as_secs_f64();
                     }
                 }
                 self.open[who.idx()][key] = Some(self.segments.len());
@@ -322,6 +334,15 @@ impl Roll {
 
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
+    }
+
+    /// Whether the roll clock is formally paused — true from the moment the
+    /// section-break threshold fires until the next note resumes it, i.e.
+    /// exactly the "a break will be auto-inserted on the next keypress"
+    /// condition the status indicator renders. (Also true before the first
+    /// note; gate on [`Roll::is_empty`] where that matters.)
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// True when there are notes on the roll that haven't been saved since
@@ -639,80 +660,110 @@ mod tests {
     }
 
     #[test]
-    fn clock_pauses_after_idle_and_separates_instances() {
+    fn clock_pauses_after_threshold_trims_tail_and_separates_instances() {
         let base = Instant::now();
         let mut roll = Roll::new();
-        // Explicit timing so the test is independent of the default values: a
-        // 2 s trailing-blank cap and a 30 s idle pause.
-        roll.set_timing(Some(Duration::from_secs(2)), Some(Duration::from_secs(30)));
+        // Explicit timing so the test is independent of the default values:
+        // 2 s tail, 2 s lead-in, 30 s break threshold.
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
         roll.tick(t(base, 0.0));
         assert_eq!(roll.now_s(), 0.0);
+        assert!(roll.is_paused()); // nothing played yet
 
         // First note: unpauses, no separator.
         roll.note(Who::Local, NoteMsg::On(60, 100), [1, 2, 3]);
+        assert!(!roll.is_paused());
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [1, 2, 3]);
         assert!(roll.separators.is_empty());
         assert_eq!(roll.segments[0].start_s, 0.0);
         assert_eq!(roll.segments[0].end_s, Some(1.0));
 
-        // Idle: the paper stops scrolling after the trailing-blank cap past the
-        // last note (roll time 1.0 + 2.0), not after the full idle pause.
+        // Past the threshold the clock pauses and snaps back to the tail —
+        // trimming the accrued dead air to last note (1.0) + tail (2.0).
         roll.tick(t(base, 40.0));
+        assert!(roll.is_paused());
         let frozen = roll.now_s();
-        assert_eq!(frozen, 3.0); // clamped to last note (1.0) + cap (2.0)...
+        assert_eq!(frozen, 3.0);
         roll.tick(t(base, 100.0));
         assert_eq!(roll.now_s(), frozen); // ...and stays there.
 
-        // Next note resumes and records a separator at the frozen time.
+        // Next note resumes: a separator at the trimmed boundary, and the
+        // lead-in pushes the new instance's first note 2 s past it.
         roll.note(Who::Local, NoteMsg::On(61, 100), [1, 2, 3]);
+        assert!(!roll.is_paused());
         assert_eq!(roll.separators.len(), 1);
         assert_eq!(roll.separators[0].at, frozen);
         assert_eq!(roll.separators[0].name, None);
+        assert_eq!(roll.segments[1].start_s, frozen + 2.0);
         roll.tick(t(base, 101.0));
-        assert_eq!(roll.now_s(), frozen + 1.0);
+        assert_eq!(roll.now_s(), frozen + 2.0 + 1.0);
     }
 
     #[test]
-    fn gap_shorter_than_cap_is_shown_faithfully() {
+    fn gap_shorter_than_threshold_is_shown_faithfully() {
         let base = Instant::now();
         let mut roll = Roll::new();
-        roll.set_timing(Some(Duration::from_secs(20)), Some(Duration::from_secs(30)));
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
         roll.tick(t(base, 0.0));
         roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
-        // A 10 s pause is under the 20 s cap: the full gap stays on the paper.
-        roll.tick(t(base, 11.0));
-        assert_eq!(roll.now_s(), 11.0);
-    }
-
-    #[test]
-    fn infinite_trailing_blank_never_clamps_but_idle_still_caps() {
-        let base = Instant::now();
-        let mut roll = Roll::new();
-        // Trailing blank infinite, idle pause finite at 30 s.
-        roll.set_timing(None, Some(Duration::from_secs(30)));
-        roll.tick(t(base, 0.0));
-        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
-        roll.tick(t(base, 1.0));
-        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
-        // Before the idle pause fires the clock is never clamped: 25 s of gap.
+        // A 25 s pause is under the 30 s threshold: nothing clamps, the full
+        // gap stays on the paper — and the next note joins the same instance.
         roll.tick(t(base, 26.0));
         assert_eq!(roll.now_s(), 26.0);
-        // Past the 30 s idle window the clock pauses — which itself caps the
-        // blank paper wherever the clock was when it paused.
-        roll.tick(t(base, 40.0));
-        let frozen = roll.now_s();
-        roll.tick(t(base, 100.0));
-        assert_eq!(roll.now_s(), frozen);
+        assert!(!roll.is_paused());
+        roll.note(Who::Local, NoteMsg::On(61, 100), [0; 3]);
+        assert!(roll.separators.is_empty());
+        assert_eq!(roll.segments[1].start_s, 26.0);
+    }
+
+    /// The exact worked example the feature was specced against: 30 s
+    /// threshold, 2 s tail, 2 s lead-in, end to end.
+    #[test]
+    fn section_break_end_to_end_threshold_tail_lead_in() {
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
+        // Section 1: a phrase from 0 to 1.
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        // 35 s of silence: past the threshold, so the break is pending and
+        // section 1 ends 2 s (the tail) after its last note.
+        roll.tick(t(base, 36.0));
+        assert!(roll.is_paused());
+        assert_eq!(roll.now_s(), 3.0);
+        // The next keypress inserts the boundary at exactly that trimmed
+        // edge and opens section 2 with its first note 2 s (the lead-in)
+        // past the line. No note's true recorded timestamp moved: only the
+        // silent span between the sections was collapsed.
+        roll.note(Who::Local, NoteMsg::On(62, 100), [0; 3]);
+        assert_eq!(roll.separators.len(), 1);
+        assert_eq!(roll.separators[0].at, 3.0);
+        assert_eq!(roll.segments[1].start_s, 5.0);
+        assert_eq!(roll.current_instance(), 1);
     }
 
     #[test]
-    fn both_infinite_gives_an_unbounded_gap_and_no_separators() {
+    fn infinite_threshold_gives_an_unbounded_gap_and_no_separators() {
         let base = Instant::now();
         let mut roll = Roll::new();
-        roll.set_timing(None, None);
+        roll.set_timing(Duration::from_secs(2), Duration::from_secs(2), None);
         roll.tick(t(base, 0.0));
         roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
@@ -759,25 +810,29 @@ mod tests {
     fn pedal_never_resets_the_idle_timer() {
         let base = Instant::now();
         let mut roll = Roll::new();
-        roll.set_timing(Some(Duration::from_secs(2)), Some(Duration::from_secs(30)));
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
         roll.tick(t(base, 0.0));
         roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
         roll.tick(t(base, 1.0));
         roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
 
-        // Pump the pedal across (and far past) the idle window with no note
-        // on/off: the clock must clamp at last-note + trailing-blank and then
-        // formally pause on schedule, exactly as if the pedal were untouched
-        // (compare `clock_pauses_after_idle_and_separates_instances`).
+        // Pump the pedal across (and far past) the break threshold with no
+        // note on/off: the clock must pause on schedule and trim to
+        // last-note + tail, exactly as if the pedal were untouched (compare
+        // `clock_pauses_after_threshold_trims_tail_and_separates_instances`).
         for (at, level) in [(5.0, 127u8), (10.0, 64), (20.0, 0), (40.0, 96)] {
             roll.tick(t(base, at));
             roll.pedal(Who::Local, level);
         }
         roll.tick(t(base, 100.0));
-        assert_eq!(roll.now_s(), 3.0); // clamped: last note (1.0) + cap (2.0)
+        assert_eq!(roll.now_s(), 3.0); // trimmed: last note (1.0) + tail (2.0)
 
         // The pause fired despite the pedal traffic: the next *note* opens a
-        // new instance with a separator at the frozen time.
+        // new instance with a separator at the trimmed boundary.
         roll.note(Who::Local, NoteMsg::On(61, 100), [0; 3]);
         assert_eq!(roll.separators.len(), 1);
         assert_eq!(roll.separators[0].at, 3.0);

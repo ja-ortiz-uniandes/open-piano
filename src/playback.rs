@@ -14,9 +14,12 @@
 //!   between note onsets, freeze exactly at the next practiced onset until
 //!   the required notes are struck, then continue — releasing early is fine.
 //!
-//! **Evaluation**: one chosen track goes silent and the playhead *never*
-//! gates — a full, non-stopping playthrough is scored live against the score
-//! ([`EvaluationState`]), then the engine flips itself into
+//! **Evaluation**: one chosen track goes silent and the playhead free-runs —
+//! a full playthrough is scored live against the score ([`EvaluationState`]).
+//! The optional pause-on-miss setting is the one exception to the free run:
+//! it freezes the playhead at a missed note's tolerance-window edge until the
+//! note is struck (the frozen time is reported on the result card). Either
+//! way, when the take ends the engine flips itself into
 //! **EvaluationReview**: a passive Listen-like replay of a synthetic
 //! two-track score — the original part next to what was actually played —
 //! with per-side show/hear toggles ([`ReviewSettings`]). Review is never a
@@ -164,6 +167,10 @@ pub struct EvaluationSettings {
     /// ever judged at the instant of a required note's press — never
     /// free-floating during gaps.
     pub evaluate_pedal: bool,
+    /// Freeze the playhead at a missed note's tolerance-window edge until the
+    /// note is actually struck, instead of scoring it a miss and moving on.
+    /// The time spent frozen is reported on the take's result card.
+    pub pause_on_miss: bool,
 }
 
 /// Per-side toggles for [`Mode::EvaluationReview`]: one flag per track drives
@@ -261,15 +268,43 @@ struct EvaluationState {
     open_played: [Option<usize>; 128],
     /// Last frame's held set, to diff for releases.
     prev_held: BTreeSet<u8>,
+    // -- pause-on-miss bookkeeping (see `record_pause`) --
+    /// Wall-clock seconds spent frozen waiting for missed notes.
+    paused_time_s: f64,
+    /// How many distinct freezes occurred (edge-counted via `was_paused`).
+    pause_count: u32,
+    was_paused: bool,
     // -- frozen at take start --
     score_velocity: bool,
     score_pedal: bool,
+    pause_on_miss: bool,
     window_s: f64,
     force_tol: f32,
     pedal_tol: f32,
 }
 
 impl EvaluationState {
+    /// Playhead position at which the earliest pending note's tolerance window
+    /// closes — mirrors the expiry-sweep condition in [`Self::record_frame`].
+    /// `pending` is in score order and `window_s` is constant for the take, so
+    /// checking only the front suffices.
+    fn next_expiry_s(&self) -> Option<f64> {
+        self.pending.front().map(|&i| self.required[i].start_s + self.window_s)
+    }
+
+    /// Per-frame pause bookkeeping for the pause-on-miss gate: total frozen
+    /// time (wall-clock, deliberately not scaled by speed — it's how long the
+    /// *player* sat waiting) and an edge-counted number of distinct freezes.
+    fn record_pause(&mut self, held_back: bool, dt_s: f64) {
+        if held_back {
+            if !self.was_paused {
+                self.pause_count += 1;
+            }
+            self.paused_time_s += dt_s;
+        }
+        self.was_paused = held_back;
+    }
+
     /// Feed one frame of live input. `playhead_s` is the post-advance
     /// playhead; `onsets` are this frame's note-ons as `(midi, velocity)`.
     fn record_frame(
@@ -393,6 +428,10 @@ impl EvaluationState {
         self.played_notes.clear();
         self.open_played = [None; 128];
         self.prev_held.clear();
+        // Pause history is per-take too — a scrub must not leak it forward.
+        self.paused_time_s = 0.0;
+        self.pause_count = 0;
+        self.was_paused = false;
     }
 
     /// Crunch the judged take into the displayed breakdown.
@@ -498,6 +537,11 @@ impl EvaluationState {
             extra_hotspot,
             missed_count,
             matched_count: self.judged.len() - missed_count,
+            // The frozen per-take flag is exactly "was this setting active for
+            // this completed take" — `None` (setting off) omits the line.
+            pause_stats: self
+                .pause_on_miss
+                .then(|| PauseStats { total_s: self.paused_time_s, count: self.pause_count }),
         }
     }
 }
@@ -505,6 +549,14 @@ impl EvaluationState {
 pub struct PitchStats {
     pub attempts: u32,
     pub avg_score: f32,
+}
+
+/// How long (and how often) the pause-on-miss gate froze the take.
+pub struct PauseStats {
+    /// Total wall-clock seconds spent frozen.
+    pub total_s: f64,
+    /// Number of distinct freezes.
+    pub count: u32,
 }
 
 /// The finished take's breakdown, shown in the results window and the review
@@ -528,6 +580,9 @@ pub struct EvaluationResult {
     pub extra_hotspot: Option<u8>,
     pub missed_count: usize,
     pub matched_count: usize,
+    /// Pause-on-miss summary; `None` when the setting was off for the take
+    /// (the UI omits the line, same convention as the accuracies above).
+    pub pause_stats: Option<PauseStats>,
 }
 
 pub struct PlaybackEngine {
@@ -585,6 +640,7 @@ impl PlaybackEngine {
                 strictness: Strictness::Normal,
                 evaluate_velocity: false,
                 evaluate_pedal: false,
+                pause_on_miss: false,
             },
             review: ReviewSettings::default(),
             eval_state: None,
@@ -781,10 +837,22 @@ impl PlaybackEngine {
         self.finished = self.playhead_s >= self.score.duration_s;
     }
 
-    /// The Evaluation frame: **always free-runs** — the playhead is never
-    /// gated on what's played (the take must not stop) — then feeds the
+    /// The Evaluation frame: free-runs by default — the playhead is not gated
+    /// on what's played — except that with `pause_on_miss` on, the advance is
+    /// clamped at the earliest pending note's tolerance-window edge, so a
+    /// missed note freezes the take until it's actually struck. Then feeds the
     /// frame's live input to the scorer. On the finished edge the take
     /// finalizes and the engine flips itself into review.
+    ///
+    /// The clamp lands *exactly* on `start_s + window_s`: the expiry sweep's
+    /// strict `<` never fires there (the note stays pending indefinitely)
+    /// while the match condition's `<=` still accepts a press, so once the
+    /// note is hit and popped, `next_expiry_s` moves to the next note (or
+    /// `None`) and the take free-runs again — no separate resume path. A
+    /// wrong-pitch press while frozen just becomes an `ExtraPress` as usual.
+    /// `want` is capped at `duration_s` first, so a final note whose window
+    /// straddles the end never holds the take back (it finishes and the note
+    /// is missed, exactly as in free-run).
     fn evaluation_advance(
         &mut self,
         dt_s: f64,
@@ -793,10 +861,21 @@ impl PlaybackEngine {
         pedal_level: u8,
     ) {
         // `tick` only dispatches here while !finished, so `self.finished`
-        // turning true below IS the finished edge.
-        self.advance(dt_s);
+        // turning true below IS the finished edge. By construction that edge
+        // and `held_back` are mutually exclusive — a take never finalizes
+        // mid-pause.
+        let want = (self.playhead_s + dt_s * self.speed as f64).min(self.score.duration_s);
+        let gate = self
+            .eval_state
+            .as_ref()
+            .filter(|s| s.pause_on_miss)
+            .and_then(EvaluationState::next_expiry_s);
+        let held_back = gate.is_some_and(|g| g < want);
+        self.playhead_s = if held_back { gate.unwrap() } else { want };
+        self.finished = self.playhead_s >= self.score.duration_s;
         let playhead_s = self.playhead_s;
         if let Some(state) = &mut self.eval_state {
+            state.record_pause(held_back, dt_s);
             state.record_frame(playhead_s, held, onsets, pedal_level);
         }
         if self.finished {
@@ -880,8 +959,12 @@ impl PlaybackEngine {
             played_notes: Vec::new(),
             open_played: [None; 128],
             prev_held: BTreeSet::new(),
+            paused_time_s: 0.0,
+            pause_count: 0,
+            was_paused: false,
             score_velocity: self.eval.evaluate_velocity && live_midi,
             score_pedal,
+            pause_on_miss: self.eval.pause_on_miss,
             window_s,
             force_tol,
             pedal_tol,
@@ -1285,6 +1368,7 @@ mod tests {
 
         let r = pb.eval_result.as_ref().expect("result must exist in review");
         assert_eq!((r.matched_count, r.missed_count, r.extra_press_count), (1, 2, 1));
+        assert!(r.pause_stats.is_none(), "pause-on-miss off -> no pause line");
         // 60 was matched with |delta| ~0 and no velocity/pedal dimensions on:
         // 1.0 point, minus the extra-press penalty, over 3 required notes.
         let expect = 100.0 * (1.0 - EXTRA_PENALTY_WEIGHT) / 3.0;
@@ -1339,6 +1423,114 @@ mod tests {
         let r = pb.eval_result.as_ref().unwrap();
         assert_eq!(r.velocity_accuracy, None);
         assert_eq!(r.pedal_accuracy, None);
+    }
+
+    /// The exact-representable tolerances the pause-on-miss tests use, so the
+    /// gate boundary (note start + 0.5) is a clean float the assertions can
+    /// compare against directly.
+    fn half_second_window() -> Strictness {
+        Strictness::Custom {
+            temporal_tolerance_s: 0.5,
+            force_tolerance: 0.5,
+            pedal_tolerance: 0.75,
+        }
+    }
+
+    #[test]
+    fn pause_on_miss_freezes_at_the_window_edge_and_resumes_on_the_hit() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.eval.strictness = half_second_window();
+        pb.eval.pause_on_miss = true;
+        pb.start_evaluation(true, &synth);
+
+        // Never play note 60 (start 1.0): the playhead must clamp exactly at
+        // its window edge (1.5) and hold, however long we keep ticking.
+        for _ in 0..40 {
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
+            assert!(pb.playhead_s <= 1.5, "ran past the gate: {}", pb.playhead_s);
+        }
+        assert_eq!(pb.playhead_s, 1.5);
+        assert!(matches!(pb.mode, Mode::Evaluation), "gated take must not finish");
+
+        // A wrong-pitch press while frozen: still frozen, still an extra.
+        pb.tick(0.1, &held(&[99]), &[(99, 90)], 0, &synth);
+        assert_eq!(pb.playhead_s, 1.5);
+
+        // The late hit lands exactly on the window edge (`<=` matches where
+        // the expiry sweep's `<` never fires). The hit frame itself is still
+        // clamped — matching happens after the advance — and the gate then
+        // releases on the next frame.
+        pb.tick(0.1, &held(&[60]), &[(60, 80)], 0, &synth);
+        assert_eq!(pb.playhead_s, 1.5);
+        pb.tick(0.1, &held(&[]), &[], 0, &synth);
+        assert!(pb.playhead_s > 1.5, "gate must release after the hit");
+
+        // Play the chord on time so the rest of the take free-runs out.
+        let mut fired = false;
+        for _ in 0..200 {
+            if !matches!(pb.mode, Mode::Evaluation) {
+                break;
+            }
+            let fire = !fired && pb.playhead_s >= 3.0;
+            fired |= fire;
+            let onsets: &[(u8, u8)] = if fire { &[(62, 80), (64, 80)] } else { &[] };
+            pb.tick(0.1, &held(&[]), onsets, 0, &synth);
+        }
+        assert!(matches!(pb.mode, Mode::EvaluationReview));
+
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!((r.matched_count, r.missed_count, r.extra_press_count), (3, 0, 1));
+        let p = r.pause_stats.as_ref().expect("setting on -> stats present");
+        assert!(p.total_s > 0.0, "frozen time must be reported");
+        assert_eq!(p.count, 1, "one continuous freeze, edge-counted once");
+    }
+
+    #[test]
+    fn evaluation_jump_mid_pause_resets_pause_stats() {
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.eval.strictness = half_second_window();
+        pb.eval.pause_on_miss = true;
+        pb.start_evaluation(true, &synth);
+
+        // Run into the first gate and accumulate some frozen time.
+        for _ in 0..30 {
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
+        }
+        assert_eq!(pb.playhead_s, 1.5);
+
+        // Scrub mid-pause: the take restarts from the top.
+        pb.jump_to(4.0, &synth);
+        assert_eq!(pb.playhead_s, 0.0);
+
+        // Perfect take this time — every note on time, no freezes — so the
+        // restarted take's stats must be clean: the pre-jump pause history
+        // did not survive the restart.
+        let (mut fired_note, mut fired_chord) = (false, false);
+        for _ in 0..200 {
+            if !matches!(pb.mode, Mode::Evaluation) {
+                break;
+            }
+            let (fire_note, fire_chord) =
+                (!fired_note && pb.playhead_s >= 1.0, !fired_chord && pb.playhead_s >= 3.0);
+            fired_note |= fire_note;
+            fired_chord |= fire_chord;
+            let onsets: &[(u8, u8)] = if fire_note {
+                &[(60, 80)]
+            } else if fire_chord {
+                &[(62, 80), (64, 80)]
+            } else {
+                &[]
+            };
+            pb.tick(0.1, &held(&[]), onsets, 0, &synth);
+        }
+        assert!(matches!(pb.mode, Mode::EvaluationReview));
+
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!(r.missed_count, 0);
+        let p = r.pause_stats.as_ref().expect("setting on -> stats present");
+        assert_eq!((p.count, p.total_s), (0, 0.0), "pause history leaked through restart");
     }
 
     #[test]

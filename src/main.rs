@@ -250,6 +250,48 @@ impl Metronome {
     }
 }
 
+/// Which page of the Preferences dialog is showing — drives the sidebar
+/// navigation (see `PianoApp::preferences_window`). Pure UI-nav state,
+/// deliberately not persisted.
+#[derive(Clone, Copy, PartialEq)]
+enum PrefsSection {
+    StartupWindow,
+    RollHistory,
+    Appearance,
+    Pedal,
+    RollBehavior,
+    AudioMic,
+    Metronome,
+    Advanced,
+}
+
+impl PrefsSection {
+    /// Sidebar order.
+    const ALL: [PrefsSection; 8] = [
+        PrefsSection::StartupWindow,
+        PrefsSection::RollHistory,
+        PrefsSection::Appearance,
+        PrefsSection::Pedal,
+        PrefsSection::RollBehavior,
+        PrefsSection::AudioMic,
+        PrefsSection::Metronome,
+        PrefsSection::Advanced,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            PrefsSection::StartupWindow => "Startup & window",
+            PrefsSection::RollHistory => "Roll & history",
+            PrefsSection::Appearance => "Appearance",
+            PrefsSection::Pedal => "Pedal",
+            PrefsSection::RollBehavior => "Roll behavior",
+            PrefsSection::AudioMic => "Audio / mic",
+            PrefsSection::Metronome => "Metronome",
+            PrefsSection::Advanced => "Advanced",
+        }
+    }
+}
+
 struct PianoApp {
     // --- note input (MIDI or microphone fallback) ---
     input: InputEngine,
@@ -355,6 +397,8 @@ struct PianoApp {
     prefs: prefs::Prefs,
     // Whether the Preferences window is open.
     show_prefs: bool,
+    // Which Preferences tab the sidebar has selected.
+    prefs_section: PrefsSection,
 
     // --- piano-roll history (see roll.rs + draw_roll) ---
     roll: roll::Roll,
@@ -401,12 +445,13 @@ struct PianoApp {
     // user *intent*, toggled by the title-bar button and persisted when
     // "Remember window state" is on.
     compact_mode: bool,
-    // Window size to restore to when leaving compact mode, snapshotted on entry.
+    // Window size to restore to when leaving compact mode, snapshotted on
+    // entry (and persisted via `prefs.normal_window_size`, which also seeds it
+    // at startup when the app launches already compact).
     normal_size: Option<egui::Vec2>,
     // What's actually been applied to the OS window right now. Reconciled once
-    // per frame against `compact_mode && !show_prefs` (see
-    // `sync_compact_viewport`), so resizes fire only on real transitions and
-    // opening Preferences transparently un-shrinks the window.
+    // per frame against `compact_mode` (see `sync_compact_viewport`), so
+    // resizes fire only on real transitions.
     compact_applied: bool,
     // Whether the Learn side panel is expanded ("‹"/"›" arrows). Preserved
     // across Learn-mode exits, so re-entering restores the last choice.
@@ -448,7 +493,11 @@ impl PianoApp {
             prefs.midi_poll_ms,
         );
         let mut roll = roll::Roll::new();
-        roll.set_timing(prefs.trailing_blank.as_duration(), prefs.idle_pause.as_duration());
+        roll.set_timing(
+            Duration::from_secs_f64(prefs.section_tail_s.max(0.0)),
+            Duration::from_secs_f64(prefs.section_lead_in_s.max(0.0)),
+            prefs.idle_pause.as_duration(),
+        );
         let mut metro = Metronome::new(prefs.metro_bpm);
         metro.beats_per_bar = prefs.metro_beats_per_bar;
         metro.beat_freqs = prefs.metro_beat_freqs.clone();
@@ -458,6 +507,11 @@ impl PianoApp {
         // to `compact_mode` — seeding `false` would make frame 1 see a spurious
         // transition and snapshot the already-compact rect as "normal".
         let compact_mode = prefs.remember_window_state && prefs.compact_mode;
+        // Seed the normal-size restore target from the last session, so a
+        // launch directly into compact mode still knows what "normal" is —
+        // without this, leaving compact fell back to the default height while
+        // keeping the live width (the disproportionate-window bug).
+        let normal_size = prefs.normal_window_size.map(|[w, h]| egui::vec2(w, h));
         let reopen_path = prefs
             .reopen_last_file
             .then(|| prefs.last_file_path.clone())
@@ -501,6 +555,7 @@ impl PianoApp {
             show_about: false,
             prefs,
             show_prefs: false,
+            prefs_section: PrefsSection::StartupWindow,
             roll,
             scrollback: None,
             scrollback_idle_since: None,
@@ -517,7 +572,7 @@ impl PianoApp {
             segment_row_visible: true,
             config_collapsed: false,
             compact_mode,
-            normal_size: None,
+            normal_size,
             compact_applied: compact_mode,
             learn_panel_expanded: true,
             evaluation_panel_expanded: true,
@@ -683,6 +738,20 @@ impl PianoApp {
         // path: `Roll::pedal` must not reset the roll's idle timer.
         while let Ok(level) = self.input.pedal.try_recv() {
             if level == self.local_pedal {
+                continue;
+            }
+            // Sensitivity deadzone (`prefs.pedal_deadzone`): mid-travel wiggles
+            // smaller than the threshold don't register, settling jittery
+            // analog pedals without discarding deliberate half-pedal moves.
+            // Transitions to/from fully released always pass — eating a span's
+            // open/close edge would leave the pedal stuck down. Local capture
+            // only: remote levels arrive already filtered by the peer's own
+            // deadzone, like the other per-player capture tunables.
+            let deadzone = self.prefs.pedal_deadzone as i16;
+            if level != 0
+                && self.local_pedal != 0
+                && (level as i16 - self.local_pedal as i16).abs() < deadzone
+            {
                 continue;
             }
             self.local_pedal = level;
@@ -1699,7 +1768,7 @@ impl PianoApp {
                 self.prefs.save();
             }
             ui.label("My color:");
-            if ui.color_edit_button_srgb(&mut self.local_color).changed() {
+            if color_picker_row(ui, &mut self.local_color, "config_bar") {
                 // Push the change immediately; the heartbeat covers the rest.
                 self.send_color();
                 // Persist as the new default color.
@@ -2170,13 +2239,12 @@ impl PianoApp {
 
     /// Reconcile the OS window against compact-mode intent, once per frame.
     /// `compact_applied` tracks what's actually been sent to the window, so a
-    /// resize fires only on real transitions — and because the *wanted* state
-    /// folds in `show_prefs`, opening Preferences while compact transparently
-    /// restores normal size (its content is far taller than a compact window)
-    /// and closing it re-shrinks. If other dialogs ever prove too cramped,
-    /// extend `want_compact`'s condition the same way.
+    /// resize fires only on real transitions. Dialogs (Preferences included)
+    /// simply float over a still-compact main window — its own scroll area
+    /// degrades gracefully in a short pane, and the ever-present
+    /// `resize_handles` let the user drag the window taller if they want.
     fn sync_compact_viewport(&mut self, ctx: &egui::Context) {
-        let want_compact = self.compact_mode && !self.show_prefs;
+        let want_compact = self.compact_mode;
         if want_compact == self.compact_applied {
             return;
         }
@@ -2193,6 +2261,12 @@ impl PianoApp {
     fn apply_compact_size(&mut self, ctx: &egui::Context) {
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             self.normal_size = Some(rect.size());
+            // Same opt-in policy as `compact_mode` itself: only persisted when
+            // the user asked for window state to be remembered.
+            if self.prefs.remember_window_state {
+                self.prefs.normal_window_size = Some([rect.size().x, rect.size().y]);
+                self.prefs.save();
+            }
         }
         let width = self.normal_size.map_or(DEFAULT_WINDOW_SIZE[0], |s| s.x);
         ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(COMPACT_MIN_SIZE.into()));
@@ -2232,11 +2306,13 @@ impl PianoApp {
         });
     }
 
-    /// Edit ▸ Preferences: every persisted tunable (see prefs.rs), grouped.
+    /// Edit ▸ Preferences: every persisted tunable (see prefs.rs), grouped
+    /// into sidebar-navigated tabs (one `prefs_*_section` method per page).
     /// Each widget applies its change live to the relevant consumer and, if
     /// anything changed this frame, saves the prefs file (a tiny atomic write).
-    /// Advanced knobs that can degrade mic detection sit behind a collapsed
-    /// expander with a Reset button.
+    /// The dialog is a floating, movable, resizable window: position/size are
+    /// remembered by egui's per-window memory for the session (this app
+    /// doesn't enable eframe persistence, so they reset on relaunch).
     fn preferences_window(&mut self, ctx: &egui::Context) {
         if !self.show_prefs {
             return;
@@ -2248,405 +2324,61 @@ impl PianoApp {
         egui::Window::new("Preferences")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(560.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(true)
+            .default_size([700.0, 520.0])
+            .min_size([560.0, 320.0])
+            // A default only — unlike the `.anchor(...)` this replaces, which
+            // re-asserted center every frame and snapped any drag straight
+            // back. From here on egui's own window memory owns position.
+            .default_pos(ctx.screen_rect().center() - egui::vec2(350.0, 260.0))
             .show(ctx, |ui| {
-                // Re-assert the width every frame: egui persists per-Id Resize
-                // memory, so `default_width` alone only applies on the very
-                // first show.
-                ui.set_min_width(520.0);
-                // Cap the section body to the viewport height (minus a reserve
-                // for chrome/margins) and scroll it — otherwise a tall dialog
-                // on a short window pushes its own title bar off-screen.
-                let max_h = (ui.ctx().screen_rect().height() - 200.0).clamp(240.0, 640.0);
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .max_height(max_h)
-                    .show(ui, |ui| {
-                        // ---- Startup & window ----
-                        ui.heading("Startup & window");
-                        if ui
-                            .checkbox(&mut self.prefs.remember_window_state, "Remember window state")
-                            .on_hover_text("Restore compact/normal window mode from your last session")
-                            .changed()
-                        {
-                            if self.prefs.remember_window_state {
-                                // Capture the current state immediately — otherwise it
-                                // only persists on the next toggle.
-                                self.prefs.compact_mode = self.compact_mode;
-                            }
-                            changed = true;
-                        }
-                        if ui
-                            .checkbox(&mut self.prefs.reopen_last_file, "Reopen last file on launch")
-                            .on_hover_text("Reload the most recently opened MIDI/JSONL file at startup")
-                            .changed()
-                        {
-                            self.prefs.last_file_path = if self.prefs.reopen_last_file {
-                                // Capture the currently-open file immediately, if any.
-                                self.playback.as_ref().map(|pb| pb.source_path.clone())
-                            } else {
-                                None // don't keep a stale path once the feature is off
-                            };
-                            changed = true;
-                        }
-
-                        ui.add_space(8.0);
-                        ui.separator();
-
-                        // ---- Roll & history ----
-                        ui.heading("Roll & history");
-                        changed |= limit_row(
-                            ui,
-                            "Trailing blank",
-                            &mut self.prefs.trailing_blank,
-                            "Cap on blank paper kept past the last note. Shorter gaps show in \
-                             full; longer gaps clamp here. ∞ = never clamp — but a truly \
-                             unbounded gap also needs Idle pause set to ∞.",
-                        );
-                        changed |= limit_row(
-                            ui,
-                            "Idle pause",
-                            &mut self.prefs.idle_pause,
-                            "Silence before the roll clock pauses, so the next note starts a \
-                             new instance. ∞ = never auto-pause (one continuous instance).",
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label("Roll zoom (px/s):");
-                            changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut self.prefs.roll_px_per_s)
-                                        .range(8.0..=200.0)
-                                        .speed(1.0),
-                                )
-                                .on_hover_text("Vertical scale of the history + falling-note strips")
-                                    .changed();
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Scrollback hold (s):");
-                            changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut self.prefs.scrollback_idle_s)
-                                        .range(0.0..=30.0)
-                                        .speed(0.1),
-                                )
-                                .on_hover_text("How long a scrolled-back view holds before easing to live")
-                                .changed();
-                        });
-                        // Only rendered (not merely disabled) with a MIDI source:
-                        // the mic path has no pedal signal at all.
-                        if self.input.source() == Source::Midi {
-                            changed |= ui
-                                .checkbox(&mut self.prefs.pedal_lane_visible, "Show pedal lane")
-                                .on_hover_text(
-                                    "Draw sustain-pedal (CC64) activity as a slim strip at the \
-                                     roll's left edge, tinted by pedal depth",
-                                )
-                                .changed();
-                        }
-
-                        ui.add_space(8.0);
-                        ui.separator();
-
-                        // ---- Appearance ----
-                        ui.heading("Appearance");
-                        ui.horizontal(|ui| {
-                            ui.label("My display name:");
+                egui::SidePanel::left("prefs_nav")
+                    .resizable(false)
+                    .exact_width(150.0)
+                    .show_inside(ui, |ui| {
+                        for section in PrefsSection::ALL {
                             if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.prefs.local_name)
-                                        .desired_width(160.0),
-                                )
-                                .changed()
+                                .selectable_label(self.prefs_section == section, section.label())
+                                .clicked()
                             {
-                                self.local_name = self.prefs.local_name.clone();
-                                self.send_name();
-                                changed = true;
+                                self.prefs_section = section;
                             }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("My note color:");
-                            if ui.color_edit_button_srgb(&mut self.prefs.local_color).changed() {
-                                self.local_color = self.prefs.local_color;
-                                self.send_color();
-                                changed = true;
-                            }
-                        });
-
-                        ui.add_space(8.0);
-                        ui.separator();
-
-                        // ---- Audio / mic ----
-                        ui.heading("Audio / mic");
-                        ui.horizontal(|ui| {
-                            ui.label("Detection threshold:");
-                            if ui
-                                .add(egui::Slider::new(&mut self.prefs.threshold, 0.05..=0.95).step_by(0.01))
-                                .on_hover_text("Mic sensitivity: lower detects quieter notes (more noise)")
-                                .changed()
-                            {
-                                self.threshold = self.prefs.threshold;
-                                self.input.threshold.set(self.prefs.threshold);
-                                changed = true;
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Echo hold-off (ms):");
-                            changed |= ui
-                                .add(
-                                    egui::DragValue::new(&mut self.prefs.echo_holdoff_ms)
-                                        .range(0..=10_000)
-                                        .speed(50.0),
-                                )
-                                .on_hover_text(
-                                    "How long after the synth stops a note the mic keeps ignoring \
-                                     that note (stops the speaker→mic echo loop)",
-                                )
-                                .changed();
-                        });
-                        if ui
-                            .checkbox(&mut self.prefs.mic_muted, "Mute mic by default")
-                            .changed()
-                        {
-                            self.mic_muted = self.prefs.mic_muted;
-                            changed = true;
                         }
-
-                        ui.add_space(8.0);
-                        ui.separator();
-
-                        // ---- Metronome ----
-                        ui.heading("Metronome");
-                        ui.horizontal(|ui| {
-                            ui.label("Beats per bar:");
-                            let mut bpb = self.prefs.metro_beats_per_bar;
-                            if ui.add(egui::DragValue::new(&mut bpb).range(1..=12)).changed() {
-                                bpb = bpb.max(1);
-                                self.prefs.metro_beats_per_bar = bpb;
-                                resize_beat_table(&mut self.prefs.metro_beat_freqs, bpb as usize, 1200.0);
-                                resize_beat_table(&mut self.prefs.metro_beat_volumes, bpb as usize, 1.0);
-                                self.metro.beats_per_bar = bpb;
-                                self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
-                                self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
-                                self.metro.next_beat_in_bar %= bpb;
-                                self.send_metro_table();
-                                changed = true;
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Pitch and level of each beat's click, synced with the peer so both \
-                                 sides sound identical. The first slider quick-picks a common pitch; \
-                                 fine-tune with the Hz field next to it.",
-                            )
-                            .weak(),
-                        );
-                        for i in 0..self.prefs.metro_beat_freqs.len() {
-                            let is_accent = i == 0;
-                            egui::Frame::none()
-                                .fill(if is_accent {
-                                    ui.visuals().faint_bg_color
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                })
-                                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
-                                .rounding(egui::Rounding::same(4.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        // Fixed-width label column so the controls line up across
-                                        // rows regardless of the accent's extra sub-label or the
-                                        // Hz field's digit count.
-                                        ui.allocate_ui(egui::vec2(76.0, 0.0), |ui| {
-                                            ui.vertical(|ui| {
-                                                ui.label(format!("Beat {}", i + 1));
-                                                if is_accent {
-                                                    ui.label(egui::RichText::new("accent").small().weak());
-                                                }
-                                            });
-                                        });
-
-                                        // Quick-pick slider: snaps the Hz field to a common preset.
-                                        // Widths below are pinned via `ui.spacing_mut()` (egui 0.29 has
-                                        // no per-widget `desired_width` on Slider/DragValue) so a beat
-                                        // with more Hz digits doesn't push its neighbors out of column.
-                                        let freq = self.prefs.metro_beat_freqs[i];
-                                        let mut preset = METRO_FREQ_PRESETS
-                                            .iter()
-                                            .enumerate()
-                                            .min_by(|(_, a), (_, b)| {
-                                                (**a - freq).abs().total_cmp(&(**b - freq).abs())
-                                            })
-                                            .map(|(idx, _)| idx)
-                                            .unwrap_or(0);
-                                        ui.spacing_mut().slider_width = 56.0;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut preset, 0..=METRO_FREQ_PRESETS.len() - 1)
-                                                    .show_value(false),
-                                            )
-                                            .on_hover_text("Quick-pick a common click pitch")
-                                            .changed()
-                                        {
-                                            self.prefs.metro_beat_freqs[i] = METRO_FREQ_PRESETS[preset];
-                                            self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
-                                            self.send_metro_table();
-                                            changed = true;
-                                        }
-
-                                        ui.spacing_mut().interact_size.x = 64.0;
-                                        if ui
-                                            .add(
-                                                egui::DragValue::new(&mut self.prefs.metro_beat_freqs[i])
-                                                    .range(100.0..=4000.0)
-                                                    .speed(5.0)
-                                                    .suffix(" Hz"),
-                                            )
-                                            .changed()
-                                        {
-                                            self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
-                                            self.send_metro_table();
-                                            changed = true;
-                                        }
-
-                                        ui.separator();
-                                        ui.spacing_mut().slider_width = 80.0;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut self.prefs.metro_beat_volumes[i], 0.0..=1.0)
-                                                    .show_value(false)
-                                                    .text("volume"),
-                                            )
-                                            .changed()
-                                        {
-                                            self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
-                                            self.send_metro_table();
-                                            changed = true;
-                                        }
-                                    });
-                                });
-                        }
-                        if ui.button("Reset metronome to defaults").clicked() {
-                            let d = prefs::Prefs::default();
-                            self.prefs.metro_beats_per_bar = d.metro_beats_per_bar;
-                            self.prefs.metro_beat_freqs = d.metro_beat_freqs.clone();
-                            self.prefs.metro_beat_volumes = d.metro_beat_volumes.clone();
-                            self.metro.beats_per_bar = d.metro_beats_per_bar;
-                            self.metro.beat_freqs = d.metro_beat_freqs;
-                            self.metro.beat_volumes = d.metro_beat_volumes;
-                            self.metro.next_beat_in_bar %= self.metro.beats_per_bar.max(1);
-                            self.send_metro_table();
-                            changed = true;
-                        }
-
-                        ui.add_space(8.0);
-                        ui.separator();
-
-                        // ---- Advanced (model / network) ----
-                        egui::CollapsingHeader::new("Advanced")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "These affect mic transcription directly — bad values can \
-                                         stop notes being detected. Defaults suit most rooms.",
-                                    )
-                                    .weak(),
-                                );
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Silence RMS:");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut self.prefs.silence_rms)
-                                                .range(0.0..=0.05)
-                                                .speed(0.0002)
-                                                .fixed_decimals(4),
-                                        )
-                                        .on_hover_text("Below this raw mic level a window is treated as silence")
-                                        .changed()
-                                    {
-                                        self.input.tunables.silence_rms.set(self.prefs.silence_rms);
-                                        changed = true;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Norm max gain:");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut self.prefs.norm_max_gain)
-                                                .range(1.0..=100.0)
-                                                .speed(0.5),
-                                        )
-                                        .on_hover_text("Cap on how much quiet input is amplified before inference")
-                                        .changed()
-                                    {
-                                        self.input.tunables.norm_max_gain.set(self.prefs.norm_max_gain);
-                                        changed = true;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Frame off:");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut self.prefs.frame_off)
-                                                .range(0.01..=0.9)
-                                                .speed(0.005)
-                                                .fixed_decimals(3),
-                                        )
-                                        .on_hover_text("Probability below which a sounding note is released")
-                                        .changed()
-                                    {
-                                        self.input.tunables.frame_off.set(self.prefs.frame_off);
-                                        changed = true;
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("MIDI poll (ms):");
-                                    if ui
-                                        .add(
-                                            egui::DragValue::new(&mut self.prefs.midi_poll_ms)
-                                                .range(100..=5_000)
-                                                .speed(10.0),
-                                        )
-                                        .on_hover_text("How often the app rescans for MIDI devices")
-                                        .changed()
-                                    {
-                                        self.input
-                                            .midi_poll_ms
-                                            .store(self.prefs.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
-                                        changed = true;
-                                    }
-                                });
-                                ui.add_space(4.0);
-                                if ui
-                                    .button("Reset advanced to defaults")
-                                    .on_hover_text("Restore Silence RMS / Norm max gain / Frame off / MIDI poll")
-                                    .clicked()
-                                {
-                                    let d = prefs::Prefs::default();
-                                    self.prefs.silence_rms = d.silence_rms;
-                                    self.prefs.norm_max_gain = d.norm_max_gain;
-                                    self.prefs.frame_off = d.frame_off;
-                                    self.prefs.midi_poll_ms = d.midi_poll_ms;
-                                    self.input.tunables.silence_rms.set(d.silence_rms);
-                                    self.input.tunables.norm_max_gain.set(d.norm_max_gain);
-                                    self.input.tunables.frame_off.set(d.frame_off);
-                                    self.input
-                                        .midi_poll_ms
-                                        .store(d.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
-                                    changed = true;
-                                }
-                            });
                     });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    // Cap the tab body to the viewport height (minus a reserve
+                    // for chrome/margins) and scroll it — a sane ceiling for
+                    // the scroll region *inside* the content pane; the window
+                    // itself is sized by egui's resize memory, which this no
+                    // longer fights.
+                    let max_h = (ui.ctx().screen_rect().height() - 200.0).clamp(240.0, 640.0);
+                    egui::ScrollArea::vertical()
+                        // Per-tab scroll id, so switching tabs doesn't inherit
+                        // the previous tab's scroll offset.
+                        .id_salt(self.prefs_section.label())
+                        .auto_shrink([false, false])
+                        .max_height(max_h)
+                        .show(ui, |ui| {
+                            changed |= match self.prefs_section {
+                                PrefsSection::StartupWindow => self.prefs_startup_section(ui),
+                                PrefsSection::RollHistory => self.prefs_roll_section(ui),
+                                PrefsSection::Appearance => self.prefs_appearance_section(ui),
+                                PrefsSection::Pedal => self.prefs_pedal_section(ui),
+                                PrefsSection::RollBehavior => self.prefs_roll_behavior_section(ui),
+                                PrefsSection::AudioMic => self.prefs_audio_section(ui),
+                                PrefsSection::Metronome => self.prefs_metronome_section(ui),
+                                PrefsSection::Advanced => self.prefs_advanced_section(ui),
+                            };
+                        });
+                });
 
-                // Roll timing is read from `self.roll`'s own fields, so push any
-                // trailing-blank / idle-pause edit down (cheap; harmless if it
-                // wasn't those fields that changed). Outside the ScrollArea (it
-                // acts on state the scrolled widgets edited), inside the Window.
+                // Roll timing is read from `self.roll`'s own fields, so push
+                // any timing edit down — once, whichever tab produced the
+                // change (cheap and idempotent when it wasn't those fields).
                 if changed {
                     self.roll.set_timing(
-                        self.prefs.trailing_blank.as_duration(),
+                        Duration::from_secs_f64(self.prefs.section_tail_s.max(0.0)),
+                        Duration::from_secs_f64(self.prefs.section_lead_in_s.max(0.0)),
                         self.prefs.idle_pause.as_duration(),
                     );
                 }
@@ -2659,6 +2391,447 @@ impl PianoApp {
         if !open {
             self.show_prefs = false;
         }
+    }
+
+    /// The "Startup & window" tab: session-restore toggles.
+    fn prefs_startup_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Startup & window");
+        if ui
+            .checkbox(&mut self.prefs.remember_window_state, "Remember window state")
+            .on_hover_text("Restore compact/normal window mode from your last session")
+            .changed()
+        {
+            if self.prefs.remember_window_state {
+                // Capture the current state immediately — otherwise it
+                // only persists on the next toggle.
+                self.prefs.compact_mode = self.compact_mode;
+            }
+            changed = true;
+        }
+        if ui
+            .checkbox(&mut self.prefs.reopen_last_file, "Reopen last file on launch")
+            .on_hover_text("Reload the most recently opened MIDI/JSONL file at startup")
+            .changed()
+        {
+            self.prefs.last_file_path = if self.prefs.reopen_last_file {
+                // Capture the currently-open file immediately, if any.
+                self.playback.as_ref().map(|pb| pb.source_path.clone())
+            } else {
+                None // don't keep a stale path once the feature is off
+            };
+            changed = true;
+        }
+        changed
+    }
+
+    /// The "Roll & history" tab: view tunables (section-break timing lives in
+    /// the Roll behavior tab).
+    fn prefs_roll_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Roll & history");
+        ui.horizontal(|ui| {
+            ui.label("Roll zoom (px/s):");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.roll_px_per_s)
+                        .range(8.0..=200.0)
+                        .speed(1.0),
+                )
+                .on_hover_text("Vertical scale of the history + falling-note strips")
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Scrollback hold (s):");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.scrollback_idle_s)
+                        .range(0.0..=30.0)
+                        .speed(0.1),
+                )
+                .on_hover_text("How long a scrolled-back view holds before easing to live")
+                .changed();
+        });
+        changed
+    }
+
+    /// The "Appearance" tab: display name + note color.
+    fn prefs_appearance_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Appearance");
+        ui.horizontal(|ui| {
+            ui.label("My display name:");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.prefs.local_name)
+                        .desired_width(160.0),
+                )
+                .changed()
+            {
+                self.local_name = self.prefs.local_name.clone();
+                self.send_name();
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("My note color:");
+            if color_picker_row(ui, &mut self.prefs.local_color, "prefs_appearance") {
+                self.local_color = self.prefs.local_color;
+                self.send_color();
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    /// The "Pedal" tab: lane visibility (relocated from Roll & history) +
+    /// input sensitivity. Pedal is MIDI-only end to end — the mic path has no
+    /// CC64 signal — so the controls only render with a MIDI source, the same
+    /// gating the lane itself uses.
+    fn prefs_pedal_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Pedal");
+        if self.input.source() == Source::Midi {
+            changed |= ui
+                .checkbox(&mut self.prefs.pedal_lane_visible, "Show pedal lane")
+                .on_hover_text(
+                    "Draw sustain-pedal (CC64) activity as a slim strip at the \
+                     roll's left edge, tinted by pedal depth",
+                )
+                .changed();
+            ui.horizontal(|ui| {
+                ui.label("Pedal sensitivity deadzone:");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.prefs.pedal_deadzone)
+                            .range(0..=32)
+                            .speed(0.1),
+                    )
+                    .on_hover_text(
+                        "Minimum CC64 change (out of 127) before a new pedal \
+                         position registers. Raise it to settle a jittery \
+                         analog pedal; too high coarsens half-pedaling. \
+                         0 = record every distinct level.",
+                    )
+                    .changed();
+            });
+        } else {
+            ui.weak("Pedal settings need a MIDI keyboard — the mic path has no pedal signal.");
+        }
+        changed
+    }
+
+    /// The "Roll behavior" tab — section auto-break timing (see roll.rs:
+    /// threshold fires the break, tail trims the old section's blank end,
+    /// lead-in pads before the new section's first note).
+    fn prefs_roll_behavior_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Roll behavior");
+        changed |= limit_row(
+            ui,
+            "Section break threshold",
+            &mut self.prefs.idle_pause,
+            "Silence before the roll clock pauses, so the next note starts a \
+             new section. Gaps shorter than this show on the paper in full; \
+             once crossed, the blank tail is trimmed to the section tail \
+             below. ∞ = never break (one continuous section).",
+        );
+        ui.horizontal(|ui| {
+            ui.label("Section tail (s):");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.section_tail_s)
+                        .range(0.0..=10.0)
+                        .speed(0.1),
+                )
+                .on_hover_text(
+                    "Blank paper kept after a section's last note when a break \
+                     fires (trailing silence at the end of a session is \
+                     trimmed to this too)",
+                )
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Section lead-in (s):");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.section_lead_in_s)
+                        .range(0.0..=10.0)
+                        .speed(0.1),
+                )
+                .on_hover_text(
+                    "Blank paper between a section boundary and the first note \
+                     of the section that resumes there",
+                )
+                .changed();
+        });
+        changed
+    }
+
+    /// The "Audio / mic" tab: detection threshold + echo guard.
+    fn prefs_audio_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Audio / mic");
+        ui.horizontal(|ui| {
+            ui.label("Detection threshold:");
+            if ui
+                .add(egui::Slider::new(&mut self.prefs.threshold, 0.05..=0.95).step_by(0.01))
+                .on_hover_text("Mic sensitivity: lower detects quieter notes (more noise)")
+                .changed()
+            {
+                self.threshold = self.prefs.threshold;
+                self.input.threshold.set(self.prefs.threshold);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Echo hold-off (ms):");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.echo_holdoff_ms)
+                        .range(0..=10_000)
+                        .speed(50.0),
+                )
+                .on_hover_text(
+                    "How long after the synth stops a note the mic keeps ignoring \
+                     that note (stops the speaker→mic echo loop)",
+                )
+                .changed();
+        });
+        if ui
+            .checkbox(&mut self.prefs.mic_muted, "Mute mic by default")
+            .changed()
+        {
+            self.mic_muted = self.prefs.mic_muted;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The "Metronome" tab: bar length + per-beat click pitch/volume tables.
+    fn prefs_metronome_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Metronome");
+        ui.horizontal(|ui| {
+            ui.label("Beats per bar:");
+            let mut bpb = self.prefs.metro_beats_per_bar;
+            if ui.add(egui::DragValue::new(&mut bpb).range(1..=12)).changed() {
+                bpb = bpb.max(1);
+                self.prefs.metro_beats_per_bar = bpb;
+                resize_beat_table(&mut self.prefs.metro_beat_freqs, bpb as usize, 1200.0);
+                resize_beat_table(&mut self.prefs.metro_beat_volumes, bpb as usize, 1.0);
+                self.metro.beats_per_bar = bpb;
+                self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
+                self.metro.next_beat_in_bar %= bpb;
+                self.send_metro_table();
+                changed = true;
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Pitch and level of each beat's click, synced with the peer so both \
+                 sides sound identical. The first slider quick-picks a common pitch; \
+                 fine-tune with the Hz field next to it.",
+            )
+            .weak(),
+        );
+        for i in 0..self.prefs.metro_beat_freqs.len() {
+            let is_accent = i == 0;
+            egui::Frame::none()
+                .fill(if is_accent {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                .rounding(egui::Rounding::same(4.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        // Fixed-width label column so the controls line up across
+                        // rows regardless of the accent's extra sub-label or the
+                        // Hz field's digit count.
+                        ui.allocate_ui(egui::vec2(76.0, 0.0), |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(format!("Beat {}", i + 1));
+                                if is_accent {
+                                    ui.label(egui::RichText::new("accent").small().weak());
+                                }
+                            });
+                        });
+
+                        // Quick-pick slider: snaps the Hz field to a common preset.
+                        // Widths below are pinned via `ui.spacing_mut()` (egui 0.29 has
+                        // no per-widget `desired_width` on Slider/DragValue) so a beat
+                        // with more Hz digits doesn't push its neighbors out of column.
+                        let freq = self.prefs.metro_beat_freqs[i];
+                        let mut preset = METRO_FREQ_PRESETS
+                            .iter()
+                            .enumerate()
+                            .min_by(|(_, a), (_, b)| {
+                                (**a - freq).abs().total_cmp(&(**b - freq).abs())
+                            })
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                        ui.spacing_mut().slider_width = 56.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut preset, 0..=METRO_FREQ_PRESETS.len() - 1)
+                                    .show_value(false),
+                            )
+                            .on_hover_text("Quick-pick a common click pitch")
+                            .changed()
+                        {
+                            self.prefs.metro_beat_freqs[i] = METRO_FREQ_PRESETS[preset];
+                            self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                            self.send_metro_table();
+                            changed = true;
+                        }
+
+                        ui.spacing_mut().interact_size.x = 64.0;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut self.prefs.metro_beat_freqs[i])
+                                    .range(100.0..=4000.0)
+                                    .speed(5.0)
+                                    .suffix(" Hz"),
+                            )
+                            .changed()
+                        {
+                            self.metro.beat_freqs = self.prefs.metro_beat_freqs.clone();
+                            self.send_metro_table();
+                            changed = true;
+                        }
+
+                        ui.separator();
+                        ui.spacing_mut().slider_width = 80.0;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.prefs.metro_beat_volumes[i], 0.0..=1.0)
+                                    .show_value(false)
+                                    .text("volume"),
+                            )
+                            .changed()
+                        {
+                            self.metro.beat_volumes = self.prefs.metro_beat_volumes.clone();
+                            self.send_metro_table();
+                            changed = true;
+                        }
+                    });
+                });
+        }
+        if ui.button("Reset metronome to defaults").clicked() {
+            let d = prefs::Prefs::default();
+            self.prefs.metro_beats_per_bar = d.metro_beats_per_bar;
+            self.prefs.metro_beat_freqs = d.metro_beat_freqs.clone();
+            self.prefs.metro_beat_volumes = d.metro_beat_volumes.clone();
+            self.metro.beats_per_bar = d.metro_beats_per_bar;
+            self.metro.beat_freqs = d.metro_beat_freqs;
+            self.metro.beat_volumes = d.metro_beat_volumes;
+            self.metro.next_beat_in_bar %= self.metro.beats_per_bar.max(1);
+            self.send_metro_table();
+            changed = true;
+        }
+        changed
+    }
+
+    /// The "Advanced" tab (model / network). No longer behind a
+    /// `CollapsingHeader` — having its own tab already gates visibility.
+    fn prefs_advanced_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Advanced");
+        ui.label(
+            egui::RichText::new(
+                "These affect mic transcription directly — bad values can \
+                 stop notes being detected. Defaults suit most rooms.",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Silence RMS:");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.silence_rms)
+                        .range(0.0..=0.05)
+                        .speed(0.0002)
+                        .fixed_decimals(4),
+                )
+                .on_hover_text("Below this raw mic level a window is treated as silence")
+                .changed()
+            {
+                self.input.tunables.silence_rms.set(self.prefs.silence_rms);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Norm max gain:");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.norm_max_gain)
+                        .range(1.0..=100.0)
+                        .speed(0.5),
+                )
+                .on_hover_text("Cap on how much quiet input is amplified before inference")
+                .changed()
+            {
+                self.input.tunables.norm_max_gain.set(self.prefs.norm_max_gain);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Frame off:");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.frame_off)
+                        .range(0.01..=0.9)
+                        .speed(0.005)
+                        .fixed_decimals(3),
+                )
+                .on_hover_text("Probability below which a sounding note is released")
+                .changed()
+            {
+                self.input.tunables.frame_off.set(self.prefs.frame_off);
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("MIDI poll (ms):");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.prefs.midi_poll_ms)
+                        .range(100..=5_000)
+                        .speed(10.0),
+                )
+                .on_hover_text("How often the app rescans for MIDI devices")
+                .changed()
+            {
+                self.input
+                    .midi_poll_ms
+                    .store(self.prefs.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
+                changed = true;
+            }
+        });
+        ui.add_space(4.0);
+        if ui
+            .button("Reset advanced to defaults")
+            .on_hover_text("Restore Silence RMS / Norm max gain / Frame off / MIDI poll")
+            .clicked()
+        {
+            let d = prefs::Prefs::default();
+            self.prefs.silence_rms = d.silence_rms;
+            self.prefs.norm_max_gain = d.norm_max_gain;
+            self.prefs.frame_off = d.frame_off;
+            self.prefs.midi_poll_ms = d.midi_poll_ms;
+            self.input.tunables.silence_rms.set(d.silence_rms);
+            self.input.tunables.norm_max_gain.set(d.norm_max_gain);
+            self.input.tunables.frame_off.set(d.frame_off);
+            self.input
+                .midi_poll_ms
+                .store(d.midi_poll_ms, std::sync::atomic::Ordering::Relaxed);
+            changed = true;
+        }
+        changed
     }
 
     /// The About window: running version, update status, and project links.
@@ -2942,6 +3115,21 @@ impl eframe::App for PianoApp {
                     ui.label(model);
                     ui.separator();
                     ui.label(&self.net_status);
+                    // Pending section break: the roll clock paused past the
+                    // break threshold, so the next note starts a new section.
+                    // Same chip affordance as the title bar's "● unsaved".
+                    if self.roll.is_paused() && !self.roll.is_empty() {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(210, 170, 60),
+                            "● section break on next keypress",
+                        )
+                        .on_hover_text(
+                            "The roll has been idle past the section-break \
+                             threshold; the next note starts a new section \
+                             (Preferences ▸ Roll behavior)",
+                        );
+                    }
                     // While the history roll is scrolled back (or easing home), an
                     // instant way out: a deliberate click deserves an immediate
                     // snap, unlike the idle timer's gentle ease.
@@ -3450,7 +3638,14 @@ const PEDAL_LANE_W: f32 = 10.0;
 fn velocity_tint(color: [u8; 3], velocity: u8) -> egui::Color32 {
     let mut hsva = egui::ecolor::Hsva::from(egui::Color32::from_rgb(color[0], color[1], color[2]));
     let t = (velocity as f32 / 127.0).clamp(0.0, 1.0);
-    hsva.s *= 0.35 + 0.65 * t;
+    // Ease-out before the linear remap, so saturation climbs toward the full
+    // base color through the upper-middle of the range: a linear map left
+    // typical hard presses (velocity ~90-115 — real playing rarely reaches
+    // the literal 127) at a perceptibly dull 80-90% of base, while an
+    // ease-out puts them near full color and leaves very soft touches close
+    // to their old muted look. The exponent is a by-eye knob.
+    let eased = 1.0 - (1.0 - t).powi(2);
+    hsva.s *= 0.35 + 0.65 * eased;
     hsva.into()
 }
 
@@ -3737,6 +3932,13 @@ fn evaluation_settings_body(
             "Needs a MIDI keyboard — mic input has no pedal signal"
         })
         .changed();
+    changed |= ui
+        .checkbox(&mut pb.eval.pause_on_miss, "Pause on miss")
+        .on_hover_text(
+            "Freeze the roll on a note you haven't hit yet, instead of \
+             scoring it a miss and moving on",
+        )
+        .changed();
 
     ui.add_space(4.0);
     ui.weak("The take restarts whenever a setting changes.");
@@ -3788,6 +3990,14 @@ fn eval_results_body(ui: &mut egui::Ui, result: &playback::EvaluationResult) {
         result.matched_count, result.missed_count, extra
     ));
     ui.label(format!("Longest clean streak: {}", result.longest_streak));
+    if let Some(p) = &result.pause_stats {
+        ui.label(format!(
+            "Paused for missed notes: {:.1}s over {} pause{}",
+            p.total_s,
+            p.count,
+            if p.count == 1 { "" } else { "s" }
+        ));
+    }
     if let Some(bias) = result.timing_bias_s {
         ui.label(format!(
             "Timing bias: {:.0} ms {}",
@@ -3822,6 +4032,152 @@ fn eval_results_body(ui: &mut egui::Ui, result: &playback::EvaluationResult) {
     if !result.worst_pitches.is_empty() {
         ui.label(format!("Weakest keys: {}", names(&result.worst_pitches)));
     }
+}
+
+/// A preview-first note-color picker: an always-visible hue spectrum bar with
+/// a live swatch next to it, plus a collapsed "Fine-tune" panel (brightness +
+/// saturation bars). Replaces the stock `color_edit_button_srgb` at both
+/// entry points (config panel and Preferences ▸ Appearance).
+///
+/// The working color lives as `Hsva` in egui temp memory keyed by `id_salt`,
+/// re-derived from `color` only when the stored copy no longer matches it —
+/// the same technique egui's own picker uses internally, avoiding the classic
+/// hue loss when saturation or brightness hits zero (an rgb round-trip at
+/// s == 0 forgets h). A mismatch means the color was edited elsewhere (the
+/// other picker entry point, or the peer-independent prefs reload).
+///
+/// Returns whether the color changed this frame — callers keep their existing
+/// `.changed()`-style `send_color()`/`prefs.save()` logic, and neither the
+/// wire format (`Packet::Color([u8; 3])`) nor `Prefs::local_color` changes.
+fn color_picker_row(ui: &mut egui::Ui, color: &mut [u8; 3], id_salt: &str) -> bool {
+    use egui::ecolor::Hsva;
+    let id = egui::Id::new(("color_picker_row", id_salt));
+    let mut hsva: Hsva = match ui.data(|d| d.get_temp::<(Hsva, [u8; 3])>(id)) {
+        Some((h, rgb)) if rgb == *color => h,
+        _ => Hsva::from(egui::Color32::from_rgb(color[0], color[1], color[2])),
+    };
+
+    let mut changed = false;
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            // Full-strength spectrum for the rail; the swatch next to it
+            // previews the actual working color.
+            changed |= gradient_bar(ui, &mut hsva.h, egui::vec2(140.0, 16.0), false, |t| {
+                Hsva { h: t, s: 1.0, v: 1.0, a: 1.0 }.into()
+            })
+            .on_hover_text("Hue")
+            .changed();
+            egui::color_picker::show_color(
+                ui,
+                egui::Color32::from(hsva),
+                egui::vec2(24.0, 16.0),
+            )
+            .on_hover_text("Current color");
+        });
+        egui::CollapsingHeader::new("Fine-tune")
+            .id_salt(id.with("fine_tune"))
+            .default_open(false)
+            .show(ui, |ui| {
+                let (h, s, v) = (hsva.h, hsva.s, hsva.v);
+                ui.horizontal(|ui| {
+                    // Vertical brightness (value) bar, dark at the bottom…
+                    changed |= gradient_bar(ui, &mut hsva.v, egui::vec2(16.0, 48.0), true, |t| {
+                        Hsva { h, s, v: t, a: 1.0 }.into()
+                    })
+                    .on_hover_text("Brightness")
+                    .changed();
+                    // …next to a horizontal saturation bar.
+                    ui.vertical(|ui| {
+                        ui.label("Saturation");
+                        changed |= gradient_bar(
+                            ui,
+                            &mut hsva.s,
+                            egui::vec2(140.0, 16.0),
+                            false,
+                            |t| Hsva { h, s: t, v, a: 1.0 }.into(),
+                        )
+                        .changed();
+                    });
+                });
+            });
+    });
+
+    if changed {
+        let c = egui::Color32::from(hsva);
+        *color = [c.r(), c.g(), c.b()];
+    }
+    // Stored even when unchanged, so the first-frame derivation (and its
+    // preserved hue) sticks across frames.
+    ui.data_mut(|d| d.insert_temp(id, (hsva, *color)));
+    changed
+}
+
+/// A hand-rolled 1D gradient slider: a mesh strip colored by `color_at` with
+/// a contrast-stroked marker at the current value, draggable/clickable along
+/// its long axis (`vertical` = bottom-to-top). egui 0.29's own
+/// `color_slider_1d` is private, so this reimplements the same look with a
+/// public seam; the response has `changed()` set when the value moved.
+fn gradient_bar(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    size: egui::Vec2,
+    vertical: bool,
+    color_at: impl Fn(f32) -> egui::Color32,
+) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if let Some(pos) = response.interact_pointer_pos() {
+        let t = if vertical {
+            egui::remap_clamp(pos.y, rect.bottom()..=rect.top(), 0.0..=1.0)
+        } else {
+            egui::remap_clamp(pos.x, rect.left()..=rect.right(), 0.0..=1.0)
+        };
+        if t != *value {
+            *value = t;
+            response.mark_changed();
+        }
+    }
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        // Gradient fill: a strip of quads, one color stop per step.
+        const STEPS: usize = 32;
+        let mut mesh = egui::Mesh::default();
+        for i in 0..=STEPS {
+            let t = i as f32 / STEPS as f32;
+            let color = color_at(t);
+            let (a, b) = if vertical {
+                let y = egui::lerp(rect.bottom()..=rect.top(), t);
+                (egui::pos2(rect.left(), y), egui::pos2(rect.right(), y))
+            } else {
+                let x = egui::lerp(rect.left()..=rect.right(), t);
+                (egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom()))
+            };
+            mesh.colored_vertex(a, color);
+            mesh.colored_vertex(b, color);
+            if i < STEPS {
+                let i = 2 * i as u32;
+                mesh.add_triangle(i, i + 1, i + 2);
+                mesh.add_triangle(i + 1, i + 2, i + 3);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        painter.rect_stroke(rect, 0.0, ui.style().interact(&response).bg_stroke);
+
+        // Marker: a line across the bar at the value, stroked to contrast
+        // with the color under it so it reads on both ends of the gradient.
+        let under = color_at(*value);
+        let lum =
+            0.299 * under.r() as f32 + 0.587 * under.g() as f32 + 0.114 * under.b() as f32;
+        let contrast = if lum > 128.0 { egui::Color32::BLACK } else { egui::Color32::WHITE };
+        let stroke = egui::Stroke::new(2.0, contrast);
+        if vertical {
+            let y = egui::lerp(rect.bottom()..=rect.top(), *value);
+            painter.hline(rect.x_range(), y, stroke);
+        } else {
+            let x = egui::lerp(rect.left()..=rect.right(), *value);
+            painter.vline(x, rect.y_range(), stroke);
+        }
+    }
+    response
 }
 
 /// A Preferences row for a [`prefs::Limit`]: a seconds `DragValue` (greyed but
