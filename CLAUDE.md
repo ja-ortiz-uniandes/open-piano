@@ -129,11 +129,51 @@ a synthetic session; `verify_alignment.py` recovers a known injected offset to
 within ~1 ms. When changing the recorder or alignment math, re-validate with a
 synthetic session (sine tones at known times + a matching `midi.jsonl`).
 
-## Releases
+## Commits, versioning & releases
 
-Push a `vX.Y.Z` tag → `.github/workflows/release.yml` builds a portable Windows
-zip (exe + ONNX Runtime + model) and publishes a GitHub Release. Distribution and
-the Windows SmartScreen/Smart App Control situation are documented in the README.
+**Commit messages** follow Conventional Commits: `type(scope): subject`, e.g.
+`feat(playback): add pause-on-miss to Evaluation mode` or `fix(net): retry
+relay handshake on timeout`. Common types: `feat` (new user-facing
+capability), `fix`, `docs`, `chore`, `refactor` (no behavior change), `perf`,
+`test`, `build`, `ci`. Scope is the touched module (`main`, `net`, `playback`,
+`roll`, `prefs`, `midi`, `inference`, ...) — omit it only when a change
+genuinely spans everything. Add a body paragraph explaining *why* when the
+subject line alone doesn't carry the motivation.
+
+**Version numbers** (`Cargo.toml`, and the release tag) bump on the size and
+count of what changed since the last release — the project is pre-1.0, so
+strict semver doesn't apply yet:
+
+- **PATCH** (`0.0.X`): one small, self-contained feature, or a release that's
+  fixes/docs/chores only with no new user-facing capability.
+- **MINOR** (`0.X.0`): a release bundles multiple substantial features, or a
+  single feature large enough to touch several modules or change core
+  behavior meaningfully.
+- **MAJOR** (`X.0.0`): reserved for 1.0 and a deliberate compatibility
+  commitment (stable wire protocol / prefs format) — not expected before the
+  causal/streaming model lands (see Next steps).
+
+Bump `Cargo.toml`'s version to match before tagging.
+
+**Tags**: always annotated and signed, with a real summary message — never a
+bare lightweight tag:
+
+```powershell
+git tag -s -a v0.6.0 -m "v0.6.0: <one-line summary of what shipped>"
+git push origin v0.6.0
+```
+
+`-s` signs the tag with your configured signing key (`git config
+user.signingkey` / `gpg.format`), which is what makes it show Verified on
+GitHub — a lightweight tag only inherits Verified from an already-signed
+commit, and a plain (unsigned) annotated tag shows unverified even when the
+commit underneath it is signed. Write the message like a mini changelog
+entry (what shipped, not just the version number) — it's what renders on the
+GitHub tag/release page. Pushing the tag triggers
+`.github/workflows/release.yml`, which builds a portable Windows zip (exe +
+ONNX Runtime + model) and publishes a GitHub Release. Distribution and the
+Windows SmartScreen/Smart App Control situation are documented in the
+README.
 
 ## Gotchas
 
