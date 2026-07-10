@@ -88,7 +88,8 @@ pub struct Prefs {
     /// How long after the synth stops voicing a note the mic keeps ignoring
     /// that note (echo guard), in milliseconds.
     pub echo_holdoff_ms: u64,
-    /// Default state of the "Mute mic" toggle.
+    /// Default state of the "Mute mic" toggle. Defaults to muted so a fresh
+    /// install doesn't start transcribing ambient audio before the user opts in.
     pub mic_muted: bool,
 
     // ---- Metronome ----
@@ -125,6 +126,10 @@ pub struct Prefs {
     /// Last active compact-mode state; only consulted at startup when
     /// `remember_window_state` is true.
     pub compact_mode: bool,
+    /// Keep the compact window above other applications (always-on-top). Only
+    /// applied while in compact mode; reconciled live so toggling it takes
+    /// effect immediately without leaving compact mode.
+    pub compact_always_on_top: bool,
     /// Last known normal-mode window size, snapshotted on every compact-mode
     /// entry. Seeds `PianoApp::normal_size` at startup so a session that
     /// launches directly into compact mode never falls back to a mismatched
@@ -160,7 +165,7 @@ impl Default for Prefs {
             keyboard_height_frac: None,
             threshold: 0.30,
             echo_holdoff_ms: 2000,
-            mic_muted: false,
+            mic_muted: true,
             metro_bpm: 120,
             metro_beats_per_bar: 4,
             metro_beat_freqs: vec![1800.0, 1200.0, 1200.0, 1200.0],
@@ -171,6 +176,7 @@ impl Default for Prefs {
             midi_poll_ms: 1000,
             remember_window_state: false,
             compact_mode: false,
+            compact_always_on_top: true,
             normal_window_size: None,
             reopen_last_file: false,
             last_file_path: None,

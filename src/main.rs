@@ -116,10 +116,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default note colors (sRGB). The live *local* color is seeded from
 /// [`prefs::Prefs`] (user-configurable and persisted); these constants remain
 /// the compile-time fallbacks — `DEFAULT_LOCAL_COLOR` also colors a loaded
-/// file's Local track (see `score.rs`), and `DEFAULT_REMOTE_COLOR` is transient
-/// (overwritten the moment the peer announces its own color).
+/// file's Local track (see `score.rs`), and `DEFAULT_REMOTE_COLOR` is what the
+/// peer always renders as locally: we deliberately ignore the peer's announced
+/// color (see the `Packet::Color` handler) so two un-customized peers — both
+/// defaulting `local_color` to the same red — never render identically.
 const DEFAULT_LOCAL_COLOR: [u8; 3] = [220, 60, 60]; // warm red
-const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (until the peer announces theirs)
+const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (the peer, always)
 
 /// Placeholder name shown for the peer until it announces its own (see the
 /// `Packet::Name` heartbeat). Transient — overwritten on the first announce.
@@ -326,6 +328,12 @@ struct PianoApp {
     // --- key state ---
     local: [bool; KEY_COUNT],
     remote: [bool; KEY_COUNT],
+    // Keys the user has "pinned" down with Ctrl+click — purely a local display
+    // aid (e.g. holding a chord to point at while explaining). ORed into
+    // `local`'s rendering only; it never touches `local_note`, the synth, the
+    // roll, or the peer broadcast, and it's gated by the same recording/eval/
+    // playback lock as mouse-play.
+    held: [bool; KEY_COUNT],
 
     // --- sustain pedal (CC64; MIDI input only — the mic path can't produce
     // pedal events, see input.rs) ---
@@ -463,6 +471,30 @@ struct PianoApp {
     // per frame against `compact_mode` (see `sync_compact_viewport`), so
     // resizes fire only on real transitions.
     compact_applied: bool,
+    // Whether the window is currently pinned always-on-top. Reconciled every
+    // frame against `compact_mode && prefs.compact_always_on_top` (see
+    // `sync_compact_viewport`), so a live pref toggle takes effect immediately.
+    on_top_applied: bool,
+
+    // --- custom-chrome window move/resize (manual, touch-compatible) ---
+    // These drive the frameless window ourselves every frame from egui's drag
+    // deltas, instead of handing off to Windows' native SC_MOVE/SC_SIZE modal
+    // loop (`ViewportCommand::StartDrag`/`BeginResize`) — that native loop is
+    // built around real mouse-button state and does not sustain a
+    // touch-originated gesture, which is why touch move was broken.
+    //
+    // Target outer position accumulated across an active title-bar move drag
+    // (seeded from the live outer rect on the first drag frame); `None` when
+    // not moving.
+    titlebar_drag: Option<egui::Pos2>,
+    // Target (outer position, inner size) accumulated across an active
+    // edge/corner resize drag; `None` when not resizing.
+    resize_drag: Option<(egui::Pos2, egui::Vec2)>,
+    // Whether recent input came from touch (vs. mouse/trackpad). Drives the
+    // enlarged, visible resize-handle affordance so it only appears in actual
+    // tablet use. Updated once per frame from raw egui events; left unchanged
+    // on idle frames so it tracks "most recently used," not flickers.
+    touch_mode: bool,
     // Whether the Learn side panel is expanded ("‹"/"›" arrows). Preserved
     // across Learn-mode exits, so re-entering restores the last choice.
     learn_panel_expanded: bool,
@@ -540,6 +572,7 @@ impl PianoApp {
             was_midi: false,
             local: [false; KEY_COUNT],
             remote: [false; KEY_COUNT],
+            held: [false; KEY_COUNT],
             local_pedal: 0,
             remote_pedal: 0,
             last_pedal_sent: 0,
@@ -586,6 +619,10 @@ impl PianoApp {
             compact_mode,
             normal_size,
             compact_applied: compact_mode,
+            on_top_applied: false,
+            titlebar_drag: None,
+            resize_drag: None,
+            touch_mode: false,
             learn_panel_expanded: true,
             evaluation_panel_expanded: true,
             show_eval_results: false,
@@ -2125,8 +2162,27 @@ impl PianoApp {
                 if drag.double_clicked() {
                     let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
-                } else if drag.drag_started_by(egui::PointerButton::Primary) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                } else if drag.dragged() {
+                    // Drive the window ourselves each frame instead of handing
+                    // off to the native SC_MOVE loop (which doesn't sustain a
+                    // touch gesture — the actual cause of broken touch-move).
+                    // Skip while maximized: repositioning a maximized window is
+                    // meaningless, and the double-click above already toggles it.
+                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    if !maximized {
+                        // Accumulate the per-frame delta onto a target seeded
+                        // from the live outer position, so a one-frame lag in
+                        // the reported rect can't drop movement.
+                        let seed =
+                            self.titlebar_drag.or_else(|| ctx.input(|i| i.viewport().outer_rect).map(|r| r.min));
+                        if let Some(pos) = seed {
+                            let new_pos = pos + drag.drag_delta();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
+                            self.titlebar_drag = Some(new_pos);
+                        }
+                    }
+                } else {
+                    self.titlebar_drag = None;
                 }
 
                 // Centered title, painted behind the widgets (non-interactive).
@@ -2208,31 +2264,45 @@ impl PianoApp {
     /// window interior falls through to the app (a single screen-spanning Area
     /// would block everything — see egui's `layer_id_at`). Skipped while
     /// maximized (nothing to resize).
-    fn resize_handles(&self, ctx: &egui::Context) {
+    fn resize_handles(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
         let s = ctx.screen_rect();
-        const B: f32 = 6.0; // handle thickness
+        // Enlarged, grabbable strips only when the device is actually being used
+        // as a tablet (a real touch event arrived recently); a mouse/trackpad
+        // session keeps the original tight, invisible 6px zones.
+        let b_thick: f32 = if self.touch_mode { 14.0 } else { 6.0 };
+        let touch = self.touch_mode;
         use egui::CursorIcon as C;
         use egui::ResizeDirection as D;
         let (l, r, t, b) = (s.left(), s.right(), s.top(), s.bottom());
         let rect = egui::Rect::from_min_max;
         let p = egui::pos2;
-        // (handle rect, resize direction, cursor) — corners then edges, tiled
-        // so none overlap.
+        let bb = b_thick;
+        // (handle rect, resize direction, cursor, is-corner) — corners then
+        // edges, tiled so none overlap.
         let handles = [
-            (rect(p(l, t), p(l + B, t + B)), D::NorthWest, C::ResizeNorthWest),
-            (rect(p(r - B, t), p(r, t + B)), D::NorthEast, C::ResizeNorthEast),
-            (rect(p(l, b - B), p(l + B, b)), D::SouthWest, C::ResizeSouthWest),
-            (rect(p(r - B, b - B), p(r, b)), D::SouthEast, C::ResizeSouthEast),
-            (rect(p(l + B, t), p(r - B, t + B)), D::North, C::ResizeNorth),
-            (rect(p(l + B, b - B), p(r - B, b)), D::South, C::ResizeSouth),
-            (rect(p(l, t + B), p(l + B, b - B)), D::West, C::ResizeWest),
-            (rect(p(r - B, t + B), p(r, b - B)), D::East, C::ResizeEast),
+            (rect(p(l, t), p(l + bb, t + bb)), D::NorthWest, C::ResizeNorthWest, true),
+            (rect(p(r - bb, t), p(r, t + bb)), D::NorthEast, C::ResizeNorthEast, true),
+            (rect(p(l, b - bb), p(l + bb, b)), D::SouthWest, C::ResizeSouthWest, true),
+            (rect(p(r - bb, b - bb), p(r, b)), D::SouthEast, C::ResizeSouthEast, true),
+            (rect(p(l + bb, t), p(r - bb, t + bb)), D::North, C::ResizeNorth, false),
+            (rect(p(l + bb, b - bb), p(r - bb, b)), D::South, C::ResizeSouth, false),
+            (rect(p(l, t + bb), p(l + bb, b - bb)), D::West, C::ResizeWest, false),
+            (rect(p(r - bb, t + bb), p(r, b - bb)), D::East, C::ResizeEast, false),
         ];
-        for (i, (hr, dir, cursor)) in handles.into_iter().enumerate() {
-            egui::Area::new(egui::Id::new(("resize_handle", i)))
+        // Minimum inner size to clamp against, matching what the OS enforced —
+        // tighter in compact mode so the compact window can shrink further.
+        let (min_w, min_h) = if self.compact_mode {
+            (COMPACT_MIN_SIZE[0], COMPACT_MIN_SIZE[1])
+        } else {
+            (NORMAL_MIN_SIZE[0], NORMAL_MIN_SIZE[1])
+        };
+
+        let mut still_dragging = false;
+        for (i, (hr, dir, cursor, corner)) in handles.into_iter().enumerate() {
+            let resp = egui::Area::new(egui::Id::new(("resize_handle", i)))
                 .order(egui::Order::Foreground)
                 .fixed_pos(hr.min)
                 .interactable(true)
@@ -2241,11 +2311,98 @@ impl PianoApp {
                     if resp.hovered() || resp.dragged() {
                         ui.ctx().set_cursor_icon(cursor);
                     }
-                    if resp.drag_started() {
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                    // Tablet-only visible grab affordance: two short strokes in
+                    // the corner so the enlarged zone reads as draggable. Never
+                    // drawn for a mouse/trackpad session (tight invisible zones).
+                    if touch && corner {
+                        let g = egui::Color32::from_gray(150);
+                        let stroke = egui::Stroke::new(1.5, g);
+                        let hr = ui.min_rect();
+                        let inset = 4.0;
+                        // A small "⌟"-ish bracket hugging the true window corner.
+                        let (c1, c2, c3) = match dir {
+                            D::NorthWest => (
+                                egui::pos2(hr.left() + inset, hr.top() + inset + 5.0),
+                                egui::pos2(hr.left() + inset, hr.top() + inset),
+                                egui::pos2(hr.left() + inset + 5.0, hr.top() + inset),
+                            ),
+                            D::NorthEast => (
+                                egui::pos2(hr.right() - inset - 5.0, hr.top() + inset),
+                                egui::pos2(hr.right() - inset, hr.top() + inset),
+                                egui::pos2(hr.right() - inset, hr.top() + inset + 5.0),
+                            ),
+                            D::SouthWest => (
+                                egui::pos2(hr.left() + inset, hr.bottom() - inset - 5.0),
+                                egui::pos2(hr.left() + inset, hr.bottom() - inset),
+                                egui::pos2(hr.left() + inset + 5.0, hr.bottom() - inset),
+                            ),
+                            _ => (
+                                egui::pos2(hr.right() - inset - 5.0, hr.bottom() - inset),
+                                egui::pos2(hr.right() - inset, hr.bottom() - inset),
+                                egui::pos2(hr.right() - inset, hr.bottom() - inset - 5.0),
+                            ),
+                        };
+                        ui.painter().line_segment([c1, c2], stroke);
+                        ui.painter().line_segment([c2, c3], stroke);
                     }
+                    resp
+                })
+                .inner;
+
+            if resp.dragged() {
+                still_dragging = true;
+                // Seed the accumulated target from the live outer position +
+                // inner size on the first drag frame; thereafter apply deltas
+                // to our own target so a lagging reported rect can't drop or
+                // double-count movement.
+                let seed = self.resize_drag.or_else(|| {
+                    ctx.input(|i| {
+                        let vp = i.viewport();
+                        match (vp.outer_rect, vp.inner_rect) {
+                            (Some(o), Some(inner)) => Some((o.min, inner.size())),
+                            _ => None,
+                        }
+                    })
                 });
+                if let Some((mut pos, mut size)) = seed {
+                    let d = resp.drag_delta();
+                    let (west, east) = (
+                        matches!(dir, D::NorthWest | D::SouthWest | D::West),
+                        matches!(dir, D::NorthEast | D::SouthEast | D::East),
+                    );
+                    let (north, south) = (
+                        matches!(dir, D::NorthWest | D::NorthEast | D::North),
+                        matches!(dir, D::SouthWest | D::SouthEast | D::South),
+                    );
+                    if east {
+                        size.x = (size.x + d.x).max(min_w);
+                    }
+                    if south {
+                        size.y = (size.y + d.y).max(min_h);
+                    }
+                    // Left/top edges: shift the outer position by however much
+                    // the edge actually moved (post-clamp) so the opposite edge
+                    // stays anchored — what a native resize does.
+                    if west {
+                        let target_w = (size.x - d.x).max(min_w);
+                        pos.x += size.x - target_w;
+                        size.x = target_w;
+                    }
+                    if north {
+                        let target_h = (size.y - d.y).max(min_h);
+                        pos.y += size.y - target_h;
+                        size.y = target_h;
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    if west || north {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    }
+                    self.resize_drag = Some((pos, size));
+                }
+            }
+        }
+        if !still_dragging {
+            self.resize_drag = None;
         }
     }
 
@@ -2256,6 +2413,20 @@ impl PianoApp {
     /// degrades gracefully in a short pane, and the ever-present
     /// `resize_handles` let the user drag the window taller if they want.
     fn sync_compact_viewport(&mut self, ctx: &egui::Context) {
+        // Always-on-top is reconciled first and *every* frame (before the size
+        // early-return below), so flipping the preference while already compact
+        // takes effect without a compact-mode transition to ride on.
+        let want_on_top = self.compact_mode && self.prefs.compact_always_on_top;
+        if want_on_top != self.on_top_applied {
+            let level = if want_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+            self.on_top_applied = want_on_top;
+        }
+
         let want_compact = self.compact_mode;
         if want_compact == self.compact_applied {
             return;
@@ -2419,6 +2590,18 @@ impl PianoApp {
                 // only persists on the next toggle.
                 self.prefs.compact_mode = self.compact_mode;
             }
+            changed = true;
+        }
+        if ui
+            .checkbox(&mut self.prefs.compact_always_on_top, "Keep compact window on top")
+            .on_hover_text(
+                "While in compact mode, float the window above other apps. \
+                 Reconciled live — toggling this takes effect immediately.",
+            )
+            .changed()
+        {
+            // `sync_compact_viewport` reconciles the actual window level every
+            // frame, so no explicit command is needed here.
             changed = true;
         }
         if ui
@@ -2935,7 +3118,15 @@ impl PianoApp {
                     self.remote_pedal = level;
                     self.roll.pedal(roll::Who::Remote, level);
                 }
-                NetEvent::Packet(Packet::Color(rgb)) => self.remote_color = rgb,
+                // Intentionally *not* applied to `remote_color`: every fresh
+                // install defaults `local_color` to the same red, so honoring
+                // an un-customized peer's announced color would render both
+                // sides identically and defeat the two-color visualization.
+                // The peer is pinned to `DEFAULT_REMOTE_COLOR` (blue) locally
+                // regardless of what they pick on their own screen. We still
+                // accept (and drop) the packet so the wire protocol is
+                // unchanged.
+                NetEvent::Packet(Packet::Color(_rgb)) => {}
                 NetEvent::Packet(Packet::Name(name)) => self.remote_name = name,
                 NetEvent::Packet(Packet::MetroCtl { on, bpm }) => {
                     // Follower → host request: the authority adopts it as the new
@@ -3049,6 +3240,33 @@ impl eframe::App for PianoApp {
         }
         self.last_pointer_pos = hover_pos;
         let still_secs = self.pointer_still_since.elapsed().as_secs_f32();
+
+        // Track touch vs. mouse/trackpad usage to size the resize handles.
+        // egui synthesizes primary-pointer events from single-finger touch (so
+        // drag-based UI just works), but a genuine `Event::Touch` rides
+        // alongside *only* for touch input — never for mouse/trackpad. So a
+        // touch event this frame means tablet use; a real pointer event with no
+        // touch means mouse/trackpad. Idle frames leave the last verdict
+        // standing, so it tracks "most recently used," not flickers.
+        let (saw_touch, saw_pointer) = ctx.input(|i| {
+            let mut touch = false;
+            let mut pointer = false;
+            for ev in &i.raw.events {
+                match ev {
+                    egui::Event::Touch { .. } => touch = true,
+                    egui::Event::PointerMoved(_)
+                    | egui::Event::PointerButton { .. }
+                    | egui::Event::MouseWheel { .. } => pointer = true,
+                    _ => {}
+                }
+            }
+            (touch, pointer)
+        });
+        if saw_touch {
+            self.touch_mode = true;
+        } else if saw_pointer {
+            self.touch_mode = false;
+        }
 
         // Low-rate color heartbeat so colors sync regardless of connect order.
         // The metronome tables ride along on the same cadence.
@@ -3236,6 +3454,22 @@ impl eframe::App for PianoApp {
                 ui.allocate_response(egui::vec2(avail.x, kb_h), egui::Sense::click_and_drag());
             let rect = response.rect;
 
+            // Reserve a thin sliver at the keyboard's left edge for the live
+            // pedal indicator (drawn below), leaving a gap so it reads as a
+            // separate element rather than part of key 1. Unlike the roll's
+            // pedal-history lane, this shows even on mic input (so the peer's
+            // pedal is still visible) — hence no `Source::Midi` gate. The keys
+            // lay out in the shrunk `kb_rect`, keeping keyboard and roll aligned.
+            let show_pedal_indicator = self.prefs.pedal_lane_visible;
+            let kb_rect = if show_pedal_indicator {
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + PEDAL_INDICATOR_W + PEDAL_INDICATOR_GAP, rect.top()),
+                    rect.max,
+                )
+            } else {
+                rect
+            };
+
             // Drag-to-resize handles on the keyboard's edges: thin strips
             // straddling the top (against the falling panel) and bottom
             // (against the roll strip). Registered after `response` so they
@@ -3317,19 +3551,45 @@ impl eframe::App for PianoApp {
                     });
                 }
             } else {
+                // Ctrl+click pins/unpins a key "held" for display (see `held`),
+                // so suppress mouse-play while Ctrl is down — otherwise the same
+                // press would also sound a note. (`command` = Ctrl on Windows,
+                // Cmd on macOS — the same modifier the roll's Ctrl+click uses.)
+                let cmd = ui.input(|i| i.modifiers.command);
                 // While the button is held, the key under the pointer is played;
                 // dragging across keys glides note-to-note.
-                let target = if response.is_pointer_button_down_on() {
-                    response.interact_pointer_pos().and_then(|p| key_at(rect, p))
+                let target = if response.is_pointer_button_down_on() && !cmd {
+                    response.interact_pointer_pos().and_then(|p| key_at(kb_rect, p))
                 } else {
                     None
                 };
                 self.set_mouse_note(target);
+
+                // Ctrl+click toggles the pinned-held state of the clicked key.
+                // Purely a local display aid — no sound, no roll, no peer send.
+                if cmd && response.clicked() {
+                    if let Some(idx) = response
+                        .interact_pointer_pos()
+                        .and_then(|p| key_at(kb_rect, p))
+                        .and_then(midi_to_key_index)
+                    {
+                        self.held[idx] = !self.held[idx];
+                    }
+                }
             }
 
             // The keyboard's key layout doubles as lane geometry for both
             // roll panels, so marks are exactly x-aligned with their keys.
-            let keys = layout_keys(rect);
+            let keys = layout_keys(kb_rect);
+
+            // Ctrl+click-pinned keys render exactly like a live local press
+            // (your own color), so OR them into the local key array used for
+            // drawing — display only; nothing downstream (synth/roll/net) ever
+            // sees `held`.
+            let mut local_shown = self.local;
+            for i in 0..KEY_COUNT {
+                local_shown[i] |= self.held[i];
+            }
 
             if let Some(pb) = &self.playback {
                 // Layered keyboard: your live presses, plus each unpracticed
@@ -3337,7 +3597,7 @@ impl eframe::App for PianoApp {
                 // its own color. `display_score` swaps in the original+played
                 // pair while reviewing an evaluation.
                 let mut layers: Vec<([bool; KEY_COUNT], egui::Color32)> = vec![(
-                    self.local,
+                    local_shown,
                     egui::Color32::from_rgb(
                         self.local_color[0],
                         self.local_color[1],
@@ -3350,13 +3610,31 @@ impl eframe::App for PianoApp {
                         layers.push((pb.active_key_array(who), egui::Color32::from_rgb(r, g, b)));
                     }
                 }
-                draw_keyboard_layered(ui.painter(), rect, &keys, &layers);
+                draw_keyboard_layered(ui.painter(), kb_rect, &keys, &layers);
             } else {
                 let colors = KeyColors {
                     local: egui::Color32::from_rgb(self.local_color[0], self.local_color[1], self.local_color[2]),
                     remote: egui::Color32::from_rgb(self.remote_color[0], self.remote_color[1], self.remote_color[2]),
                 };
-                draw_keyboard(ui.painter(), rect, &self.local, &self.remote, colors);
+                draw_keyboard(ui.painter(), kb_rect, &local_shown, &self.remote, colors);
+            }
+
+            // Live pedal indicator: a thin sliver in the reserved strip left of
+            // the keyboard, showing both players' current pedal depth (local +
+            // remote), split diagonally like a simultaneous same-key press.
+            if show_pedal_indicator {
+                let strip = egui::Rect::from_min_max(
+                    rect.left_top(),
+                    egui::pos2(rect.left() + PEDAL_INDICATOR_W, rect.bottom()),
+                );
+                draw_pedal_indicator(
+                    ui.painter(),
+                    strip,
+                    self.local_pedal,
+                    self.remote_pedal,
+                    self.local_color,
+                    self.remote_color,
+                );
             }
 
             // Falling-panel interactions + drawing. The background is painted
@@ -3708,6 +3986,56 @@ fn draw_roll(
 
 /// Width of the sustain-pedal lane at the history roll's left edge.
 const PEDAL_LANE_W: f32 = 10.0;
+
+/// Width of the live pedal indicator sliver drawn to the left of the keyboard,
+/// and the gap between it and key 1 (so it reads as a separate element).
+const PEDAL_INDICATOR_W: f32 = 8.0;
+const PEDAL_INDICATOR_GAP: f32 = 4.0;
+
+/// Paint the live pedal indicator: a thin vertical sliver showing both players'
+/// current sustain-pedal depth. The sliver is split along its diagonal — local
+/// in the upper-left triangle, remote in the lower-right — the same visual
+/// language as `paint_key`'s simultaneous-press split, so a local + remote press
+/// is legible at once. Each triangle fades from the unlit background toward its
+/// player's full color as that side's pedal depth (CC64, 0..=127) rises, so a
+/// side with the pedal up simply stays dark (e.g. yours, on mic input, while the
+/// peer's half still lights).
+fn draw_pedal_indicator(
+    painter: &egui::Painter,
+    strip: egui::Rect,
+    local_pedal: u8,
+    remote_pedal: u8,
+    local_color: [u8; 3],
+    remote_color: [u8; 3],
+) {
+    const BG: f32 = 26.0; // matches the unlit lane gray used elsewhere
+    let bg = egui::Color32::from_gray(BG as u8);
+    // Depth → brightness: lerp from the background gray toward the full color.
+    let depth = |color: [u8; 3], level: u8| {
+        let t = (level as f32 / 127.0).clamp(0.0, 1.0);
+        let mix = |c: u8| (BG + (c as f32 - BG) * t) as u8;
+        egui::Color32::from_rgb(mix(color[0]), mix(color[1]), mix(color[2]))
+    };
+
+    painter.rect_filled(strip, 2.0, bg);
+    let tl = strip.left_top();
+    let tr = strip.right_top();
+    let bl = strip.left_bottom();
+    let br = strip.right_bottom();
+    let no_stroke = egui::Stroke::NONE;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tl, tr, bl],
+        depth(local_color, local_pedal),
+        no_stroke,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![tr, br, bl],
+        depth(remote_color, remote_pedal),
+        no_stroke,
+    ));
+    // A faint outline so the sliver stays visible even fully unlit.
+    painter.rect_stroke(strip, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+}
 
 /// Velocity → color mapping for roll marks: soft presses desaturate toward
 /// gray, hard ones keep the player's full color. Never darkens toward black —
