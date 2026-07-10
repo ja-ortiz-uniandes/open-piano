@@ -330,9 +330,10 @@ struct PianoApp {
     remote: [bool; KEY_COUNT],
     // Keys the user has "pinned" down with Ctrl+click — purely a local display
     // aid (e.g. holding a chord to point at while explaining). ORed into
-    // `local`'s rendering only; it never touches `local_note`, the synth, the
-    // roll, or the peer broadcast, and it's gated by the same recording/eval/
-    // playback lock as mouse-play.
+    // `local`'s rendering only *while Ctrl is held* (releasing Ctrl hides them
+    // again); it never touches `local_note`, the synth, the roll, or the peer
+    // broadcast, and toggling is gated by the same recording/eval/playback lock
+    // as mouse-play.
     held: [bool; KEY_COUNT],
 
     // --- sustain pedal (CC64; MIDI input only — the mic path can't produce
@@ -3585,10 +3586,14 @@ impl eframe::App for PianoApp {
             // Ctrl+click-pinned keys render exactly like a live local press
             // (your own color), so OR them into the local key array used for
             // drawing — display only; nothing downstream (synth/roll/net) ever
-            // sees `held`.
+            // sees `held`. Only shown *while Ctrl is held*: releasing Ctrl hides
+            // them (the pinned set is remembered and reappears on the next
+            // Ctrl-hold). `command` = Ctrl on Windows / Cmd on macOS.
             let mut local_shown = self.local;
-            for i in 0..KEY_COUNT {
-                local_shown[i] |= self.held[i];
+            if ui.input(|i| i.modifiers.command) {
+                for i in 0..KEY_COUNT {
+                    local_shown[i] |= self.held[i];
+                }
             }
 
             if let Some(pb) = &self.playback {
