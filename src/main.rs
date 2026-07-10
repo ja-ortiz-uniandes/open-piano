@@ -484,9 +484,14 @@ struct PianoApp {
     // built around real mouse-button state and does not sustain a
     // touch-originated gesture, which is why touch move was broken.
     //
-    // Target outer position accumulated across an active title-bar move drag
-    // (seeded from the live outer rect on the first drag frame); `None` when
-    // not moving.
+    // Grab offset for an active title-bar move drag: the pointer's position
+    // *relative to the window's client origin* at the moment the drag started,
+    // held constant for the whole gesture. Each frame we solve the window
+    // origin absolutely (`outer_rect.min + pointer_local - grab`) so the grab
+    // point stays pinned under the pointer. Absolute (not delta-accumulated),
+    // so re-issuing the same command is idempotent and a one-frame lag in the
+    // reported outer rect self-corrects instead of feeding the window's own
+    // motion back in as jitter. `None` when not moving.
     titlebar_drag: Option<egui::Pos2>,
     // Target (outer position, inner size) accumulated across an active
     // edge/corner resize drag; `None` when not resizing.
@@ -2170,16 +2175,21 @@ impl PianoApp {
                     // Skip while maximized: repositioning a maximized window is
                     // meaningless, and the double-click above already toggles it.
                     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    if !maximized {
-                        // Accumulate the per-frame delta onto a target seeded
-                        // from the live outer position, so a one-frame lag in
-                        // the reported rect can't drop movement.
-                        let seed =
-                            self.titlebar_drag.or_else(|| ctx.input(|i| i.viewport().outer_rect).map(|r| r.min));
-                        if let Some(pos) = seed {
-                            let new_pos = pos + drag.drag_delta();
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(new_pos));
-                            self.titlebar_drag = Some(new_pos);
+                    if let Some(local) = drag.interact_pointer_pos() {
+                        // Pin the grab offset once, on the first drag frame.
+                        let grab = *self.titlebar_drag.get_or_insert(local);
+                        if !maximized {
+                            // Solve the window origin absolutely so the grab
+                            // point stays under the pointer. Delta-accumulation
+                            // (the old approach) measured pointer motion in
+                            // window-local space, which flips sign as the
+                            // window moves under it — a feedback loop that
+                            // jittered. Reading the live outer rect each frame
+                            // makes this idempotent instead.
+                            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                                let target = outer.min + (local - grab);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
+                            }
                         }
                     }
                 } else {
