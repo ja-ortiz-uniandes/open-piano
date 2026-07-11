@@ -2268,9 +2268,10 @@ impl PianoApp {
         }
     }
 
-    /// Thin invisible drag handles on the window's four edges and corners, each
-    /// issuing `BeginResize` — the resize affordance the OS gave us before we
-    /// dropped its chrome. Each handle is its *own* foreground `Area` with a
+    /// Thin invisible drag handles on the window's side/bottom edges and four
+    /// corners (no top edge — that strip is the title bar's move-drag; see the
+    /// note on `handles`), each resizing the window — the affordance the OS
+    /// gave us before we dropped its chrome. Each handle is its *own* foreground `Area` with a
     /// thin bounding rect, so only the edge strips capture the pointer and the
     /// window interior falls through to the app (a single screen-spanning Area
     /// would block everything — see egui's `layer_id_at`). Skipped while
@@ -2292,13 +2293,16 @@ impl PianoApp {
         let p = egui::pos2;
         let bb = b_thick;
         // (handle rect, resize direction, cursor, is-corner) — corners then
-        // edges, tiled so none overlap.
+        // edges, tiled so none overlap. Deliberately NO north edge handle: the
+        // top strip belongs to the title bar's move-drag, and a resize handle
+        // there (a foreground Area, so it wins the pointer) hijacked
+        // move-drags that started near the top edge. Top resizing is still
+        // available via the NW/NE corners.
         let handles = [
             (rect(p(l, t), p(l + bb, t + bb)), D::NorthWest, C::ResizeNorthWest, true),
             (rect(p(r - bb, t), p(r, t + bb)), D::NorthEast, C::ResizeNorthEast, true),
             (rect(p(l, b - bb), p(l + bb, b)), D::SouthWest, C::ResizeSouthWest, true),
             (rect(p(r - bb, b - bb), p(r, b)), D::SouthEast, C::ResizeSouthEast, true),
-            (rect(p(l + bb, t), p(r - bb, t + bb)), D::North, C::ResizeNorth, false),
             (rect(p(l + bb, b - bb), p(r - bb, b)), D::South, C::ResizeSouth, false),
             (rect(p(l, t + bb), p(l + bb, b - bb)), D::West, C::ResizeWest, false),
             (rect(p(r - bb, t + bb), p(r, b - bb)), D::East, C::ResizeEast, false),
