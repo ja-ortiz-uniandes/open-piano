@@ -330,11 +330,17 @@ struct PianoApp {
     remote: [bool; KEY_COUNT],
     // Keys the user has "pinned" down with Ctrl+click — purely a local display
     // aid (e.g. holding a chord to point at while explaining). ORed into
-    // `local`'s rendering only *while Ctrl is held* (releasing Ctrl hides them
-    // again); it never touches `local_note`, the synth, the roll, or the peer
-    // broadcast, and toggling is gated by the same recording/eval/playback lock
-    // as mouse-play.
+    // `local`'s rendering only *while Ctrl is held*; it never touches
+    // `local_note`, the synth, the roll, or the peer broadcast, and toggling
+    // is gated by the same recording/eval/playback lock as mouse-play.
+    // Memoryless by design: releasing Ctrl both hides *and clears* the pinned
+    // set (see `held_cmd_down`), so each Ctrl-hold starts a fresh selection
+    // instead of resurrecting whatever was pinned last time — a chord you're
+    // done displaying shouldn't pop back up on the next unrelated Ctrl-hold.
     held: [bool; KEY_COUNT],
+    // Whether Ctrl/Cmd was down as of the last frame — lets us detect the
+    // release edge and clear `held` exactly once (see `held` doc comment).
+    held_cmd_down: bool,
 
     // --- sustain pedal (CC64; MIDI input only — the mic path can't produce
     // pedal events, see input.rs) ---
@@ -579,6 +585,7 @@ impl PianoApp {
             local: [false; KEY_COUNT],
             remote: [false; KEY_COUNT],
             held: [false; KEY_COUNT],
+            held_cmd_down: false,
             local_pedal: 0,
             remote_pedal: 0,
             last_pedal_sent: 0,
@@ -3543,6 +3550,18 @@ impl eframe::App for PianoApp {
                 }
             }
 
+            // `command` = Ctrl on Windows / Cmd on macOS — the modifier for
+            // both pinning a key (below) and showing the pinned set (further
+            // down). Detect the release edge here so the pinned set clears
+            // the instant Ctrl goes up, before anything reads `held` this
+            // frame — memoryless, so the next Ctrl-hold starts empty instead
+            // of resurrecting a chord pinned in some earlier, unrelated hold.
+            let cmd = ui.input(|i| i.modifiers.command);
+            if self.held_cmd_down && !cmd {
+                self.held = [false; KEY_COUNT];
+            }
+            self.held_cmd_down = cmd;
+
             // Mouse play is disabled while capturing training data (a click
             // makes no real sound and isn't in the MIDI labels) and while a
             // score is open (clicking keys would fight the score's own
@@ -3568,9 +3587,7 @@ impl eframe::App for PianoApp {
             } else {
                 // Ctrl+click pins/unpins a key "held" for display (see `held`),
                 // so suppress mouse-play while Ctrl is down — otherwise the same
-                // press would also sound a note. (`command` = Ctrl on Windows,
-                // Cmd on macOS — the same modifier the roll's Ctrl+click uses.)
-                let cmd = ui.input(|i| i.modifiers.command);
+                // press would also sound a note.
                 // While the button is held, the key under the pointer is played;
                 // dragging across keys glides note-to-note.
                 let target = if response.is_pointer_button_down_on() && !cmd {
@@ -3600,11 +3617,11 @@ impl eframe::App for PianoApp {
             // Ctrl+click-pinned keys render exactly like a live local press
             // (your own color), so OR them into the local key array used for
             // drawing — display only; nothing downstream (synth/roll/net) ever
-            // sees `held`. Only shown *while Ctrl is held*: releasing Ctrl hides
-            // them (the pinned set is remembered and reappears on the next
-            // Ctrl-hold). `command` = Ctrl on Windows / Cmd on macOS.
+            // sees `held`. Only shown *while Ctrl is held*; releasing Ctrl both
+            // hides them and clears `held` (see the release-edge check above),
+            // so the set never carries over to a later, unrelated Ctrl-hold.
             let mut local_shown = self.local;
-            if ui.input(|i| i.modifiers.command) {
+            if cmd {
                 for i in 0..KEY_COUNT {
                     local_shown[i] |= self.held[i];
                 }
