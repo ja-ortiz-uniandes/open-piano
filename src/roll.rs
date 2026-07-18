@@ -195,6 +195,12 @@ impl Roll {
     /// Advance the roll clock. Call once per frame, before rendering.
     pub fn tick(&mut self, now: Instant) {
         if !self.paused {
+            // NOTE (L11): deliberately *not* clamped. Unlike the score playhead
+            // (a fixed-length piece), the roll is a live recorder whose clock
+            // tracks real elapsed wall time — a key held for minutes must scroll
+            // the paper for those minutes (see `held_key_keeps_the_clock_running`).
+            // The idle-pause auto-break already bounds blank paper when nothing
+            // is held; clamping here would break that intended behavior.
             self.roll_now_s += now.saturating_duration_since(self.last_frame).as_secs_f64();
             // Freeze only when nothing is held: a key held for minutes is
             // still an extending mark, and the paper must keep moving under it.
@@ -213,6 +219,34 @@ impl Roll {
                             self.paused = true;
                             self.roll_now_s =
                                 self.last_event_roll_s + self.section_tail.as_secs_f64();
+                            // The snap-back rewinds the live edge into trimmed
+                            // dead air: any separator the user inserted out
+                            // there (e.g. a Ctrl+click near the pre-snap edge)
+                            // now sits *beyond* the clock. Drop those — they'd
+                            // otherwise leave `separators` unsorted (a resume
+                            // pushes the new boundary at the rewound clock) and
+                            // underflow the SMF delta math in `save_midi`.
+                            self.separators.retain(|s| s.at <= self.roll_now_s);
+                            // Pedal spans (unlike notes) can accrue during the
+                            // trimmed dead air, since pedal traffic deliberately
+                            // doesn't reset the idle timer. Clamp any that
+                            // started or ended beyond the rewound clock back
+                            // onto it — in place, so the open-span indices stay
+                            // valid: a still-held pedal keeps showing from the
+                            // new edge, phantom marks stop overlaying the next
+                            // section, and `save_midi` never emits a release
+                            // before its press (end >= start always holds).
+                            let clock = self.roll_now_s;
+                            for p in self.pedal_segments.iter_mut() {
+                                if p.start_s > clock {
+                                    p.start_s = clock;
+                                }
+                                if let Some(e) = p.end_s.as_mut() {
+                                    if *e > clock {
+                                        *e = clock;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -241,7 +275,12 @@ impl Roll {
                     // the lead-in then pushes this first note a fixed margin
                     // past the separator line.
                     if !self.segments.is_empty() {
-                        self.separators.push(Instance { at: self.roll_now_s, name: None });
+                        // Sorted insert, not a bare push: a manual separator can
+                        // outlive the snap-back only when it's <= the rewound
+                        // clock (tick drops the rest), so `separators` stays
+                        // sorted for rendering and for `save_midi`'s delta math.
+                        let pos = self.separators.partition_point(|s| s.at < self.roll_now_s);
+                        self.separators.insert(pos, Instance { at: self.roll_now_s, name: None });
                         self.roll_now_s += self.section_lead_in.as_secs_f64();
                     }
                 }
@@ -399,6 +438,15 @@ impl Roll {
         self.separators.insert(pos, Instance { at, name: None });
         self.dirty = true;
     }
+
+    /// Whether a separator currently sits at `at`, within the same dedupe
+    /// tolerance [`insert_separator`] uses. Lets the UI prune its broadcast list
+    /// of breaks the idle snap-back trimmed away, so a dropped break stops being
+    /// re-sent on the heartbeat instead of being re-created on the peer forever
+    /// (F1).
+    pub fn has_separator_at(&self, at: f64) -> bool {
+        self.separators.iter().any(|s| (s.at - at).abs() < 1e-9)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,10 +533,13 @@ pub fn save_midi(
     for (sep, text) in roll.separators.iter().zip(&marker_texts) {
         let at = ticks(sep.at);
         conductor.push(TrackEvent {
-            delta: u28::from(at - prev),
+            // `separators` is kept sorted, so `at >= prev`; saturating_sub is a
+            // belt-and-suspenders guard against a stray out-of-order boundary
+            // ever underflowing this delta into a garbage multi-hour value.
+            delta: u28::from(at.saturating_sub(prev)),
             kind: TrackEventKind::Meta(MetaMessage::Marker(text.as_bytes())),
         });
-        prev = at;
+        prev = at.max(prev);
     }
     conductor.push(TrackEvent {
         delta: u28::from(0),
@@ -536,10 +587,10 @@ pub fn save_midi(
                 _ => MidiMessage::Controller { controller: u7::from(64), value: u7::from(value) },
             };
             track.push(TrackEvent {
-                delta: u28::from(at - prev),
+                delta: u28::from(at.saturating_sub(prev)),
                 kind: TrackEventKind::Midi { channel: u4::from(0), message },
             });
-            prev = at;
+            prev = at.max(prev);
         }
         track.push(TrackEvent {
             delta: u28::from(0),
@@ -807,6 +858,47 @@ mod tests {
     }
 
     #[test]
+    fn manual_separator_in_dead_air_survives_snap_back_sorted() {
+        // C2 regression: a note near t=0, a manual break inserted near the live
+        // edge during a long idle, then the pause snaps the clock back behind
+        // that break. The stale break must be dropped so `separators` stays
+        // sorted and `save_midi` never underflows its delta math.
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        // Clock runs on during the idle; Ctrl+click a break near the live edge.
+        roll.tick(t(base, 20.0));
+        roll.insert_separator(19.0);
+        assert_eq!(roll.separators.len(), 1);
+        // Past the threshold: pause fires, snaps back to last note (1.0) + tail
+        // (2.0) = 3.0, and the stale break at 19.0 (now beyond the clock) drops.
+        roll.tick(t(base, 55.0));
+        assert!(roll.is_paused());
+        assert_eq!(roll.now_s(), 3.0);
+        assert!(roll.separators.iter().all(|s| s.at <= roll.now_s()));
+        // The next note resumes with a boundary at the rewound clock; the list
+        // stays sorted.
+        roll.note(Who::Local, NoteMsg::On(62, 100), [0; 3]);
+        let ats: Vec<f64> = roll.separators.iter().map(|s| s.at).collect();
+        assert!(ats.windows(2).all(|w| w[0] <= w[1]), "separators must stay sorted: {ats:?}");
+        // And a save doesn't panic (dev) / corrupt (release).
+        let dir = std::env::temp_dir().join(format!("op-roll-c2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c2.mid");
+        save_midi(&roll, [0; 3], [0; 3], &path).expect("save must succeed");
+        assert!(midly::Smf::parse(&std::fs::read(&path).unwrap()).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn pedal_never_resets_the_idle_timer() {
         let base = Instant::now();
         let mut roll = Roll::new();
@@ -836,6 +928,38 @@ mod tests {
         roll.note(Who::Local, NoteMsg::On(61, 100), [0; 3]);
         assert_eq!(roll.separators.len(), 1);
         assert_eq!(roll.separators[0].at, 3.0);
+    }
+
+    #[test]
+    fn pedal_spans_in_trimmed_dead_air_are_clamped_to_the_clock() {
+        // M4 regression: half-pedaling during a long idle, then the pause snaps
+        // the clock back. Every pedal span must end up within [.., now] with
+        // end >= start, so nothing overlays the next section or saves stuck-down.
+        let base = Instant::now();
+        let mut roll = Roll::new();
+        roll.set_timing(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(30)),
+        );
+        roll.tick(t(base, 0.0));
+        roll.note(Who::Local, NoteMsg::On(60, 100), [0; 3]);
+        roll.tick(t(base, 1.0));
+        roll.note(Who::Local, NoteMsg::Off(60), [0; 3]);
+        // Pedal activity across the dead air (never resets the idle timer).
+        for (at, level) in [(5.0, 127u8), (10.0, 64), (20.0, 0)] {
+            roll.tick(t(base, at));
+            roll.pedal(Who::Local, level);
+        }
+        // Past the threshold: pause fires, clock snaps back to 3.0.
+        roll.tick(t(base, 55.0));
+        assert_eq!(roll.now_s(), 3.0);
+        let now = roll.now_s();
+        for p in &roll.pedal_segments {
+            assert!(p.start_s <= now, "pedal start {} beyond clock {now}", p.start_s);
+            let end = p.end_s.unwrap_or(now);
+            assert!(end <= now && end >= p.start_s, "span [{}, {end}] invalid", p.start_s);
+        }
     }
 
     #[test]

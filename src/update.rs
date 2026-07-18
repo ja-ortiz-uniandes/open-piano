@@ -177,12 +177,16 @@ fn pick_update(
     let newest = |keep: &dyn Fn(&str) -> bool| -> Result<Option<String>, Box<dyn std::error::Error>> {
         let mut best: Option<String> = None;
         for r in releases {
-            if !keep(&r.version) || !bump_is_greater(current, &r.version)? {
+            // A single malformed tag (e.g. `nightly-2026-07-01`, `v0.8`) must
+            // not fail the whole check — that would brick auto-update for every
+            // installed copy, *including* against the later well-formed release
+            // that would fix it. Skip unparseable / not-newer releases instead.
+            if !keep(&r.version) || !matches!(bump_is_greater(current, &r.version), Ok(true)) {
                 continue;
             }
             let is_better = match &best {
                 None => true,
-                Some(b) => bump_is_greater(b, &r.version)?,
+                Some(b) => matches!(bump_is_greater(b, &r.version), Ok(true)),
             };
             if is_better {
                 best = Some(r.version.clone());
@@ -191,7 +195,10 @@ fn pick_update(
         Ok(best)
     };
 
-    let is_pre = |v: &str| v.starts_with("0.");
+    // Pre-release = any `0.x.y` tag (the workflow's own `v0.*` rule) *or* any
+    // tag carrying a semver pre-release suffix (`1.0.0-rc.1`). Classifying the
+    // latter as stable would pull stable installs onto release candidates.
+    let is_pre = |v: &str| v.starts_with("0.") || v.contains('-');
     let is_stable = |v: &str| !is_pre(v);
 
     // 1. A higher stable release always wins (for stable and preview users alike).

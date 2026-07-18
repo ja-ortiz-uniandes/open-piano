@@ -127,8 +127,14 @@ impl EnvParams {
 struct SynthState {
     voices: [Voice; MAX_VOICES],
     sample_rate: f32,
-    /// Per-channel output gain (indexed by `Channel as usize`). 0.0 mutes.
+    /// Per-channel output gain (indexed by `Channel as usize`), ramped toward
+    /// `gain_target` per sample so a mute/unmute fades instead of popping.
     gain: [f32; CHANNELS],
+    /// Where each channel's gain is heading; `Cmd::Gain` sets this, the
+    /// per-sample slew in `next_sample` chases it.
+    gain_target: [f32; CHANNELS],
+    /// Per-sample gain-slew coefficient (~5 ms), precomputed from the rate.
+    gain_slew: f32,
     /// Metronome click: a short percussive sine blip, separate from the
     /// harmonic voices. Only one sounds at a time (a new tick retriggers it).
     click_env: f32,   // current amplitude, 0..1 (0 = silent)
@@ -144,6 +150,10 @@ impl SynthState {
             voices: [Voice::IDLE; MAX_VOICES],
             sample_rate,
             gain: [1.0; CHANNELS],
+            gain_target: [1.0; CHANNELS],
+            // ~5 ms ramp: fast enough to feel instant, slow enough to erase the
+            // step discontinuity (click) an instant gain change would make.
+            gain_slew: 1.0 - (-1.0 / (0.005 * sample_rate)).exp(),
             click_env: 0.0,
             click_phase: 0.0,
             click_inc: 0.0,
@@ -172,13 +182,27 @@ impl SynthState {
         let freq = 440.0 * 2f32.powf((midi as f32 - 69.0) / 12.0);
         let inc = freq / self.sample_rate;
 
-        let slot = self
+        // Retrigger of a voice already on this note+channel: re-enter Attack but
+        // *keep* its phase and current envelope. Resetting them to 0 (as a fresh
+        // start does) mid-ring is an amplitude+phase discontinuity — an audible
+        // click on fast repeats.
+        if let Some(slot) = self
             .voices
             .iter()
             .position(|v| v.stage != Stage::Idle && v.midi == midi && v.channel == channel)
-            .or_else(|| self.voices.iter().position(|v| v.stage == Stage::Idle))
+        {
+            self.voices[slot].inc = inc;
+            self.voices[slot].stage = Stage::Attack;
+            return;
+        }
+
+        // Else a free slot, else steal the quietest voice (lowest env → smallest
+        // discontinuity when it's cut).
+        let slot = self
+            .voices
+            .iter()
+            .position(|v| v.stage == Stage::Idle)
             .unwrap_or_else(|| {
-                // Steal the quietest voice.
                 let mut quietest = 0;
                 for i in 1..self.voices.len() {
                     if self.voices[i].env < self.voices[quietest].env {
@@ -214,6 +238,11 @@ impl SynthState {
 
     /// Advance all voices one sample and return the mixed mono output.
     fn next_sample(&mut self, env: &EnvParams) -> f32 {
+        // Chase each channel's gain target (mute/unmute fades, no click).
+        for c in 0..CHANNELS {
+            self.gain[c] += (self.gain_target[c] - self.gain[c]) * self.gain_slew;
+        }
+
         let amp_sum: f32 = HARMONICS.iter().sum();
         let mut mix = 0.0;
         for v in self.voices.iter_mut() {
@@ -226,7 +255,16 @@ impl SynthState {
                         v.stage = Stage::Decay;
                     }
                 }
-                Stage::Decay => v.env *= env.decay_mult,
+                // Ring down while held — but floor to Idle once inaudible, so a
+                // long-held (or off-dropped) voice can't sit forever doing
+                // denormal multiplies + 4 sin() calls per sample for nothing.
+                Stage::Decay => {
+                    v.env *= env.decay_mult;
+                    if v.env < 0.0008 {
+                        v.stage = Stage::Idle;
+                        continue;
+                    }
+                }
                 Stage::Release => {
                     v.env *= env.release_mult;
                     if v.env < 0.0008 {
@@ -265,8 +303,10 @@ impl SynthState {
             self.click_env = 0.0;
         }
 
-        // Soft clamp so dense chords can't blow past full-scale.
-        (mix * MASTER_GAIN).clamp(-1.0, 1.0)
+        // Soft-knee limiter: tanh rounds off dense-mix peaks instead of the old
+        // hard `.clamp`, which flat-topped (audibly distorted) anything over
+        // full-scale. Near-linear for the quiet majority of the signal.
+        (mix * MASTER_GAIN).tanh()
     }
 }
 
@@ -335,9 +375,19 @@ impl Synth {
         let _ = self.cmd_tx.send(Cmd::Tick(freq_hz, accent, volume));
     }
 
-    /// Stop the audio thread and wait for it to wind down.
+    /// Stop the audio thread and wait for it to wind down. Redundant with
+    /// [`Drop`] (dropping the handle tears the stream down the same way), kept
+    /// for an explicit, eager shutdown before process exit.
     #[allow(dead_code)]
-    pub fn stop(mut self) {
+    pub fn stop(self) {
+        // `self` drops here → `Drop` signals + joins the thread.
+    }
+}
+
+impl Drop for Synth {
+    /// Tear down the output stream/thread when the handle goes away, so a
+    /// dropped `Synth` never leaks its cpal stream and output thread.
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(j) = self.join.take() {
             let _ = j.join();
@@ -378,7 +428,7 @@ fn output_loop(
                 match cmd {
                     Cmd::On(m, ch) => state.note_on(m, ch),
                     Cmd::Off(m, ch) => state.note_off(m, ch),
-                    Cmd::Gain(ch, g) => state.gain[ch as usize] = g,
+                    Cmd::Gain(ch, g) => state.gain_target[ch as usize] = g,
                     Cmd::Tick(freq_hz, accent, volume) => state.trigger_click(freq_hz, accent, volume),
                 }
             }

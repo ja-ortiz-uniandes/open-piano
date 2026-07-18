@@ -6,6 +6,10 @@ pub const MIDI_LOW: u8 = 21; // A0
 pub const MIDI_HIGH: u8 = 108; // C8
 pub const KEY_COUNT: usize = (MIDI_HIGH - MIDI_LOW + 1) as usize; // 88
 
+/// Bytes needed to pack one bool per key into a bitmask (88 keys → 11 bytes).
+/// Used by [`Packet::Held`] to snapshot the whole pinned-key set in one frame.
+pub const HELD_MASK_BYTES: usize = KEY_COUNT.div_ceil(8); // 11
+
 /// The velocity used for note-ons that have no real velocity behind them —
 /// mouse clicks on the on-screen keyboard and the mic/ONNX path (a
 /// posteriorgram has no force signal). Chosen mezzo-forte-ish so the flat
@@ -42,26 +46,46 @@ impl NoteMsg {
 
     /// Decode a received datagram. Returns `None` for malformed / unknown
     /// data. A velocity-less 2-byte On (an older peer) decodes with
-    /// [`DEFAULT_VELOCITY`] rather than being dropped.
+    /// [`DEFAULT_VELOCITY`] rather than being dropped. A note-on carrying an
+    /// explicit velocity of 0 is, by the MIDI convention, a note-off — so a
+    /// hostile/buggy peer can't strand a key "on" with an un-releasable
+    /// zero-velocity voice (see `synth.rs` / the `on`/`remote` arrays).
     pub fn decode(buf: &[u8]) -> Option<NoteMsg> {
         if buf.len() < 2 {
             return None;
         }
         match buf[0] {
-            0x90 => Some(NoteMsg::On(buf[1], buf.get(2).copied().unwrap_or(DEFAULT_VELOCITY))),
+            0x90 => match buf.get(2) {
+                Some(0) => Some(NoteMsg::Off(buf[1])),
+                Some(&v) => Some(NoteMsg::On(buf[1], v)),
+                None => Some(NoteMsg::On(buf[1], DEFAULT_VELOCITY)),
+            },
             0x80 => Some(NoteMsg::Off(buf[1])),
             _ => None,
         }
     }
 }
 
-/// A packet on the P2P wire: either a note transition or a peer announcing the
-/// color it wants its notes drawn in. Colors travel over the network so each
-/// player picks *their own* color and the other end renders it — see `net.rs`.
+/// A packet on the P2P wire: a note transition, or one of several small
+/// shared-surface announcements (color, name, metronome, pedal, pins, …).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
-    Note(NoteMsg),
-    /// The sender's chosen display color, as sRGB `[r, g, b]`.
+    /// A note transition plus a per-sender monotonic sequence number. The seq
+    /// totally orders the sender's note-related traffic (notes *and* the
+    /// [`Packet::Live`] snapshots), so a whole-state snapshot delivered out of
+    /// order — reordered datagrams, notably during iroh's relay→direct path
+    /// migration — can't resurrect a note a later `Note::Off` already cleared
+    /// (or extinguish a fresh press). Note events always apply and advance the
+    /// receiver's high-water mark; snapshots apply only if not stale (F6).
+    /// Older peers omit the seq on the wire → decodes as 0, which still applies
+    /// (notes are unconditional) but doesn't protect their snapshots.
+    Note(NoteMsg, u32),
+    /// The sender's chosen display color, as sRGB `[r, g, b]`. NOTE: the
+    /// *receiver currently ignores the payload* — each player renders the peer
+    /// in a fixed local remote color (see `main.rs`'s `Packet::Color` handler),
+    /// because fresh installs share one default color. The variant is kept on
+    /// the wire (and still sent) so the protocol stays stable if per-peer colors
+    /// are ever honored.
     Color([u8; 3]),
     /// The sender's chosen display name (UTF-8). Travels over the network the
     /// same way colors do — each player picks their own name and the other end
@@ -84,12 +108,13 @@ pub enum Packet {
     /// back via `MetroBeat`s (last-writer-wins, single scheduler). Status `0xB1`.
     MetroCtl { on: bool, bpm: u16 },
     /// Per-beat click pitch (Hz) and level (0..1) tables, indexed the same way
-    /// as `Metronome::beat_freqs`/`beat_volumes` in `main.rs`. Unlike
-    /// `MetroBeat`/`MetroCtl` there's no host authority here — whichever side
-    /// edits its Preferences last broadcasts its tables and the other side
-    /// adopts them verbatim, so both players' clicks sound identical. Sent on
-    /// every edit and re-sent on the color heartbeat so a dropped datagram
-    /// doesn't leave the two sides mismatched. Status `0xB2`.
+    /// as `Metronome::beat_freqs`/`beat_volumes` in `main.rs`. The **host is
+    /// authoritative** (like `MetroBeat`/`MetroCtl`): only the host broadcasts
+    /// the table — on connect and on the color heartbeat — so the two sides
+    /// can't *swap* tables (each sending before it processes the other's) or
+    /// oscillate. A follower adopts what the host sends and pushes its own edits
+    /// to the host, which adopts them and re-broadcasts on the next heartbeat,
+    /// so a dropped edit heals within a second. Status `0xB2`.
     MetroBeatTable { freqs: Vec<f32>, volumes: Vec<f32> },
     /// The sender's sustain-pedal (CC64) level, 0..=127. Deliberately its own
     /// `Packet` variant, never folded into [`NoteMsg`]: pedal events must be
@@ -98,6 +123,74 @@ pub enum Packet {
     /// heartbeat: CC64 fires frequently while half-pedaling, so a dropped
     /// datagram self-heals on the next change). Status `0xB3`.
     Pedal { level: u8 },
+    /// The sender's full set of Ctrl+click-**pinned** keys, packed as an 88-bit
+    /// mask (`HELD_MASK_BYTES` bytes, key `i` = bit `i&7` of byte `i>>3`). A
+    /// display-only overlay — the receiver lights these keys in the sender's
+    /// color exactly as it does live presses, so the pinned "point at this
+    /// chord" gesture is a single shared thing both peers see (see `main.rs`
+    /// `held`/`remote_held`). Sent as a whole-state **snapshot** on every
+    /// change (pin/unpin, and the all-zero clear when Ctrl is released) and
+    /// re-sent on the color heartbeat while any key is pinned: idempotent, so a
+    /// dropped datagram can't leave the two views mismatched. Status `0xB4`.
+    Held { seq: u32, mask: [u8; HELD_MASK_BYTES] },
+    /// The sender's full set of **currently-sounding live notes**, packed as the
+    /// same 88-bit mask as [`Packet::Held`]. An idempotent whole-state snapshot
+    /// riding the heartbeat: the per-event [`NoteMsg`] datagrams are
+    /// fire-and-forget, so a dropped note-**off** would otherwise leave a remote
+    /// key (and its synth voice) stuck forever, and a chord held across a
+    /// reconnect would never re-light. The receiver reconciles its `remote`
+    /// array against this (see `main.rs` `reconcile_remote_live`), so any lost
+    /// transition self-heals within a heartbeat. Status `0xB5`.
+    Live { seq: u32, mask: [u8; HELD_MASK_BYTES] },
+    /// The sender's manually-inserted segment-break times (roll-clock seconds),
+    /// so a Ctrl+click break is one shared thing both players see rather than a
+    /// line on one screen only. A whole-list snapshot re-sent on the heartbeat;
+    /// the receiver folds each time into its own roll (deduped), so a dropped
+    /// datagram converges. Status `0xB6`, `u8` count then that many big-endian
+    /// `f64`s (count capped at 255 — far more manual breaks than a session has).
+    Separators(Vec<f64>),
+}
+
+/// Pack the per-key pinned flags into the wire bitmask (see [`Packet::Held`]).
+pub fn pack_held(keys: &[bool; KEY_COUNT]) -> [u8; HELD_MASK_BYTES] {
+    let mut mask = [0u8; HELD_MASK_BYTES];
+    for (i, &on) in keys.iter().enumerate() {
+        if on {
+            mask[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    mask
+}
+
+/// Unpack the wire bitmask back into per-key pinned flags (see [`Packet::Held`]).
+pub fn unpack_held(mask: &[u8; HELD_MASK_BYTES]) -> [bool; KEY_COUNT] {
+    let mut keys = [false; KEY_COUNT];
+    for (i, key) in keys.iter_mut().enumerate() {
+        *key = mask[i >> 3] & (1 << (i & 7)) != 0;
+    }
+    keys
+}
+
+/// Clamp a wire-received click frequency (Hz) to the audible range the UI
+/// itself enforces, mapping non-finite values to a safe default. Keeps a
+/// hostile/garbled [`Packet::MetroBeatTable`] from ever reaching the synth or
+/// the persisted prefs with a NaN/∞ pitch.
+pub(crate) fn sanitize_freq(f: f32) -> f32 {
+    if f.is_finite() {
+        f.clamp(20.0, 8000.0)
+    } else {
+        1200.0
+    }
+}
+
+/// Clamp a wire-received per-beat click level to `0..=1`, mapping non-finite
+/// values to full level. See [`sanitize_freq`].
+pub(crate) fn sanitize_volume(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 impl Packet {
@@ -108,7 +201,14 @@ impl Packet {
     /// u16.)
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Packet::Note(n) => n.encode(),
+            Packet::Note(n, seq) => {
+                // The 2/3-byte note form with the seq appended big-endian. An
+                // older peer's `NoteMsg::decode` reads only the leading bytes and
+                // ignores the trailing seq, so this stays wire-compatible.
+                let mut buf = n.encode();
+                buf.extend_from_slice(&seq.to_be_bytes());
+                buf
+            }
             Packet::Color([r, g, b]) => vec![0xC0, *r, *g, *b],
             Packet::Name(name) => {
                 // `[0xC1, len, ..utf8..]`. Length-prefixed with a single byte so
@@ -153,13 +253,52 @@ impl Packet {
                 buf
             }
             Packet::Pedal { level } => vec![0xB3, *level],
+            Packet::Held { seq, mask } => {
+                let mut buf = Vec::with_capacity(5 + HELD_MASK_BYTES);
+                buf.push(0xB4);
+                buf.extend_from_slice(&seq.to_be_bytes());
+                buf.extend_from_slice(mask);
+                buf
+            }
+            Packet::Live { seq, mask } => {
+                let mut buf = Vec::with_capacity(5 + HELD_MASK_BYTES);
+                buf.push(0xB5);
+                buf.extend_from_slice(&seq.to_be_bytes());
+                buf.extend_from_slice(mask);
+                buf
+            }
+            Packet::Separators(times) => {
+                let len = times.len().min(u8::MAX as usize);
+                let mut buf = Vec::with_capacity(2 + len * 8);
+                buf.push(0xB6);
+                buf.push(len as u8);
+                for t in times.iter().take(len) {
+                    buf.extend_from_slice(&t.to_be_bytes());
+                }
+                buf
+            }
         }
     }
 
     /// Decode a received datagram, or `None` for malformed / unknown data.
     pub fn decode(buf: &[u8]) -> Option<Packet> {
+        // Read a big-endian u32 at `off`, or 0 if the buffer is too short (an
+        // older peer that didn't stamp a seq).
+        let read_u32 = |off: usize| -> u32 {
+            if buf.len() >= off + 4 {
+                u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+            } else {
+                0
+            }
+        };
         match buf.first()? {
-            0x90 | 0x80 => NoteMsg::decode(buf).map(Packet::Note),
+            0x90 | 0x80 => {
+                let msg = NoteMsg::decode(buf)?;
+                // The seq follows the note bytes: 3 for a 0x90 On, 2 for a 0x80
+                // Off. (A velocity-less 0x90 has no seq → 0.)
+                let seq = read_u32(if buf[0] == 0x90 { 3 } else { 2 });
+                Some(Packet::Note(msg, seq))
+            }
             0xC0 if buf.len() >= 4 => Some(Packet::Color([buf[1], buf[2], buf[3]])),
             0xC1 if buf.len() >= 2 => {
                 let len = buf[1] as usize;
@@ -188,11 +327,44 @@ impl Packet {
                     let off = 2 + i * 4;
                     f32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
                 };
-                let freqs = (0..len).map(read_f32).collect();
-                let volumes = (0..len).map(|i| read_f32(len + i)).collect();
+                // Sanitize at the decode boundary so consumers (and the local
+                // prefs the adopt path persists) can never see a NaN/∞ click
+                // frequency or level: a non-finite freq would emit NaN samples
+                // straight to the audio device, and serde would later write it
+                // as JSON `null`, wiping every local preference on next launch.
+                let freqs = (0..len).map(|i| sanitize_freq(read_f32(i))).collect();
+                let volumes = (0..len).map(|i| sanitize_volume(read_f32(len + i))).collect();
                 Some(Packet::MetroBeatTable { freqs, volumes })
             }
             0xB3 if buf.len() >= 2 => Some(Packet::Pedal { level: buf[1] }),
+            0xB4 if buf.len() >= 5 + HELD_MASK_BYTES => {
+                let mut mask = [0u8; HELD_MASK_BYTES];
+                mask.copy_from_slice(&buf[5..5 + HELD_MASK_BYTES]);
+                Some(Packet::Held { seq: read_u32(1), mask })
+            }
+            0xB5 if buf.len() >= 5 + HELD_MASK_BYTES => {
+                let mut mask = [0u8; HELD_MASK_BYTES];
+                mask.copy_from_slice(&buf[5..5 + HELD_MASK_BYTES]);
+                Some(Packet::Live { seq: read_u32(1), mask })
+            }
+            0xB6 if buf.len() >= 2 => {
+                let len = buf[1] as usize;
+                if buf.len() < 2 + len * 8 {
+                    return None;
+                }
+                let times = (0..len)
+                    .map(|i| {
+                        let off = 2 + i * 8;
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&buf[off..off + 8]);
+                        f64::from_be_bytes(b)
+                    })
+                    // Drop non-finite times so a garbled frame can't poison the
+                    // roll's separator math.
+                    .filter(|t| t.is_finite())
+                    .collect();
+                Some(Packet::Separators(times))
+            }
             _ => None,
         }
     }
@@ -205,9 +377,9 @@ mod tests {
     #[test]
     fn packet_encode_decode_roundtrips() {
         for p in [
-            Packet::Note(NoteMsg::On(60, 100)),
-            Packet::Note(NoteMsg::On(108, 1)),
-            Packet::Note(NoteMsg::Off(21)),
+            Packet::Note(NoteMsg::On(60, 100), 0),
+            Packet::Note(NoteMsg::On(108, 1), 42),
+            Packet::Note(NoteMsg::Off(21), 4_000_000_000),
             Packet::Pedal { level: 0 },
             Packet::Pedal { level: 127 },
             Packet::Color([220, 60, 60]),
@@ -223,9 +395,38 @@ mod tests {
                 freqs: vec![1800.0, 1200.0, 1200.0, 1200.0],
                 volumes: vec![1.0, 0.5, 0.75, 0.25],
             },
+            Packet::Held { seq: 0, mask: [0; HELD_MASK_BYTES] },
+            Packet::Held { seq: 7, mask: [0xFF; HELD_MASK_BYTES] },
+            Packet::Live { seq: 0, mask: [0; HELD_MASK_BYTES] },
+            Packet::Live { seq: 65_536, mask: [0b1010_1010; HELD_MASK_BYTES] },
+            Packet::Separators(vec![]),
+            Packet::Separators(vec![3.0, 5.5, 128.25]),
+            Packet::Held {
+                seq: 1,
+                mask: pack_held(&{
+                    let mut k = [false; KEY_COUNT];
+                    k[0] = true; // A0 (lowest)
+                    k[39] = true; // middle C
+                    k[KEY_COUNT - 1] = true; // C8 (highest)
+                    k
+                }),
+            },
         ] {
             assert_eq!(Packet::decode(&p.encode()), Some(p.clone()), "roundtrip {p:?}");
         }
+    }
+
+    #[test]
+    fn held_mask_roundtrips_through_pack_unpack() {
+        let mut keys = [false; KEY_COUNT];
+        keys[0] = true;
+        keys[39] = true;
+        keys[KEY_COUNT - 1] = true;
+        assert_eq!(unpack_held(&pack_held(&keys)), keys);
+        // No bits beyond the 88 keys are ever set: the top mask byte only holds
+        // the last KEY_COUNT % 8 keys.
+        let full = pack_held(&[true; KEY_COUNT]);
+        assert_eq!(unpack_held(&full), [true; KEY_COUNT]);
     }
 
     #[test]
@@ -236,6 +437,7 @@ mod tests {
         assert_eq!(Packet::decode(&[0xB2, 2, 0, 0, 0, 0]), None); // too short for MetroBeatTable
         assert_eq!(Packet::decode(&[0xC1, 5, b'h', b'i']), None); // name len exceeds payload
         assert_eq!(Packet::decode(&[0xB3]), None); // too short for Pedal
+        assert_eq!(Packet::decode(&[0xB4, 0, 0]), None); // too short for Held (needs 4 seq + 11 mask)
         assert_eq!(Packet::decode(&[0x7F, 0, 0]), None); // unknown status
     }
 
@@ -245,8 +447,33 @@ mod tests {
         // instead of dropping the note.
         assert_eq!(
             Packet::decode(&[0x90, 60]),
-            Some(Packet::Note(NoteMsg::On(60, DEFAULT_VELOCITY)))
+            Some(Packet::Note(NoteMsg::On(60, DEFAULT_VELOCITY), 0))
         );
+    }
+
+    #[test]
+    fn note_on_velocity_zero_decodes_as_off() {
+        // A note-on carrying an explicit velocity of 0 is a note-off by MIDI
+        // convention — never a stuck On(n, 0) a peer could use to strand a key.
+        assert_eq!(Packet::decode(&[0x90, 60, 0]), Some(Packet::Note(NoteMsg::Off(60), 0)));
+        // A non-zero explicit velocity still decodes as a real On.
+        assert_eq!(Packet::decode(&[0x90, 60, 77]), Some(Packet::Note(NoteMsg::On(60, 77), 0)));
+    }
+
+    #[test]
+    fn metro_table_nan_is_sanitized_on_decode() {
+        // A crafted table with a NaN freq and ∞ volume must decode to finite,
+        // in-range values — never reaching the synth or the persisted prefs.
+        let mut buf = vec![0xB2, 1];
+        buf.extend_from_slice(&f32::NAN.to_be_bytes());
+        buf.extend_from_slice(&f32::INFINITY.to_be_bytes());
+        match Packet::decode(&buf) {
+            Some(Packet::MetroBeatTable { freqs, volumes }) => {
+                assert!(freqs[0].is_finite() && (20.0..=8000.0).contains(&freqs[0]));
+                assert!(volumes[0].is_finite() && (0.0..=1.0).contains(&volumes[0]));
+            }
+            other => panic!("expected a MetroBeatTable, got {other:?}"),
+        }
     }
 
     #[test]

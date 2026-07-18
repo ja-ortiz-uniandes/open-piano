@@ -10,7 +10,7 @@
 //! them over an mpsc channel; all model work happens on the inference thread so
 //! neither the audio driver callback nor the GUI render loop ever stalls.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -76,12 +76,23 @@ pub struct EngineStatus {
     pub model: String,
 }
 
+/// Capture backend health, tracked so the supervisor can tell a *running*
+/// stream from one that never started (no device / unsupported format) or died
+/// mid-session (device unplugged) — the latter two look identical from the
+/// outside otherwise (the callback simply stops firing).
+pub const HEALTH_STARTING: u8 = 0;
+pub const HEALTH_RUNNING: u8 = 1;
+pub const HEALTH_FAILED: u8 = 2;
+
 /// A running microphone backend. Dropping/stopping it tears down capture and
 /// inference cleanly: stopping the capture thread drops the cpal stream and the
 /// raw-audio sender, which ends the inference thread — and the inference thread
 /// releases any still-held notes (emits Note Offs) as it exits.
 pub struct AudioHandle {
     stop: Arc<AtomicBool>,
+    /// One of `HEALTH_*`; set by the capture thread (and its cpal error
+    /// callback) so the supervisor can restart a dead backend.
+    health: Arc<AtomicU8>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -93,6 +104,13 @@ impl AudioHandle {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+
+    /// Whether the backend failed to start or has since died — the supervisor
+    /// polls this to decide whether to tear the handle down and retry, instead
+    /// of trusting that "started" means "still running".
+    pub fn failed(&self) -> bool {
+        self.health.load(Ordering::Relaxed) == HEALTH_FAILED
     }
 }
 
@@ -111,22 +129,34 @@ pub fn start_into(
     status: Arc<Mutex<EngineStatus>>,
 ) -> AudioHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    let health = Arc::new(AtomicU8::new(HEALTH_STARTING));
     let st = Arc::clone(&status);
     let stop_for_thread = Arc::clone(&stop);
+    let health_for_thread = Arc::clone(&health);
     let join = thread::Builder::new()
         .name("audio-capture".into())
         .spawn(move || {
-            if let Err(e) = capture_loop(note_tx, threshold, tunables, st.clone(), stop_for_thread) {
+            let health = Arc::clone(&health_for_thread);
+            if let Err(e) = capture_loop(
+                note_tx,
+                threshold,
+                tunables,
+                st.clone(),
+                stop_for_thread,
+                health_for_thread,
+            ) {
                 eprintln!("[audio] fatal: {e}");
                 if let Ok(mut s) = st.lock() {
                     s.device = format!("Audio ERROR: {e}");
                 }
+                health.store(HEALTH_FAILED, Ordering::Relaxed);
             }
         })
         .expect("failed to spawn audio thread");
 
     AudioHandle {
         stop,
+        health,
         join: Some(join),
     }
 }
@@ -141,18 +171,23 @@ pub fn start_into(
 /// itself is begun/ended by the caller (the input supervisor).
 pub fn start_record_capture(recorder: Recorder) -> AudioHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    let health = Arc::new(AtomicU8::new(HEALTH_STARTING));
     let stop_for_thread = Arc::clone(&stop);
+    let health_for_thread = Arc::clone(&health);
     let join = thread::Builder::new()
         .name("record-capture".into())
         .spawn(move || {
-            if let Err(e) = record_capture_loop(recorder, stop_for_thread) {
+            let health = Arc::clone(&health_for_thread);
+            if let Err(e) = record_capture_loop(recorder, stop_for_thread, health_for_thread) {
                 eprintln!("[record] capture fatal: {e}");
+                health.store(HEALTH_FAILED, Ordering::Relaxed);
             }
         })
         .expect("failed to spawn record-capture thread");
 
     AudioHandle {
         stop,
+        health,
         join: Some(join),
     }
 }
@@ -160,6 +195,7 @@ pub fn start_record_capture(recorder: Recorder) -> AudioHandle {
 fn record_capture_loop(
     recorder: Recorder,
     stop: Arc<AtomicBool>,
+    health: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     let host = cpal::host_from_id(cpal::HostId::Wasapi)?;
@@ -180,7 +216,11 @@ fn record_capture_loop(
     // ahead of any audio buffer from the callback.
     recorder.audio_format(sample_rate, channels as u16, dev_name);
 
-    let err_fn = |e| eprintln!("[record] capture stream error: {e}");
+    let err_health = Arc::clone(&health);
+    let err_fn = move |e| {
+        eprintln!("[record] capture stream error: {e}");
+        err_health.store(HEALTH_FAILED, Ordering::Relaxed);
+    };
     let cfg = config.config();
     let stream = match sample_format {
         SampleFormat::F32 => {
@@ -220,6 +260,17 @@ fn record_capture_loop(
     };
 
     stream.play()?;
+    // compare_exchange, not a bare store: the cpal error callback runs
+    // concurrently and can store HEALTH_FAILED between `play()` returning and
+    // this point. Overwriting it with RUNNING would leave a dead stream looking
+    // healthy forever (silent zombie); only promote STARTING→RUNNING so a FAILED
+    // set in the race window is sticky (F7).
+    let _ = health.compare_exchange(
+        HEALTH_STARTING,
+        HEALTH_RUNNING,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }
@@ -232,6 +283,7 @@ fn capture_loop(
     tunables: InferenceTunables,
     status: Arc<Mutex<EngineStatus>>,
     stop: Arc<AtomicBool>,
+    health: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // WASAPI on Windows; default host elsewhere (keeps it compiling on dev macs).
     #[cfg(target_os = "windows")]
@@ -256,22 +308,15 @@ fn capture_loop(
     // Raw mono samples flow from the cpal callback to the inference thread.
     let (raw_tx, raw_rx) = mpsc::channel::<Vec<f32>>();
 
-    // ---- Inference thread (loads model, resamples, runs ONNX, emits notes). ----
-    {
-        let note_tx = note_tx.clone();
-        let threshold = threshold.clone();
-        let tunables = tunables.clone();
-        let status = Arc::clone(&status);
-        thread::Builder::new()
-            .name("inference".into())
-            .spawn(move || {
-                inference::run(raw_rx, note_tx, threshold, tunables, sample_rate, status);
-            })
-            .expect("failed to spawn inference thread");
-    }
-
     // ---- Build the input stream. The callback only down-mixes + forwards. ----
-    let err_fn = |e| eprintln!("[audio] stream error: {e}");
+    let err_health = Arc::clone(&health);
+    let err_fn = move |e| {
+        eprintln!("[audio] stream error: {e}");
+        // A stream error means the device died (unplug, default-device switch):
+        // the callback stops firing, so flag it so the supervisor restarts us
+        // instead of leaving a silent zombie reporting healthy status.
+        err_health.store(HEALTH_FAILED, Ordering::Relaxed);
+    };
     let cfg = config.config();
 
     let stream = match sample_format {
@@ -311,16 +356,49 @@ fn capture_loop(
         other => return Err(format!("unsupported sample format: {other:?}").into()),
     };
 
-    stream.play()?;
+    // ---- Inference thread (loads model, resamples, runs ONNX, emits notes). ----
+    // Spawned only *after* the stream builds successfully: an unsupported sample
+    // format returns above, so a permanently-failing mic no longer builds and
+    // discards a full ONNX Session on every supervisor retry (F4). Keep its join
+    // handle so we can drain it on teardown (see the tail below).
+    let infer_join = {
+        let note_tx = note_tx.clone();
+        let threshold = threshold.clone();
+        let tunables = tunables.clone();
+        let status = Arc::clone(&status);
+        thread::Builder::new()
+            .name("inference".into())
+            .spawn(move || {
+                inference::run(raw_rx, note_tx, threshold, tunables, sample_rate, status);
+            })
+            .expect("failed to spawn inference thread")
+    };
 
-    // Keep the stream (and capture) alive until asked to stop. On stop we fall
-    // out of the function: `stream` drops (cpal stops capturing) and the raw
-    // sender(s) drop, which ends the inference thread — and that thread releases
-    // any still-held notes as it exits, so nothing stays stuck on when we switch
-    // to the MIDI backend.
+    stream.play()?;
+    // compare_exchange, not a bare store: the cpal error callback can store
+    // HEALTH_FAILED between `play()` returning and here; only promote
+    // STARTING→RUNNING so a FAILED set in that race window stays sticky (F7).
+    let _ = health.compare_exchange(
+        HEALTH_STARTING,
+        HEALTH_RUNNING,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+
+    // Keep the stream (and capture) alive until asked to stop.
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
     }
+
+    // Orderly teardown: drop the stream (cpal stops capturing) and *our* raw
+    // sender, so every sender is gone and the inference thread sees the channel
+    // close, emits Offs for anything still held, and exits — then join it. This
+    // closes the L7 race where a NoteMsg computed from the final window arrived
+    // after the supervisor's epoch force-release, briefly lighting a phantom
+    // key: by the time `stop()` returns, the inference thread is truly done.
+    drop(stream);
+    drop(raw_tx);
+    let _ = infer_join.join();
     Ok(())
 }
 

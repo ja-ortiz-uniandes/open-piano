@@ -10,6 +10,25 @@ peers see one shared 88-key keyboard; each player's notes light up in that
 player's chosen color. Input is either a MIDI device (preferred) or microphone
 audio transcribed by an ONNX model. See README for the product goal.
 
+## Golden rule — one shared surface
+
+The keyboard and both roll panels (top + bottom) are **a single thing both
+players look at**, not two separate instances that merely share some state.
+Whatever appears on one side must appear on the other, identically. When you add
+anything that lights a key, draws a mark, or otherwise changes what's on that
+surface — live notes, the sustain lane, Ctrl+click-pinned keys, the metronome
+grid — it has to be broadcast to the peer and rendered the same on both screens.
+The only thing that legitimately differs across the two machines is *color*: each
+player sees themselves in their own color and the peer in the remote color (the
+"me = my color, you = the remote color" convention). If a feature shows up on
+only one side, that's a bug, not a local nicety.
+
+Prefer **idempotent whole-state snapshots** over incremental deltas for anything
+synced over the (unreliable-datagram) wire, and re-send on a heartbeat while the
+state persists — a dropped packet must self-heal rather than leave the two
+surfaces mismatched (see `Packet::Held`, the color/name heartbeat, and the
+pedal send-on-change for the established patterns).
+
 ## Architecture & data flow
 
 ```text

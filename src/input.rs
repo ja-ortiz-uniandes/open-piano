@@ -22,11 +22,12 @@
 //! Switching always bumps `epoch`; the UI watches it and force-releases every
 //! locally-held note on a switch so nothing can stay stuck "on".
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use midir::MidiInputConnection;
 
@@ -38,6 +39,21 @@ use crate::record::Recorder;
 /// Floor on the MIDI rescan interval, so a preference of 0 can't spin the
 /// supervisor. The interval itself is live-editable (see `midi_poll_ms`).
 const MIN_POLL_MS: u64 = 100;
+
+/// After a MIDI port fails to open (held exclusively by another app, flaky
+/// virtual port), wait this long before retrying it — staying on the current
+/// backend meanwhile instead of tearing down mic + ONNX + epoch every poll.
+const MIDI_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// After the microphone backend fails to start (no device, unsupported format)
+/// or dies, wait this long before rebuilding it. Without this, a machine with no
+/// usable mic rebuilds cpal + reloads the full ONNX model every ~1 s forever
+/// (F4).
+const MIC_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// After the record-capture stream fails, wait this long before retrying it —
+/// so a busy/absent mic doesn't respawn the capture thread every poll (F25).
+const RECORD_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 
 // `source` atomic encoding (it's read by the UI thread).
 const SRC_DETECTING: u8 = 0;
@@ -74,7 +90,9 @@ pub struct InputEngine {
     source: Arc<AtomicU8>,
     epoch: Arc<AtomicU64>,
     stop_all: Arc<AtomicBool>,
-    _supervisor: JoinHandle<()>,
+    /// Joined in [`Drop`] so an orderly shutdown finalizes any open recording
+    /// (WAV header + `meta.json`) before the process exits (C1).
+    supervisor: Option<JoinHandle<()>>,
 }
 
 impl InputEngine {
@@ -104,8 +122,14 @@ impl InputEngine {
 
 impl Drop for InputEngine {
     fn drop(&mut self) {
-        // Tell the supervisor to stop; it tears down whatever backend is live.
+        // Tell the supervisor to stop, then wait for it: its shutdown path
+        // finalizes any open recording and joins the recorder writer thread, so
+        // a WAV/meta.json is never left unwritten when the app closes (C1). The
+        // supervisor wakes within ~100 ms (see `sleep_unless_stopped`).
         self.stop_all.store(true, Ordering::Relaxed);
+        if let Some(j) = self.supervisor.take() {
+            let _ = j.join();
+        }
     }
 }
 
@@ -161,7 +185,7 @@ pub fn start(
         source,
         epoch,
         stop_all,
-        _supervisor: supervisor,
+        supervisor: Some(supervisor),
     }
 }
 
@@ -193,8 +217,18 @@ fn supervise(
 ) {
     let mut active = Active::None;
     // Capture-only mic for the recording harness; runs alongside whatever the
-    // live note source is. `Some` exactly while a recording session is open.
+    // live note source is. `Some` exactly while a capture stream is running.
     let mut record_capture: Option<AudioHandle> = None;
+    // MIDI ports we recently failed to open, keyed by name, with the time — so
+    // we back off instead of thrashing them, and try *other* ports meanwhile so
+    // an un-openable port 0 doesn't starve a working port 1 (H4/F9).
+    let mut failed_midi: HashMap<String, Instant> = HashMap::new();
+    // Time the mic backend last failed, so we back off rebuilding it instead of
+    // reloading ONNX every poll (F4).
+    let mut failed_mic: Option<Instant> = None;
+    // Time the record-capture stream last failed, so a busy mic doesn't respawn
+    // capture every poll (F25).
+    let mut failed_record: Option<Instant> = None;
 
     while !stop_all.load(Ordering::Relaxed) {
         let ports = midi::port_names();
@@ -211,21 +245,40 @@ fn supervise(
             }
         }
 
-        if let Some(want) = ports.first() {
-            // 2) A MIDI device is available. Switch to it unless we're already
-            //    connected to that exact port.
-            let already = matches!(&active, Active::Midi { name, .. } if name == want);
-            if !already {
-                // Stop the mic first so it isn't held open while on MIDI; its
-                // inference thread releases any held notes as it exits.
-                if let Active::Mic(handle) = std::mem::replace(&mut active, Active::None) {
-                    handle.stop();
-                }
-                epoch.fetch_add(1, Ordering::Relaxed);
+        // 2) A mic backend that failed to start (no device / unsupported
+        //    format) or died mid-session (device unplugged) reports it via the
+        //    handle. Tear it down so the fallback below re-detects it, rather
+        //    than leaving a silent zombie with healthy-looking status (H5/M11).
+        //    Record the failure time so step 4 backs off instead of rebuilding
+        //    cpal + reloading ONNX every poll for a permanently-dead mic (F4).
+        if matches!(&active, Active::Mic(h) if h.failed()) {
+            eprintln!("[input] microphone backend died; will re-detect");
+            if let Active::Mic(h) = std::mem::replace(&mut active, Active::None) {
+                h.stop();
+            }
+            set_detecting(&status, &source);
+            failed_mic = Some(Instant::now());
+        }
 
-                // Only MIDI gets the pedal sender: the mic backend below is
-                // never wired to it (the pedal feature's structural guarantee).
-                active = match midi::connect_to(
+        // 3) A MIDI device is present and we're not already on one of its ports:
+        //    switch to it. Connect *before* tearing down the mic, so an
+        //    un-openable port (held exclusively by another app) never kills a
+        //    working mic + ONNX every poll (H4); iterate all non-cooling ports
+        //    so an un-openable port 0 doesn't starve a working port 1 (F9). On a
+        //    successful connect, bump the epoch (which force-releases stale keys
+        //    in the UI) *before* the blocking mic teardown, so genuine MIDI
+        //    Note-Ons already arriving on the new connection aren't wiped by a
+        //    switch that bumped the epoch only after `handle.stop()` returned (F8).
+        let on_live_midi = matches!(&active, Active::Midi { name, .. } if ports.iter().any(|p| p == name));
+        if !on_live_midi {
+            let mut opened = None;
+            for want in &ports {
+                if failed_midi.get(want).is_some_and(|at| at.elapsed() < MIDI_RETRY_COOLDOWN) {
+                    continue;
+                }
+                // Only MIDI gets the pedal sender: the mic backend is never
+                // wired to it (the pedal feature's structural guarantee).
+                match midi::connect_to(
                     note_tx.clone(),
                     &status,
                     want,
@@ -233,28 +286,62 @@ fn supervise(
                     pedal_tx.clone(),
                 ) {
                     Ok(conn) => {
-                        source.store(SRC_MIDI, Ordering::Relaxed);
-                        Active::Midi {
-                            _conn: conn,
-                            name: want.clone(),
-                        }
+                        opened = Some((conn, want.clone()));
+                        break;
                     }
                     Err(e) => {
-                        eprintln!("[input] MIDI connect failed ({e}); using microphone");
-                        start_mic(&note_tx, &threshold, &tunables, &status, &source)
+                        eprintln!("[input] MIDI connect failed for '{want}' ({e}); trying next port");
+                        failed_midi.insert(want.clone(), Instant::now());
                     }
-                };
+                }
             }
-        } else if matches!(active, Active::None) {
-            // 3) No MIDI device at all: bring up the mic fallback (lazily — only
-            //    when there's nothing better, and only if not already running).
-            active = start_mic(&note_tx, &threshold, &tunables, &status, &source);
+            if let Some((conn, name)) = opened {
+                epoch.fetch_add(1, Ordering::Relaxed);
+                failed_midi.remove(&name);
+                failed_mic = None;
+                source.store(SRC_MIDI, Ordering::Relaxed);
+                // Install the MIDI backend and stop the old mic (if any) — the
+                // epoch bump above already covers its trailing Note-Offs.
+                if let Active::Mic(handle) =
+                    std::mem::replace(&mut active, Active::Midi { _conn: conn, name })
+                {
+                    handle.stop();
+                }
+            }
+            // All candidates failed (or none): `active` is unchanged — a working
+            // mic keeps running (H4), and step 4 brings one up if there is none.
+        }
+
+        // 4) Nothing live (no MIDI, or every port is un-connectable and cooling
+        //    down): bring up the mic fallback, unless it recently failed and is
+        //    still cooling down (F4).
+        if matches!(active, Active::None) {
+            let cooling = failed_mic.is_some_and(|at| at.elapsed() < MIC_RETRY_COOLDOWN);
+            if !cooling {
+                failed_mic = None;
+                active = start_mic(&note_tx, &threshold, &tunables, &status, &source);
+            }
+        }
+
+        // A record-capture stream that failed to start / died yields a
+        // labels-only stretch: tear the dead handle down (never leak it) and
+        // surface the error, but keep the *session* open so MIDI labels keep
+        // recording and a retried capture resumes audio into the same WAV
+        // (`audio_start_s` is set by the first buffer that ever arrives). Back
+        // off before retrying so a busy mic doesn't respawn capture every poll
+        // (M11/F25).
+        if record_capture.as_ref().is_some_and(|h| h.failed()) {
+            recorder.report_error("microphone capture failed — retrying; audio may be missing");
+            if let Some(h) = record_capture.take() {
+                h.stop();
+            }
+            failed_record = Some(Instant::now());
         }
 
         // Reconcile the recording harness with the UI's Record toggle. A session
         // runs whenever armed: the capture-only mic logs audio, and the MIDI
         // callback (already teeing) logs labels whenever a device is connected.
-        reconcile_recording(&recorder, &mut record_capture);
+        reconcile_recording(&recorder, &mut record_capture, &mut failed_record);
 
         // Live poll interval (Preferences ▸ Advanced), floored so a tiny value
         // can't busy-spin the supervisor.
@@ -262,29 +349,66 @@ fn supervise(
         sleep_unless_stopped(&stop_all, poll);
     }
 
-    // App is shutting down: finalize any open recording, then stop the live mic
-    // if it's the active backend (a MIDI connection just drops with `active`).
-    if record_capture.take().is_some() {
+    // App is shutting down: stop the record-capture stream (joining its thread
+    // and closing the mic — never leak it), finalize any open recording, then
+    // stop the live mic if it's the active backend (a MIDI connection just drops
+    // with `active`) (F24).
+    if let Some(handle) = record_capture.take() {
+        handle.stop();
+    }
+    if recorder.is_recording() {
         recorder.end();
     }
     if let Active::Mic(handle) = active {
         handle.stop();
     }
+    // Flush + join the recorder writer thread so the WAV header and meta.json
+    // are always written before the process exits (C1).
+    recorder.shutdown();
 }
 
 /// Start or stop the recording session to match `recorder.is_armed()`.
-/// `record_capture` is `Some` exactly while a session is open.
-fn reconcile_recording(recorder: &Recorder, record_capture: &mut Option<AudioHandle>) {
+/// `record_capture` is `Some` exactly while a capture stream is running.
+/// `failed_record` gates retries after a capture failure so a busy/absent mic
+/// doesn't respawn capture every poll (F25).
+fn reconcile_recording(
+    recorder: &Recorder,
+    record_capture: &mut Option<AudioHandle>,
+    failed_record: &mut Option<Instant>,
+) {
     let want = recorder.is_armed();
-    let active = record_capture.is_some();
-    if want && !active {
-        recorder.begin();
-        *record_capture = Some(audio::start_record_capture(recorder.clone()));
-    } else if !want && active {
-        if let Some(handle) = record_capture.take() {
-            handle.stop();
+    match (want, record_capture.is_some()) {
+        (true, false) => {
+            // Cooling down after a capture failure: keep the session open (MIDI
+            // labels still record) and retry capture only once the cooldown
+            // elapses.
+            if failed_record.is_some_and(|at| at.elapsed() < RECORD_RETRY_COOLDOWN) {
+                return;
+            }
+            *failed_record = None;
+            // Open the session only if one isn't already running — a retry after
+            // a mid-session capture failure resumes audio into the same session.
+            if !recorder.is_recording() {
+                recorder.begin();
+            }
+            *record_capture = Some(audio::start_record_capture(recorder.clone()));
         }
-        recorder.end();
+        (false, true) => {
+            if let Some(handle) = record_capture.take() {
+                handle.stop();
+            }
+            recorder.end();
+            *failed_record = None;
+        }
+        (false, false) => {
+            // Disarmed after a capture failure closed the stream but left the
+            // session open: finalize it.
+            if recorder.is_recording() {
+                recorder.end();
+            }
+            *failed_record = None;
+        }
+        (true, true) => {}
     }
 }
 

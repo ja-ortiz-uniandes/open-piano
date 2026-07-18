@@ -23,6 +23,13 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+
+/// A cached runtime untouched for at least this long is fair game for the
+/// startup housekeeping sweep. Anything younger might be another instance's
+/// in-flight temp mid-write, or a runtime it extracted but hasn't loaded yet
+/// (ORT loads lazily, possibly minutes after extraction).
+const RUNTIME_REAP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Basic Pitch transcription model, loaded by the inference thread.
 pub const MODEL: &[u8] = include_bytes!("../model.onnx");
@@ -69,7 +76,21 @@ fn extract_dll() -> std::io::Result<PathBuf> {
 
     let name = format!("onnxruntime-{:016x}.dll", fnv1a(ONNXRUNTIME_DLL));
     let path = dir.join(&name);
-    if path.exists() {
+    // Reuse the cached copy only if it's the *full* expected size. A power loss
+    // can leave the rename (metadata) committed while the data blocks never
+    // reached disk — a truncated DLL the name-only fast path would otherwise
+    // trust forever, failing the mic path on every subsequent launch.
+    if fs::metadata(&path).is_ok_and(|m| m.len() == ONNXRUNTIME_DLL.len() as u64) {
+        // Refresh the mtime so the 24 h reaper (below, and in any concurrent
+        // instance) treats this still-needed runtime as live. ORT loads lazily —
+        // possibly never this session (a MIDI-only run) — so without this a
+        // side-by-side newer instance could reap a week-old DLL that this
+        // instance still depends on when it later falls back to the mic (F20).
+        // Best-effort: if the file is already mapped by another process the
+        // open fails, but a mapped file can't be reaped on Windows anyway.
+        if let Ok(f) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = f.set_modified(SystemTime::now());
+        }
         return Ok(path);
     }
 
@@ -80,6 +101,9 @@ fn extract_dll() -> std::io::Result<PathBuf> {
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(ONNXRUNTIME_DLL)?;
+        // Flush data to disk before the rename so a crash can't leave a
+        // renamed-but-truncated DLL (see the size check above).
+        f.sync_all()?;
     }
     if fs::rename(&tmp, &path).is_err() {
         let _ = fs::remove_file(&tmp);
@@ -90,11 +114,27 @@ fn extract_dll() -> std::io::Result<PathBuf> {
 
     // Housekeeping: drop runtimes older app versions extracted. A file still
     // mapped by a running instance won't delete on Windows — fine, skip it.
+    //
+    // Only reap files untouched for `RUNTIME_REAP_AGE`: deleting a *recent*
+    // `onnxruntime-*` (or `*.tmp-<pid>`) would sabotage another live instance —
+    // its in-flight write's rename fails, or a runtime it extracted but hasn't
+    // lazily loaded yet vanishes before the load. The exact old+new-concurrent
+    // scenario this cache is designed to support.
     if let Ok(entries) = fs::read_dir(&dir) {
+        let now = SystemTime::now();
         for entry in entries.flatten() {
             let fname = entry.file_name();
             let fname = fname.to_string_lossy();
-            if fname.starts_with("onnxruntime-") && fname != name.as_str() {
+            if !fname.starts_with("onnxruntime-") || fname == name.as_str() {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age >= RUNTIME_REAP_AGE);
+            if old_enough {
                 let _ = fs::remove_file(entry.path());
             }
         }

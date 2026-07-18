@@ -37,7 +37,10 @@ use std::time::{Duration, Instant};
 
 use input::{InputEngine, Source};
 use net::{NetEvent, Peer};
-use note::{is_black_key, midi_to_key_index, NoteMsg, Packet, KEY_COUNT, MIDI_HIGH, MIDI_LOW};
+use note::{
+    is_black_key, midi_to_key_index, pack_held, unpack_held, NoteMsg, Packet, HELD_MASK_BYTES,
+    KEY_COUNT, MIDI_HIGH, MIDI_LOW,
+};
 
 // Defensive: when ONNX Runtime later probes for optional execution-provider
 // DLLs (CUDA/DirectML/etc.) on the inference thread, a missing one can make
@@ -132,6 +135,20 @@ const DEFAULT_REMOTE_NAME: &str = "Peer";
 /// announcement, at a negligible 1 datagram/sec.
 const COLOR_HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// Cap on the number of manual segment breaks put in one `Packet::Separators`
+/// snapshot. Each is 8 bytes; the datagram must stay under the ~1200-byte
+/// path-MTU limit (past which QUIC drops it and separator sync silently stops),
+/// so we bound the count well below that (F21). Far more manual breaks than any
+/// real session has.
+const MAX_WIRE_SEPARATORS: usize = 120;
+
+/// Debounce for persisting preferences edited by a continuous control (sliders,
+/// drag-values): egui fires `.changed()` every frame of a drag, so saving
+/// immediately would serialize + temp-write + rename at ~60 Hz on the GUI
+/// thread. Instead the change schedules a single save this long after the last
+/// edit (see `save_prefs_soon`) — well under a second, imperceptible (M7).
+const PREFS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
 // The mic echo hold-off, roll zoom (px/s), scrollback idle window, detection
 // threshold and default local color are now user preferences (see prefs.rs) —
 // read live from `self.prefs` at their use sites instead of compile-time consts.
@@ -161,6 +178,12 @@ const COMPACT_MIN_SIZE: [f32; 2] = [640.0, 190.0];
 /// `ViewportBuilder` and the compact-mode restore path.
 const NORMAL_MIN_SIZE: [f32; 2] = [640.0, 420.0];
 const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 620.0];
+
+/// Height of the custom title bar. The top strip is reserved for it (move-drag,
+/// the File/Edit menus, and the window buttons), so the edge-resize handles keep
+/// clear of it — otherwise a touch-sized corner handle sits over the ✕ button
+/// and a tap there starts a resize instead of closing (F23).
+const TITLEBAR_H: f32 = 30.0;
 
 /// With a score loaded, the space not taken by the keyboard splits between
 /// the falling-notes panel (above the keys) and the history roll (below).
@@ -222,6 +245,11 @@ struct Metronome {
     next_beat_at: Option<Instant>,
     /// The next click's position in the bar (accent when 0 = the downbeat).
     next_beat_in_bar: u8,
+    /// When the most recent beat was processed (sounded or not), on the local
+    /// clock. Lets a follower tell a genuinely new incoming marker from a
+    /// re-delivery of one it already handled, so it doesn't double-click when
+    /// firing the current beat on marker arrival (F3).
+    last_beat_at: Option<Instant>,
 }
 
 impl Metronome {
@@ -236,6 +264,7 @@ impl Metronome {
             beat_volumes: vec![1.0, 1.0, 1.0, 1.0],
             next_beat_at: None,
             next_beat_in_bar: 0,
+            last_beat_at: None,
         }
     }
 
@@ -328,16 +357,42 @@ struct PianoApp {
     // --- key state ---
     local: [bool; KEY_COUNT],
     remote: [bool; KEY_COUNT],
-    // Keys the user has "pinned" down with Ctrl+click — purely a local display
-    // aid (e.g. holding a chord to point at while explaining). ORed into
-    // `local`'s rendering only *while Ctrl is held*; it never touches
-    // `local_note`, the synth, the roll, or the peer broadcast, and toggling
-    // is gated by the same recording/eval/playback lock as mouse-play.
-    // Memoryless by design: releasing Ctrl both hides *and clears* the pinned
-    // set (see `held_cmd_down`), so each Ctrl-hold starts a fresh selection
-    // instead of resurrecting whatever was pinned last time — a chord you're
-    // done displaying shouldn't pop back up on the next unrelated Ctrl-hold.
+    // Keys the user has "pinned" down with Ctrl+click — a display aid for
+    // holding a chord to point at while explaining. ORed into `local`'s
+    // rendering only *while Ctrl is held*; it never touches `local_note`, the
+    // synth, or the roll, and toggling is gated by the same recording/eval/
+    // playback lock as mouse-play. It IS shared with the peer, though (see
+    // `Packet::Held` / `remote_held`): the keyboard is one surface both players
+    // look at, so a pinned chord lights up on both screens (in the pinner's
+    // color) just like a live press. Memoryless by design: releasing Ctrl both
+    // hides *and clears* the pinned set (see `held_cmd_down`) — and broadcasts
+    // the clear — so each Ctrl-hold starts fresh instead of resurrecting a
+    // chord pinned in some earlier, unrelated hold.
     held: [bool; KEY_COUNT],
+    // The peer's currently-pinned keys (their `held`, received via
+    // `Packet::Held`). Rendered like remote presses, in the remote color —
+    // cleared on connect/disconnect like every other remote state.
+    remote_held: [bool; KEY_COUNT],
+    // The last pinned-key mask we sent the peer, so we only broadcast on change
+    // (mirrors `last_pedal_sent`); reset on (re)connect so a fresh peer resyncs.
+    last_held_sent: [u8; HELD_MASK_BYTES],
+    // The last live (sounding) note mask we sent the peer as a self-heal
+    // snapshot (`Packet::Live`); reset on (re)connect. See `broadcast_live`.
+    last_live_sent: [u8; HELD_MASK_BYTES],
+    // Per-sender monotonic sequence stamped on every outbound note event and
+    // `Packet::Live` snapshot, so the receiver can drop a stale snapshot that
+    // reordered past a newer note transition (F6). Monotonic for the process
+    // lifetime (never reset), so a reconnecting peer — which resets its own
+    // high-water mark — always sees our seq climb.
+    live_seq: u32,
+    // Sequence stamped on every outbound `Packet::Held` snapshot (F6). Held has
+    // no per-event channel, so this just orders successive whole-state snapshots.
+    held_seq: u32,
+    // Highest note/live seq we've applied from the peer, and highest held seq —
+    // snapshots older than these are ignored. Reset on (re)connect (a fresh peer
+    // starts its seq low), see `clear_remote_keys`.
+    remote_live_seq: u32,
+    remote_held_seq: u32,
     // Whether Ctrl/Cmd was down as of the last frame — lets us detect the
     // release edge and clear `held` exactly once (see `held` doc comment).
     held_cmd_down: bool,
@@ -382,8 +437,13 @@ struct PianoApp {
     last_pointer_pos: Option<egui::Pos2>,
 
     // --- colors (sRGB) ---
-    local_color: [u8; 3],  // our notes; editable, broadcast to the peer
-    remote_color: [u8; 3], // the peer's notes; received from the peer
+    local_color: [u8; 3], // our notes; editable, broadcast to the peer
+    // The color the peer's notes are drawn in *on this screen*. Fixed to
+    // `DEFAULT_REMOTE_COLOR`: the peer's announced `Packet::Color` is
+    // deliberately discarded on receive (every fresh install defaults to the
+    // same red, so honoring it would render both sides identically). Not "the
+    // peer's chosen color".
+    remote_color: [u8; 3],
     last_color_send: Instant,
 
     // --- display names (ride the same heartbeat as colors) ---
@@ -401,6 +461,23 @@ struct PianoApp {
     // Whether *we* are the host of the current session (the metronome timing
     // authority). Meaningless without a peer — then we're always the authority.
     is_host: bool,
+    // Whether a peer connection is actually live right now (true between
+    // `NetEvent::Connected` and `Disconnected`). A joiner whose host quit still
+    // holds a `Some(peer)`, so this — not `peer.is_some()` — is what lets it
+    // reclaim metronome authority and keep clicking (M9).
+    peer_connected: bool,
+    // The playback key range as of last frame, to detect a mid-take edit and
+    // restart the evaluation take (M13). `None` when no score is loaded.
+    last_key_range: Option<(u8, u8)>,
+    // When a debounced preferences save is due (see `save_prefs_soon`), coalescing
+    // the per-frame `.changed()` storm of a slider drag into one write (M7).
+    prefs_save_due: Option<Instant>,
+    // Roll-clock times of segment breaks *we* inserted by hand (Ctrl+click /
+    // context menu). Broadcast to the peer on change and on the heartbeat
+    // (`Packet::Separators`) so a manual break is a shared surface element, not
+    // a line on one screen (M2). Auto-pause breaks stay local — the two rolls
+    // run independent clocks, so syncing derived boundaries would misplace them.
+    manual_separators: Vec<f64>,
 
     // --- synced metronome (see Metronome + drive_metronome) ---
     metro: Metronome,
@@ -445,6 +522,10 @@ struct PianoApp {
     roll_status: String,
     // Whether the "unsaved roll" confirmation is up (close was intercepted).
     show_close_confirm: bool,
+    // Set when the unsaved-roll confirmation was raised by "Restart now" rather
+    // than a window close, so the dialog restarts (instead of quitting) once the
+    // roll is saved/discarded (F22).
+    pending_restart: bool,
     // Set once the user confirms quitting, so the re-issued close passes the
     // interception even though the roll is still unsaved.
     allow_close: bool,
@@ -585,6 +666,13 @@ impl PianoApp {
             local: [false; KEY_COUNT],
             remote: [false; KEY_COUNT],
             held: [false; KEY_COUNT],
+            remote_held: [false; KEY_COUNT],
+            last_held_sent: [0; HELD_MASK_BYTES],
+            last_live_sent: [0; HELD_MASK_BYTES],
+            live_seq: 0,
+            held_seq: 0,
+            remote_live_seq: 0,
+            remote_held_seq: 0,
             held_cmd_down: false,
             local_pedal: 0,
             remote_pedal: 0,
@@ -605,6 +693,10 @@ impl PianoApp {
             peer: None,
             net_status: "Not connected".to_string(),
             is_host: false,
+            peer_connected: false,
+            last_key_range: None,
+            prefs_save_due: None,
+            manual_separators: Vec::new(),
             metro,
             // Kick off the background GitHub Releases check; the UI polls its
             // state each frame (see `update_controls`).
@@ -621,6 +713,7 @@ impl PianoApp {
             score_roll_origin_s: 0.0,
             roll_status: String::new(),
             show_close_confirm: false,
+            pending_restart: false,
             allow_close: false,
             playback: None,
             playback_volume: 1.0,
@@ -657,6 +750,24 @@ impl PianoApp {
         app
     }
 
+    /// Schedule a debounced preferences save (see `PREFS_SAVE_DEBOUNCE`). Use
+    /// from continuous controls (sliders / drag-values) whose `.changed()` fires
+    /// every frame of a drag, instead of the immediate `self.prefs.save()` — that
+    /// would hammer the disk on the GUI thread ~60×/s (M7).
+    fn save_prefs_soon(&mut self) {
+        self.prefs_save_due = Some(Instant::now() + PREFS_SAVE_DEBOUNCE);
+    }
+
+    /// Flush a due debounced prefs save. Called once per frame from `update`.
+    fn flush_prefs_save(&mut self) {
+        if let Some(due) = self.prefs_save_due {
+            if Instant::now() >= due {
+                self.prefs.save();
+                self.prefs_save_due = None;
+            }
+        }
+    }
+
     /// Send our chosen color to the peer (if connected) and reset the heartbeat.
     fn send_color(&mut self) {
         if let Some(peer) = &self.peer {
@@ -687,14 +798,85 @@ impl PianoApp {
         }
     }
 
+    /// Broadcast our Ctrl+click-pinned key set to the peer as a whole-state
+    /// snapshot, so the pinned chord lights up on both screens (see
+    /// `Packet::Held`). `force` re-sends even if the mask is unchanged — used
+    /// by the color heartbeat so a dropped snapshot self-heals while keys stay
+    /// pinned. `last_held_sent` is updated only when a peer actually exists, so
+    /// a set pinned while disconnected is still announced once a session comes
+    /// up (mirrors the pedal send-on-change).
+    fn broadcast_held(&mut self, force: bool) {
+        let mask = pack_held(&self.held);
+        if !force && mask == self.last_held_sent {
+            return;
+        }
+        self.held_seq = self.held_seq.wrapping_add(1);
+        let seq = self.held_seq;
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::Held { seq, mask });
+            self.last_held_sent = mask;
+        }
+    }
+
+    /// Forward a local note transition to the peer, stamped with the next
+    /// note sequence number (F6). The bump happens whether or not a peer exists
+    /// so the counter stays a faithful running index of local note events; the
+    /// [`Packet::Live`] snapshot then carries the latest value.
+    fn send_note(&mut self, msg: NoteMsg) {
+        self.live_seq = self.live_seq.wrapping_add(1);
+        let seq = self.live_seq;
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::Note(msg, seq));
+        }
+    }
+
+    /// Insert a manual segment break locally and share it with the peer so the
+    /// break shows on both screens (M2). The full manual-break list is re-sent
+    /// on the heartbeat, so a dropped datagram converges.
+    fn insert_manual_separator(&mut self, at: f64) {
+        self.roll.insert_separator(at);
+        // Track the clamped time the roll actually used, deduped, so our
+        // snapshot matches what we rendered.
+        let at = at.clamp(0.0, self.roll.now_s());
+        if at > 0.0 && !self.manual_separators.iter().any(|&x| (x - at).abs() < 1e-9) {
+            self.manual_separators.push(at);
+        }
+        self.broadcast_separators();
+    }
+
+    /// Broadcast our manual segment breaks to the peer (see `manual_separators`).
+    /// Reconciles the broadcast list against the roll first: the idle snap-back
+    /// (`Roll::tick`) trims breaks that fall into rewound dead air, and a break
+    /// that's gone from our own roll must stop riding the heartbeat — otherwise
+    /// the heartbeat keeps *re-creating* it on the peer, so the originator shows
+    /// no break while the peer shows one forever (F1). Capped so an oversized
+    /// snapshot can't silently blow the datagram MTU and stop sync (F21).
+    fn broadcast_separators(&mut self) {
+        self.manual_separators.retain(|&t| self.roll.has_separator_at(t));
+        if self.manual_separators.len() > MAX_WIRE_SEPARATORS {
+            self.manual_separators.truncate(MAX_WIRE_SEPARATORS);
+        }
+        if self.manual_separators.is_empty() {
+            return;
+        }
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::Separators(self.manual_separators.clone()));
+        }
+    }
+
     /// Start hosting a session. Replaces any existing session (dropping the
     /// old `Peer` shuts its net thread down); the invite code arrives async
     /// as a `NetEvent::Ticket`.
     fn host(&mut self) {
         self.my_ticket = None;
         self.clear_remote_keys();
+        // Fresh session: don't feed a brand-new peer the manual breaks of a
+        // previous, unrelated session (F1). The breaks stay on our own roll;
+        // we just stop broadcasting the stale list.
+        self.manual_separators.clear();
         self.net_status = "Starting…".into();
         self.is_host = true;
+        self.peer_connected = false;
         // Fresh session: re-anchor the metronome (we're the authority now).
         self.metro.next_beat_at = None;
         self.peer = Some(net::host());
@@ -710,8 +892,11 @@ impl PianoApp {
         }
         self.my_ticket = None;
         self.clear_remote_keys();
+        // Fresh session: don't leak a previous session's manual breaks (F1).
+        self.manual_separators.clear();
         self.net_status = "Joining…".into();
         self.is_host = false;
+        self.peer_connected = false;
         // As a follower we no longer own the grid; wait for the host's markers.
         self.metro.next_beat_at = None;
         self.peer = Some(net::join(code));
@@ -732,6 +917,62 @@ impl PianoApp {
         // The matching pedal-up will never arrive either.
         self.roll.release_pedal(roll::Who::Remote);
         self.remote_pedal = 0;
+        // Drop the peer's pinned keys (display-only, no synth); a fresh session
+        // starts with an empty shared overlay. Reset `last_held_sent` too so a
+        // set we're still holding is re-announced to the new peer.
+        self.remote_held = [false; KEY_COUNT];
+        self.last_held_sent = [0; HELD_MASK_BYTES];
+        // Same for the live-note snapshot: force a fresh re-announce of whatever
+        // we're currently holding to the new peer (H1).
+        self.last_live_sent = [0; HELD_MASK_BYTES];
+        // Reset the applied-seq high-water marks: a fresh/rejoined peer starts
+        // its own seq counter low, so we must accept its first packets (F6).
+        self.remote_live_seq = 0;
+        self.remote_held_seq = 0;
+        // And the pedal: reset the send-on-change latch (parallel to
+        // `last_held_sent`) so a pedal held at a constant level is re-announced
+        // to a fresh/rejoined peer rather than staying silent (M1).
+        self.last_pedal_sent = 0;
+    }
+
+    /// Reconcile the peer's live (sounding) notes from a whole-state snapshot
+    /// (`Packet::Live`): light/extinguish only the keys that actually differ, so
+    /// a dropped note-on/off datagram self-heals on the next heartbeat instead
+    /// of leaving a remote key (and its synth voice) stuck (H1). Velocity isn't
+    /// carried by the snapshot — a note first *seen* here uses the placeholder,
+    /// which the real (velocity-bearing) note-on normally supplied already.
+    fn reconcile_remote_live(&mut self, mask: [u8; HELD_MASK_BYTES]) {
+        let want = unpack_held(&mask);
+        for idx in 0..KEY_COUNT {
+            let midi = MIDI_LOW + idx as u8;
+            if want[idx] && !self.remote[idx] {
+                self.remote[idx] = true;
+                let msg = NoteMsg::On(midi, note::DEFAULT_VELOCITY);
+                self.roll.note(roll::Who::Remote, msg, self.remote_color);
+                self.play_synth(msg, synth::Channel::Peer);
+            } else if !want[idx] && self.remote[idx] {
+                self.remote[idx] = false;
+                let msg = NoteMsg::Off(midi);
+                self.roll.note(roll::Who::Remote, msg, self.remote_color);
+                self.play_synth(msg, synth::Channel::Peer);
+            }
+        }
+    }
+
+    /// Broadcast our live (sounding) note set to the peer as an idempotent
+    /// whole-state snapshot (`Packet::Live`) — the self-heal companion to the
+    /// per-event note datagrams (H1). `force` re-sends even when unchanged (used
+    /// by the heartbeat). `last_live_sent` is updated only when a peer exists.
+    fn broadcast_live(&mut self, force: bool) {
+        let mask = pack_held(&self.local);
+        if !force && mask == self.last_live_sent {
+            return;
+        }
+        let seq = self.live_seq;
+        if let Some(peer) = &self.peer {
+            peer.send(Packet::Live { seq, mask });
+            self.last_live_sent = mask;
+        }
     }
 
     /// Drain the input channel (MIDI or mic, whichever is active): update local
@@ -751,9 +992,7 @@ impl PianoApp {
             for idx in 0..KEY_COUNT {
                 if self.local[idx] {
                     self.local[idx] = false;
-                    if let Some(peer) = &self.peer {
-                        peer.send(Packet::Note(NoteMsg::Off(MIDI_LOW + idx as u8)));
-                    }
+                    self.send_note(NoteMsg::Off(MIDI_LOW + idx as u8));
                 }
             }
             // The matching note-offs will never arrive, so close the roll's
@@ -789,9 +1028,7 @@ impl PianoApp {
                 self.frame_onsets.push((midi, velocity));
             }
             self.roll.note(roll::Who::Local, msg, self.local_color);
-            if let Some(peer) = &self.peer {
-                peer.send(Packet::Note(msg));
-            }
+            self.send_note(msg);
         }
 
         // Sustain pedal (CC64). Only the MIDI backend is wired to this channel
@@ -904,6 +1141,12 @@ impl PianoApp {
                 );
             }
             ui.weak(format!("→ {}", rec.session_dir()));
+            // Surface a setup/write failure instead of showing a healthy "REC"
+            // over a session that isn't actually being written (L18).
+            let err = rec.error();
+            if !err.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), format!("⚠ {err}"));
+            }
         } else if armed {
             ui.label("Starting…");
         }
@@ -1122,20 +1365,35 @@ impl PianoApp {
                     ui.weak(&self.roll_status);
                 }
                 ui.add_space(6.0);
+                // The same dialog serves a window close and a "Restart now"
+                // (F22); word the confirm buttons for whichever is pending.
+                let restart = self.pending_restart;
+                let (save_label, discard_label) = if restart {
+                    ("Save and restart", "Restart without saving")
+                } else {
+                    ("Save and quit", "Quit without saving")
+                };
                 ui.horizontal(|ui| {
-                    if ui.button("Save and quit").clicked() && self.save_roll_quick() {
+                    if ui.button(save_label).clicked() && self.save_roll_quick() {
                         // Synchronous save: the file is on disk before the
                         // process is allowed to die. On failure we fall
                         // through with the error shown above.
+                        if restart {
+                            self.perform_restart();
+                        }
                         self.allow_close = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    if ui.button("Quit without saving").clicked() {
+                    if ui.button(discard_label).clicked() {
+                        if restart {
+                            self.perform_restart();
+                        }
                         self.allow_close = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_close_confirm = false;
+                        self.pending_restart = false;
                     }
                 });
             });
@@ -1799,8 +2057,9 @@ impl PianoApp {
                 {
                     self.input.threshold.set(self.threshold);
                     // Keep the persisted default in sync with this live control.
+                    // Debounced: the threshold is a slider dragged at frame rate.
                     self.prefs.threshold = self.threshold;
-                    self.prefs.save();
+                    self.save_prefs_soon();
                 }
                 ui.separator();
                 if ui
@@ -1841,7 +2100,11 @@ impl PianoApp {
             ui.label(format!("Peer: {}", self.remote_name));
             let (r, g, b) = (self.remote_color[0], self.remote_color[1], self.remote_color[2]);
             ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
-            ui.weak("(chosen by the peer)");
+            // The peer is always drawn in the fixed remote color locally — the
+            // peer's own color choice is intentionally not applied (see the
+            // `Packet::Color` handler in pump_network), so this isn't "their"
+            // color, it's the color they appear in on your screen (L6).
+            ui.weak("(peer color on your screen)");
         });
         // ---- Synth volume / mute (screen + peer sources) ----
         ui.add_space(2.0);
@@ -1873,7 +2136,9 @@ impl PianoApp {
                     .on_hover_text("Relaunch into the new version (or just reopen the app later)")
                     .clicked()
                 {
-                    update::restart();
+                    // Honor the unsaved-roll confirmation and flush a pending
+                    // prefs save before the process exits (F12/F22/C1).
+                    self.request_restart();
                 }
                 true
             }
@@ -1894,6 +2159,14 @@ impl PianoApp {
     /// audio with tones that have no MIDI label. Note-offs always pass through so
     /// nothing started before arming gets stuck sounding.
     fn play_synth(&mut self, msg: NoteMsg, channel: synth::Channel) {
+        // Guard the note byte before it reaches the synth: peer datagrams are
+        // untrusted, and an out-of-range note (e.g. `[0x90, 200, ..]`) would
+        // start an aliased ultrasonic voice that `clear_remote_keys` — which
+        // only releases MIDI 21..=108 — could never stop (L1). Every other
+        // consumer already gates on `midi_to_key_index`; match it here.
+        if midi_to_key_index(msg.midi()).is_none() {
+            return;
+        }
         match msg {
             NoteMsg::On(n, _) => {
                 // Velocity is deliberately unused here: the built-in synth
@@ -1923,7 +2196,10 @@ impl PianoApp {
     /// Whether *this* instance owns the metronome grid: true when solo (no peer)
     /// or when we're the host. A follower defers to the host's markers.
     fn metro_authority(&self) -> bool {
-        self.peer.is_none() || self.is_host
+        // A joiner whose host has gone (peer still `Some`, but disconnected)
+        // reclaims authority so its metronome self-anchors instead of latching
+        // on silently (M9).
+        self.peer.is_none() || !self.peer_connected || self.is_host
     }
 
     /// (Re)anchor the metronome to the next roll-time-grid-aligned beat — the
@@ -1975,6 +2251,9 @@ impl PianoApp {
                 break;
             }
             let beat_in_bar = self.metro.next_beat_in_bar;
+            // Record every processed beat (sounded or muted) so a follower can
+            // dedup a re-delivered marker (F3).
+            self.metro.last_beat_at = Some(at);
             if !self.metro.muted {
                 self.synth.tick(
                     self.metro.freq_for_beat(beat_in_bar),
@@ -2060,10 +2339,38 @@ impl PianoApp {
         let period = Duration::from_secs_f64(self.metro.period());
         // When (corrected for transit) the host played this beat, in our clock.
         let this_beat_at = now.checked_sub(one_way).unwrap_or(now);
-        // Schedule the *next* beat locally; the following marker re-anchors it,
-        // correcting drift, while local generation covers any lost marker.
-        self.metro.next_beat_at = Some(this_beat_at + period);
-        self.metro.next_beat_in_bar = (beat_in_bar + 1) % self.metro.beats_per_bar;
+        // Reduce the (untrusted) wire byte modulo the bar first, so a hostile
+        // `beat_in_bar = 255` can't overflow the u8 add (a debug-build panic) —
+        // `beat_in_bar % bpb < bpb`, so the `+ 1` is always in range (L2).
+        let bpb = self.metro.beats_per_bar; // already `.max(1)` above
+        let beat_in_bar = beat_in_bar % bpb;
+
+        // Have we already handled ~this beat? On low-latency links the marker
+        // for beat N arrives right as our local schedule for beat N comes due;
+        // the old code overwrote the schedule with beat N+1, silently swallowing
+        // N's click. Instead, if we haven't already sounded a beat within half a
+        // period of this one, (re)schedule beat N *itself* at its corrected time
+        // — which is at/just-before `now`, so `drive_metronome` (running right
+        // after `pump_network` this same frame) sounds it and advances to N+1.
+        // The dedup guard prevents a double-click when a marker is re-delivered
+        // after we already generated N locally (F3).
+        let already_sounded = self.metro.last_beat_at.is_some_and(|prev| {
+            let d = if this_beat_at >= prev {
+                this_beat_at - prev
+            } else {
+                prev - this_beat_at
+            };
+            d < period / 2
+        });
+        if already_sounded {
+            // Same beat we already handled: just re-anchor the next one.
+            self.metro.next_beat_at = Some(this_beat_at + period);
+            self.metro.next_beat_in_bar = (beat_in_bar + 1) % bpb;
+        } else {
+            // Fire beat N now (via the schedule), then it advances to N+1.
+            self.metro.next_beat_at = Some(this_beat_at);
+            self.metro.next_beat_in_bar = beat_in_bar;
+        }
     }
 
     /// Metronome row: on/off, tempo, and a local-only "mute click". Editing tempo
@@ -2087,7 +2394,7 @@ impl PianoApp {
         {
             self.metro_set(self.metro.enabled, bpm);
             self.prefs.metro_bpm = bpm.clamp(MIN_BPM, MAX_BPM);
-            self.prefs.save();
+            self.save_prefs_soon(); // BPM is a drag-value — debounce the save
         }
         ui.separator();
         let mut changed = ui
@@ -2130,9 +2437,7 @@ impl PianoApp {
         apply(&mut self.local, msg);
         self.roll.note(roll::Who::Local, msg, self.local_color);
         self.play_synth(msg, synth::Channel::Local);
-        if let Some(peer) = &self.peer {
-            peer.send(Packet::Note(msg));
-        }
+        self.send_note(msg);
     }
 
     /// Reconcile the mouse-held note with the key currently under the pressed
@@ -2161,7 +2466,7 @@ impl PianoApp {
     /// handles the OS would provide (we dropped its chrome — see `main`).
     fn title_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("titlebar")
-            .exact_height(30.0)
+            .exact_height(TITLEBAR_H)
             .show(ctx, |ui| {
                 let bar_rect = ui.max_rect();
                 // Drag / double-click the bar. Interact FIRST so the menus and
@@ -2275,6 +2580,29 @@ impl PianoApp {
         }
     }
 
+    /// Handle the "Restart now" button: honor the unsaved-roll confirmation
+    /// (the update restart used to bypass it, destroying unsaved playing, F22).
+    /// With no unsaved work, restart straight away.
+    fn request_restart(&mut self) {
+        if self.roll.has_unsaved() {
+            self.pending_restart = true;
+            self.show_close_confirm = true;
+        } else {
+            self.perform_restart();
+        }
+    }
+
+    /// Actually relaunch into the updated build. `update::restart()` calls
+    /// `process::exit`, which runs no destructors — so flush a pending debounced
+    /// prefs save (F12) and finalize any in-progress recording (C1) first.
+    fn perform_restart(&mut self) -> ! {
+        if self.prefs_save_due.take().is_some() {
+            self.prefs.save();
+        }
+        self.input.recorder.shutdown();
+        update::restart()
+    }
+
     /// Thin invisible drag handles on the window's side/bottom edges and four
     /// corners (no top edge — that strip is the title bar's move-drag; see the
     /// note on `handles`), each resizing the window — the affordance the OS
@@ -2303,16 +2631,21 @@ impl PianoApp {
         // edges, tiled so none overlap. Deliberately NO north edge handle: the
         // top strip belongs to the title bar's move-drag, and a resize handle
         // there (a foreground Area, so it wins the pointer) hijacked
-        // move-drags that started near the top edge. Top resizing is still
-        // available via the NW/NE corners.
+        // move-drags that started near the top edge. The ENTIRE title-bar strip
+        // (`TITLEBAR_H`) is reserved for it — the NW/NE corners begin just below
+        // it, so a touch-sized corner handle no longer sits over the window
+        // buttons / menus (a tap over ✕ started a resize instead of closing,
+        // F23). Top resizing stays available from those just-below-the-bar
+        // corners.
+        let ct = t + TITLEBAR_H; // top of the resize zone (below the title bar)
         let handles = [
-            (rect(p(l, t), p(l + bb, t + bb)), D::NorthWest, C::ResizeNorthWest, true),
-            (rect(p(r - bb, t), p(r, t + bb)), D::NorthEast, C::ResizeNorthEast, true),
+            (rect(p(l, ct), p(l + bb, ct + bb)), D::NorthWest, C::ResizeNorthWest, true),
+            (rect(p(r - bb, ct), p(r, ct + bb)), D::NorthEast, C::ResizeNorthEast, true),
             (rect(p(l, b - bb), p(l + bb, b)), D::SouthWest, C::ResizeSouthWest, true),
             (rect(p(r - bb, b - bb), p(r, b)), D::SouthEast, C::ResizeSouthEast, true),
             (rect(p(l + bb, b - bb), p(r - bb, b)), D::South, C::ResizeSouth, false),
-            (rect(p(l, t + bb), p(l + bb, b - bb)), D::West, C::ResizeWest, false),
-            (rect(p(r - bb, t + bb), p(r, b - bb)), D::East, C::ResizeEast, false),
+            (rect(p(l, ct + bb), p(l + bb, b - bb)), D::West, C::ResizeWest, false),
+            (rect(p(r - bb, ct + bb), p(r, b - bb)), D::East, C::ResizeEast, false),
         ];
         // Minimum inner size to clamp against, matching what the OS enforced —
         // tighter in compact mode so the compact window can shrink further.
@@ -2464,13 +2797,27 @@ impl PianoApp {
     /// Shrink to keyboard + title bar: snapshot the current size for restore,
     /// keep the width, clamp the height.
     fn apply_compact_size(&mut self, ctx: &egui::Context) {
-        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
-            self.normal_size = Some(rect.size());
-            // Same opt-in policy as `compact_mode` itself: only persisted when
-            // the user asked for window state to be remembered.
-            if self.prefs.remember_window_state {
-                self.prefs.normal_window_size = Some([rect.size().x, rect.size().y]);
-                self.prefs.save();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        // Clear the OS maximized flag first: a maximized window ignores
+        // `InnerSize` and leaves the title-bar move-drag and every resize handle
+        // disabled (they early-return while maximized), so the compact strip
+        // would be stuck un-movable and un-resizable (F10).
+        if maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        // Snapshot the restore size only from a *non-maximized* rect: capturing
+        // the full-screen maximized rect would persist a screen-sized "normal"
+        // window that compact-restore then expands to (F10). While maximized we
+        // keep the previously-captured `normal_size` (or the default).
+        if !maximized {
+            if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+                self.normal_size = Some(rect.size());
+                // Same opt-in policy as `compact_mode` itself: only persisted
+                // when the user asked for window state to be remembered.
+                if self.prefs.remember_window_state {
+                    self.prefs.normal_window_size = Some([rect.size().x, rect.size().y]);
+                    self.prefs.save();
+                }
             }
         }
         let width = self.normal_size.map_or(DEFAULT_WINDOW_SIZE[0], |s| s.x);
@@ -2590,7 +2937,10 @@ impl PianoApp {
             });
 
         if changed {
-            self.prefs.save();
+            // Debounced: the Preferences dialog aggregates every control's
+            // `.changed()` here, including sliders/drag-values that fire each
+            // frame of a drag — an immediate save would write ~60×/s (M7).
+            self.save_prefs_soon();
         }
         // The window ✕ (or Esc) clears `open`; mirror it back into our flag.
         if !open {
@@ -2836,7 +3186,15 @@ impl PianoApp {
         ui.horizontal(|ui| {
             ui.label("Beats per bar:");
             let mut bpb = self.prefs.metro_beats_per_bar;
-            if ui.add(egui::DragValue::new(&mut bpb).range(1..=12)).changed() {
+            // Host-authoritative: a follower's edit would be silently reverted
+            // by the next host beat marker (which carries beats_per_bar), while
+            // its own UI kept showing the changed value — both ends then
+            // inconsistent. Disable it unless we own the grid (M8).
+            let authority = self.metro_authority();
+            let bpb_resp = ui
+                .add_enabled(authority, egui::DragValue::new(&mut bpb).range(1..=12))
+                .on_disabled_hover_text("The host sets beats per bar for both players");
+            if bpb_resp.changed() {
                 bpb = bpb.max(1);
                 self.prefs.metro_beats_per_bar = bpb;
                 resize_beat_table(&mut self.prefs.metro_beat_freqs, bpb as usize, 1200.0);
@@ -3106,10 +3464,29 @@ impl PianoApp {
                 NetEvent::Connected => {
                     // Fresh connection: remote state is unknown (this may be a
                     // reconnect mid-chord), and the peer needs our color.
+                    self.peer_connected = true;
                     self.clear_remote_keys();
                     self.send_color();
                     self.send_name();
-                    self.send_metro_table();
+                    // Only the metronome authority (host) broadcasts the click
+                    // table on connect — a follower staying silent is what stops
+                    // the two sides *swapping* tables (each sending before it
+                    // processes the other's) and never converging (F2). The
+                    // follower adopts the host's, and pushes its own edits to the
+                    // host afterwards.
+                    if self.metro_authority() {
+                        self.send_metro_table();
+                    }
+                    // Announce our current live notes, pinned keys, and pedal so
+                    // a chord/pin/pedal held across the (re)connect lights up on
+                    // the peer immediately instead of waiting to be re-struck
+                    // (H1/H2/M1).
+                    self.broadcast_live(true);
+                    self.broadcast_held(true);
+                    if let Some(peer) = &self.peer {
+                        peer.send(Packet::Pedal { level: self.local_pedal });
+                    }
+                    self.last_pedal_sent = self.local_pedal;
                     // If we're the metronome authority, announce current state so
                     // a follower syncs immediately (even when it's off). The
                     // per-beat markers handle the running case.
@@ -3125,12 +3502,18 @@ impl PianoApp {
                     }
                 }
                 NetEvent::Disconnected => {
+                    self.peer_connected = false;
                     self.clear_remote_keys();
                     // Drop the peer's announced name so a stale one isn't shown
                     // while nobody's connected; it re-announces on reconnect.
                     self.remote_name = DEFAULT_REMOTE_NAME.to_string();
                 }
-                NetEvent::Packet(Packet::Note(msg)) => {
+                NetEvent::Packet(Packet::Note(msg, seq)) => {
+                    // Note events always apply (per-key transitions are
+                    // independent; reordered events for different keys must not
+                    // cancel), and advance the high-water mark so a stale Live
+                    // snapshot that reordered past this note is later ignored (F6).
+                    self.remote_live_seq = self.remote_live_seq.max(seq);
                     apply(&mut self.remote, msg);
                     self.roll.note(roll::Who::Remote, msg, self.remote_color);
                     // The peer's notes have no local sound source, so voice them.
@@ -3139,6 +3522,41 @@ impl PianoApp {
                 NetEvent::Packet(Packet::Pedal { level }) => {
                     self.remote_pedal = level;
                     self.roll.pedal(roll::Who::Remote, level);
+                }
+                // The peer's Ctrl+click-pinned keys — a whole-state snapshot, so
+                // just adopt it (idempotent; an empty mask clears the overlay
+                // when they release Ctrl). Display only: no synth, no roll.
+                NetEvent::Packet(Packet::Held { seq, mask }) => {
+                    // Ignore a snapshot that reordered behind a newer one (F6).
+                    if seq >= self.remote_held_seq {
+                        self.remote_held_seq = seq;
+                        self.remote_held = unpack_held(&mask);
+                    }
+                }
+                // The peer's live (sounding) notes as a whole-state snapshot —
+                // reconcile so any dropped note-on/off self-heals (H1), unless it
+                // reordered behind a newer note/snapshot, which would resurrect a
+                // released note or extinguish a fresh press (F6).
+                NetEvent::Packet(Packet::Live { seq, mask }) => {
+                    if seq >= self.remote_live_seq {
+                        self.remote_live_seq = seq;
+                        self.reconcile_remote_live(mask);
+                    }
+                }
+                // The peer's manual segment breaks — fold each into our roll
+                // (idempotent; `insert_separator` dedupes) so the break shows on
+                // both screens (M2). Drop any time beyond our own live edge
+                // instead of clamping it there: clamping made every heartbeat
+                // re-delivery land at the (ever-advancing) live edge, spawning a
+                // fresh separator line every second (F1). A break the peer placed
+                // ahead of our clock is simply inserted once our clock reaches it.
+                NetEvent::Packet(Packet::Separators(times)) => {
+                    let now = self.roll.now_s();
+                    for at in times {
+                        if at > 0.0 && at <= now {
+                            self.roll.insert_separator(at);
+                        }
+                    }
                 }
                 // Intentionally *not* applied to `remote_color`: every fresh
                 // install defaults `local_color` to the same red, so honoring
@@ -3179,12 +3597,19 @@ impl PianoApp {
                 NetEvent::Packet(Packet::MetroBeat { .. }) => {}
                 NetEvent::Packet(Packet::MetroBeatTable { freqs, volumes }) => {
                     // No authority here (see Packet::MetroBeatTable): whoever
-                    // last edited wins on both ends.
-                    self.metro.beat_freqs = freqs.clone();
-                    self.metro.beat_volumes = volumes.clone();
-                    self.prefs.metro_beat_freqs = freqs;
-                    self.prefs.metro_beat_volumes = volumes;
-                    self.prefs.save();
+                    // last edited wins on both ends. Adopt (and persist) only
+                    // when the table actually differs — this is what stops the
+                    // two peers oscillating X→Y→X every second and turns the
+                    // per-packet `prefs.save()` disk-write storm into a write
+                    // only on a genuine change (H3). Values arrive already
+                    // finite/in-range (sanitized in `Packet::decode`).
+                    if self.metro.beat_freqs != freqs || self.metro.beat_volumes != volumes {
+                        self.metro.beat_freqs = freqs.clone();
+                        self.metro.beat_volumes = volumes.clone();
+                        self.prefs.metro_beat_freqs = freqs;
+                        self.prefs.metro_beat_volumes = volumes;
+                        self.prefs.save();
+                    }
                 }
                 NetEvent::MetroBeat { bpm, beat_in_bar, beats_per_bar, on, one_way } => {
                     self.on_metro_beat(bpm, beat_in_bar, beats_per_bar, on, one_way);
@@ -3202,6 +3627,16 @@ fn apply(keys: &mut [bool; KEY_COUNT], msg: NoteMsg) {
 }
 
 impl eframe::App for PianoApp {
+    /// Called once as the app shuts down (window closed / Alt+F4). A debounced
+    /// prefs save may still be pending — a slider edited within the last
+    /// `PREFS_SAVE_DEBOUNCE` — and nothing else flushes it once `update` stops
+    /// running, so force it here or the last edit is silently lost (F12).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.prefs_save_due.take().is_some() {
+            self.prefs.save();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_onsets.clear(); // repopulated by pump_input below
         self.pump_input();
@@ -3209,6 +3644,28 @@ impl eframe::App for PianoApp {
         self.sync_synth_to_source();
         self.drive_metronome();
         self.roll.tick(Instant::now());
+        self.flush_prefs_save();
+
+        // Restart the evaluation take if the key range was edited mid-take: the
+        // range is frozen into `EvaluationState` at take start (H7), so a live
+        // edit would otherwise leave the frozen `required` list disagreeing with
+        // what the UI now shows — pause-on-miss would freeze at a note the user
+        // just excluded (the "roll froze" symptom). Every other evaluation
+        // setting already restarts the take; the range is the one that didn't
+        // (M13).
+        let current_range = self.playback.as_ref().and_then(|pb| pb.learn.key_range);
+        let range_changed_mid_take = self
+            .playback
+            .as_ref()
+            .is_some_and(|pb| pb.mode == playback::Mode::Evaluation)
+            && current_range != self.last_key_range;
+        if range_changed_mid_take {
+            let live_midi = self.input.midi_connected();
+            if let Some(pb) = &mut self.playback {
+                pb.start_evaluation(live_midi, &self.synth);
+            }
+        }
+        self.last_key_range = current_range;
 
         // Advance the loaded score's playhead (Listen auto-play / Learn
         // gating). `self.local` is already current from the pumps above.
@@ -3290,12 +3747,52 @@ impl eframe::App for PianoApp {
             self.touch_mode = false;
         }
 
-        // Low-rate color heartbeat so colors sync regardless of connect order.
-        // The metronome tables ride along on the same cadence.
+        // Low-rate heartbeat carrying every idempotent shared-surface snapshot,
+        // so a dropped datagram self-heals within a second regardless of
+        // connect order (and the QUIC connection never idles out). Everything
+        // here is a whole-state snapshot the receiver reconciles idempotently,
+        // so re-sending is safe.
         if self.peer.is_some() && self.last_color_send.elapsed() >= COLOR_HEARTBEAT {
             self.send_color();
             self.send_name();
-            self.send_metro_table();
+            // Live notes + pinned keys, re-sent unconditionally: the pin-clear
+            // (H2) and a phrase's final note-off (H1) have no "next event" to
+            // correct a lost datagram, so the periodic snapshot is the only
+            // self-heal. Idempotent — the receiver acts only on real diffs.
+            self.broadcast_live(true);
+            self.broadcast_held(true);
+            // Current pedal level, so a level held constant across a reconnect,
+            // and a lost final release, both heal (M1).
+            if let Some(peer) = &self.peer {
+                peer.send(Packet::Pedal { level: self.local_pedal });
+            }
+            self.last_pedal_sent = self.local_pedal;
+            // Manually-inserted segment breaks, so a Ctrl+click break shows on
+            // both screens and a dropped one still converges (M2).
+            self.broadcast_separators();
+            // Metronome state, authority-only so it can't oscillate (F2/F11):
+            if self.metro_authority() {
+                // The click table — a single broadcaster (the host) means the
+                // two sides can't swap or oscillate, and a dropped table-edit
+                // heals within a second (F2).
+                self.send_metro_table();
+                // On/off state: a *running* metronome already streams per-beat
+                // markers, but an off authority produces none — so re-announce
+                // the off state here, or a dropped connect/toggle marker would
+                // leave a follower clicking a stale grid forever (F11). (Sending
+                // an on:true MetroBeat here would inject a spurious beat, so we
+                // rely on the per-beat markers for the running case.)
+                if !self.metro.enabled {
+                    if let Some(peer) = &self.peer {
+                        peer.send(Packet::MetroBeat {
+                            bpm: self.metro.bpm,
+                            beat_in_bar: 0,
+                            beats_per_bar: self.metro.beats_per_bar,
+                            on: false,
+                        });
+                    }
+                }
+            }
         }
 
         // ---- Custom title bar (File/Edit menus, window controls, edge resize).
@@ -3363,7 +3860,14 @@ impl eframe::App for PianoApp {
                     ui.label(format!("{} (peer)", self.remote_name));
                     ui.separator();
                     let (device, model) = {
-                        let s = self.input.status.lock().unwrap();
+                        // Recover the guard if a backend thread panicked while
+                        // holding it, rather than cascading that panic into the
+                        // GUI thread every frame (L5).
+                        let s = self
+                            .input
+                            .status
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         (s.device.clone(), s.model.clone())
                     };
                     ui.label(device);
@@ -3559,6 +4063,8 @@ impl eframe::App for PianoApp {
             let cmd = ui.input(|i| i.modifiers.command);
             if self.held_cmd_down && !cmd {
                 self.held = [false; KEY_COUNT];
+                // Tell the peer the shared overlay just cleared (all-zero mask).
+                self.broadcast_held(false);
             }
             self.held_cmd_down = cmd;
 
@@ -3598,7 +4104,8 @@ impl eframe::App for PianoApp {
                 self.set_mouse_note(target);
 
                 // Ctrl+click toggles the pinned-held state of the clicked key.
-                // Purely a local display aid — no sound, no roll, no peer send.
+                // A display aid — no sound, no roll — but shared with the peer
+                // (see `held` / `Packet::Held`) so both see the same overlay.
                 if cmd && response.clicked() {
                     if let Some(idx) = response
                         .interact_pointer_pos()
@@ -3606,6 +4113,7 @@ impl eframe::App for PianoApp {
                         .and_then(midi_to_key_index)
                     {
                         self.held[idx] = !self.held[idx];
+                        self.broadcast_held(false);
                     }
                 }
             }
@@ -3614,17 +4122,22 @@ impl eframe::App for PianoApp {
             // roll panels, so marks are exactly x-aligned with their keys.
             let keys = layout_keys(kb_rect);
 
-            // Ctrl+click-pinned keys render exactly like a live local press
-            // (your own color), so OR them into the local key array used for
-            // drawing — display only; nothing downstream (synth/roll/net) ever
-            // sees `held`. Only shown *while Ctrl is held*; releasing Ctrl both
-            // hides them and clears `held` (see the release-edge check above),
-            // so the set never carries over to a later, unrelated Ctrl-hold.
+            // Ctrl+click-pinned keys render exactly like a live press (in that
+            // player's color), so OR them into the key arrays used for drawing —
+            // display only; nothing downstream (synth/roll) sees `held`. Local
+            // pins show *while Ctrl is held*; releasing Ctrl hides and clears
+            // `held` (see the release-edge check above). Remote pins show
+            // whenever the peer has any (they broadcast the all-zero clear on
+            // their own Ctrl release), keeping the shared overlay in sync.
             let mut local_shown = self.local;
             if cmd {
                 for i in 0..KEY_COUNT {
                     local_shown[i] |= self.held[i];
                 }
+            }
+            let mut remote_shown = self.remote;
+            for i in 0..KEY_COUNT {
+                remote_shown[i] |= self.remote_held[i];
             }
 
             if let Some(pb) = &self.playback {
@@ -3640,6 +4153,19 @@ impl eframe::App for PianoApp {
                         self.local_color[2],
                     ),
                 )];
+                // The peer's pinned overlay is part of the shared surface, so it
+                // shows even while we have a score open (our own pinning is
+                // locked during playback, but theirs may not be).
+                if self.remote_held.iter().any(|&h| h) {
+                    layers.push((
+                        self.remote_held,
+                        egui::Color32::from_rgb(
+                            self.remote_color[0],
+                            self.remote_color[1],
+                            self.remote_color[2],
+                        ),
+                    ));
+                }
                 for who in [roll::Who::Local, roll::Who::Remote] {
                     if !pb.practiced(who) && pb.track_visible(who) {
                         let [r, g, b] = pb.display_score().tracks[who.idx()].color;
@@ -3652,7 +4178,7 @@ impl eframe::App for PianoApp {
                     local: egui::Color32::from_rgb(self.local_color[0], self.local_color[1], self.local_color[2]),
                     remote: egui::Color32::from_rgb(self.remote_color[0], self.remote_color[1], self.remote_color[2]),
                 };
-                draw_keyboard(ui.painter(), kb_rect, &local_shown, &self.remote, colors);
+                draw_keyboard(ui.painter(), kb_rect, &local_shown, &remote_shown, colors);
             }
 
             // Live pedal indicator: a thin sliver in the reserved strip left of
@@ -3741,7 +4267,7 @@ impl eframe::App for PianoApp {
                     |y: f32| view_top_s - ((y - roll_resp.rect.top()) / px_per_s) as f64;
                 if roll_resp.clicked() && ui.input(|i| i.modifiers.command) {
                     if let Some(pos) = roll_resp.interact_pointer_pos() {
-                        self.roll.insert_separator(roll_t_of_y(pos.y));
+                        self.insert_manual_separator(roll_t_of_y(pos.y));
                     }
                 }
                 if roll_resp.secondary_clicked() {
@@ -3752,16 +4278,21 @@ impl eframe::App for PianoApp {
                 roll_resp.context_menu(|ui| {
                     if ui.button("Insert segment break here").clicked() {
                         if let Some(t) = self.pending_break_t.take() {
-                            self.roll.insert_separator(t);
+                            self.insert_manual_separator(t);
                         }
                         ui.close_menu();
                     }
                 });
 
-                // The pedal lane is MIDI-only end to end: hidden (not just
-                // empty) on the mic fallback, like its Preferences toggle.
+                // Pedal lane visibility follows the pref, and shows whenever
+                // *either* side has pedal history — our own (MIDI input) or the
+                // peer's. Gating on our local source alone hid a MIDI peer's
+                // pedal from a mic-input player, contradicting the live
+                // indicator's own rule and the shared-surface principle (M3).
+                let have_remote_pedal =
+                    self.roll.pedal_segments.iter().any(|p| p.who == roll::Who::Remote);
                 let pedal_lane = (self.prefs.pedal_lane_visible
-                    && self.input.source() == Source::Midi)
+                    && (self.input.source() == Source::Midi || have_remote_pedal))
                     .then_some((self.local_color, self.remote_color));
                 draw_roll(
                     ui.painter(),
@@ -3979,11 +4510,24 @@ fn draw_roll(
         lanes[k.midi as usize] = Some((k.rect.x_range(), k.black));
     }
 
+    // `segments` is sorted by `start_s`, so binary-search the slice that can
+    // intersect the visible window instead of scanning the whole session every
+    // frame (which grew unbounded — the ruler already fixed this for itself).
+    // Upper bound: the first segment starting above the view top (future).
+    // Lower bound: `bottom_s` minus a generous look-back, so a note held down
+    // across the window's bottom edge (its `start_s` is earlier) is still
+    // included; anything held longer than the look-back is not realistic (M20).
+    let hi = roll.segments.partition_point(|s| s.start_s <= view_top_s);
+    let lo = roll
+        .segments
+        .partition_point(|s| s.start_s < bottom_s - MARK_LOOKBACK_S);
+    let visible = &roll.segments[lo..hi];
+
     // Fixed half-lane split: local always left, remote always right, so
     // simultaneous same-key presses sit side by side with no overlap logic —
     // the roll's analogue of `paint_key`'s diagonal split.
     for pass_black in [false, true] {
-        for seg in &roll.segments {
+        for seg in visible {
             let Some((xr, black)) = lanes[seg.midi as usize] else { continue };
             if black != pass_black {
                 continue;
@@ -4019,6 +4563,13 @@ fn draw_roll(
         }
     }
 }
+
+/// How far below the visible window's bottom edge (roll seconds) the mark /
+/// pedal-span scan looks back, so a note or pedal held *across* that edge (its
+/// start is earlier) is still drawn. Bounds the per-frame scan to the visible
+/// window rather than the whole (uncapped) session; anything held longer than
+/// this is not a realistic performance (M20).
+const MARK_LOOKBACK_S: f64 = 600.0;
 
 /// Width of the sustain-pedal lane at the history roll's left edge.
 const PEDAL_LANE_W: f32 = 10.0;
@@ -4117,8 +4668,14 @@ fn draw_pedal_lane(
     let bottom_s = view_top_s - (rect.height() / px_per_s) as f64;
 
     // Visible spans per player as (start, end, level); open ones extend live.
+    // `pedal_segments` is start-sorted, so binary-search the visible window
+    // rather than scanning every span each frame (M20, matching the note marks).
+    let phi = roll.pedal_segments.partition_point(|p| p.start_s <= view_top_s);
+    let plo = roll
+        .pedal_segments
+        .partition_point(|p| p.start_s < bottom_s - MARK_LOOKBACK_S);
     let spans = |who: roll::Who| -> Vec<(f64, f64, u8)> {
-        roll.pedal_segments
+        roll.pedal_segments[plo..phi]
             .iter()
             .filter(|p| p.who == who)
             .map(|p| (p.start_s, p.end_s.unwrap_or(roll.now_s()), p.level))

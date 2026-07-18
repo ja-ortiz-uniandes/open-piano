@@ -187,18 +187,87 @@ impl Default for Prefs {
 impl Prefs {
     /// Load preferences, falling back to [`Default`] on any error (missing file,
     /// parse failure, unreadable dir). Never fails — a bad file just resets.
+    /// Whatever parses is then [`sanitize`](Self::sanitize)d, so even a
+    /// well-formed-but-hostile file can't panic startup or poison rendering.
     pub fn load() -> Self {
         let Some(path) = prefs_path() else {
             return Prefs::default();
         };
-        match std::fs::read_to_string(&path) {
+        let mut prefs = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 eprintln!("[prefs] {} is unreadable ({e}); using defaults", path.display());
                 Prefs::default()
             }),
             // Missing file is the normal first-run case — silent.
             Err(_) => Prefs::default(),
+        };
+        prefs.sanitize();
+        prefs
+    }
+
+    /// Clamp every numeric field to a finite, in-range value and reconcile the
+    /// two per-beat metronome arrays to equal length. `#[serde(default)]` keeps
+    /// a *missing* field safe; this keeps a *present but hostile* one safe —
+    /// values like `1e30` (which would panic `Duration::from_secs_f64` on every
+    /// launch), non-finite floats, `roll_px_per_s: 0` (a coordinate-mapping
+    /// divisor), or a `metro_beat_volumes` shorter than `metro_beat_freqs`
+    /// (an index-out-of-bounds panic when the Metronome tab opens).
+    fn sanitize(&mut self) {
+        fn f64_or(v: f64, lo: f64, hi: f64, default: f64) -> f64 {
+            if v.is_finite() { v.clamp(lo, hi) } else { default }
         }
+        fn f32_or(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
+            if v.is_finite() { v.clamp(lo, hi) } else { default }
+        }
+
+        // Section timing (seconds): finite and within a day, so `Duration`
+        // conversions can't overflow/panic.
+        self.idle_pause.secs = f64_or(self.idle_pause.secs, 0.0, 86_400.0, 30.0);
+        self.section_tail_s = f64_or(self.section_tail_s, 0.0, 86_400.0, 2.0);
+        self.section_lead_in_s = f64_or(self.section_lead_in_s, 0.0, 86_400.0, 2.0);
+        self.scrollback_idle_s = f64_or(self.scrollback_idle_s, 0.0, 86_400.0, 2.5);
+        // Zoom is a divisor in the roll coordinate map — must be strictly > 0.
+        self.roll_px_per_s = f32_or(self.roll_px_per_s, 1.0, 5000.0, 40.0);
+
+        // Audio / detector knobs.
+        self.threshold = f32_or(self.threshold, 0.05, 0.95, 0.30);
+        self.silence_rms = f32_or(self.silence_rms, 0.0, 1.0, 0.002);
+        self.norm_max_gain = f32_or(self.norm_max_gain, 1.0, 100.0, 10.0);
+        self.frame_off = f32_or(self.frame_off, 0.0, 1.0, 0.10);
+
+        // Metronome: clamp tempo, and make the two per-beat arrays equal length
+        // (the Preferences loop iterates `freqs` and indexes `volumes`).
+        self.metro_bpm = self.metro_bpm.clamp(30, 240);
+        self.metro_beats_per_bar = self.metro_beats_per_bar.clamp(1, 32);
+        if self.metro_beat_freqs.is_empty() {
+            self.metro_beat_freqs = vec![1200.0; self.metro_beats_per_bar as usize];
+        }
+        for f in &mut self.metro_beat_freqs {
+            *f = f32_or(*f, 20.0, 8000.0, 1200.0);
+        }
+        self.metro_beat_volumes.resize(self.metro_beat_freqs.len(), 1.0);
+        for v in &mut self.metro_beat_volumes {
+            *v = f32_or(*v, 0.0, 1.0, 1.0);
+        }
+
+        // Window size fed straight into `ViewportCommand::InnerSize` when
+        // leaving compact mode: a non-finite/degenerate value produces a
+        // broken/vanished window (and is re-saved, so it persists). Drop the
+        // hint entirely if either axis is unusable; otherwise clamp to a sane
+        // pixel range (F27).
+        self.normal_window_size = self.normal_window_size.and_then(|[w, h]| {
+            if w.is_finite() && h.is_finite() {
+                Some([w.clamp(200.0, 10_000.0), h.clamp(150.0, 10_000.0)])
+            } else {
+                None
+            }
+        });
+        // Echo holdoff: a huge value leaves the mic permanently deaf after any
+        // synth note. Cap at 60 s (F27).
+        self.echo_holdoff_ms = self.echo_holdoff_ms.min(60_000);
+        // Pedal deadzone is a CC delta (0..=127); anything above makes the pedal
+        // lane permanently dead (F27).
+        self.pedal_deadzone = self.pedal_deadzone.min(127);
     }
 
     /// Save preferences atomically (temp file + rename). Errors are logged but
@@ -219,9 +288,23 @@ impl Prefs {
             }
         };
         let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        if let Err(e) = std::fs::write(&tmp, json) {
-            eprintln!("[prefs] write failed: {e}");
-            return;
+        // Write + fsync the temp file's *data* before the rename, so a power
+        // loss can't commit the rename (metadata) while the file's data blocks
+        // are still empty — which would truncate preferences.json to nothing and
+        // silently reset every preference next launch (F19). Mirrors bundle.rs.
+        match std::fs::File::create(&tmp) {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                if let Err(e) = f.write_all(json.as_bytes()).and_then(|()| f.sync_all()) {
+                    eprintln!("[prefs] write/sync failed: {e}");
+                    let _ = std::fs::remove_file(&tmp);
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[prefs] write failed: {e}");
+                return;
+            }
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
             eprintln!("[prefs] rename failed: {e}");
@@ -269,6 +352,29 @@ mod tests {
         assert_eq!(parsed.section_lead_in_s, 2.0);
         assert_eq!(parsed.pedal_deadzone, 0);
         assert_eq!(parsed.normal_window_size, None);
+    }
+
+    #[test]
+    fn sanitize_reconciles_metro_array_lengths() {
+        // 5 freqs but 4 volumes: the Preferences loop would index out of bounds.
+        let mut p: Prefs = serde_json::from_str(
+            r#"{"metro_beat_freqs":[1800,1200,1200,1200,1200],"metro_beat_volumes":[1,1,1,1]}"#,
+        )
+        .unwrap();
+        p.sanitize();
+        assert_eq!(p.metro_beat_volumes.len(), p.metro_beat_freqs.len());
+    }
+
+    #[test]
+    fn sanitize_clamps_hostile_numerics() {
+        let mut p: Prefs =
+            serde_json::from_str(r#"{"section_tail_s":1e30,"roll_px_per_s":0.0}"#).unwrap();
+        p.sanitize();
+        assert!(p.section_tail_s.is_finite() && p.section_tail_s <= 86_400.0);
+        assert!(p.roll_px_per_s >= 1.0);
+        // The duration conversion that used to panic on 1e30 is now safe.
+        let _ = Duration::from_secs_f64(p.section_tail_s);
+        let _ = p.idle_pause.as_duration();
     }
 
     #[test]

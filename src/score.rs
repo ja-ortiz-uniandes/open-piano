@@ -90,7 +90,13 @@ pub struct Score {
 
 impl Score {
     pub fn load(path: &Path) -> Result<Score, String> {
-        let mut score = match path.extension().and_then(|e| e.to_str()) {
+        // Case-insensitive: Windows (the app's only platform) happily hands us
+        // `.MID`/`.JSONL`, and a foreign file may be upper-cased.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let mut score = match ext.as_deref() {
             Some("jsonl") => Self::load_jsonl(path)?,
             Some("mid") | Some("midi") => Self::load_midi(path)?,
             _ => return Err("expected a .mid, .midi, or .jsonl file".into()),
@@ -213,6 +219,12 @@ impl Score {
                 return Err("SMPTE-timed MIDI files aren't supported".into());
             }
         };
+        // Division 0 parses as legal metrical timing but makes ticks→seconds
+        // `0/0 = NaN` (and later events +∞), so `duration_s` goes infinite and
+        // an Evaluation take could never end. Reject it like SMPTE timing.
+        if ppq == 0 {
+            return Err("MIDI file has an invalid ticks-per-quarter of 0".into());
+        }
 
         // Single constant tempo: the first Tempo event anywhere wins (500000
         // µs/quarter if none — the MIDI default). This app's own exports are
@@ -368,6 +380,12 @@ impl Score {
                 return Err("malformed event line".into());
             };
             let Some(t) = ev["t"].as_f64() else { continue };
+            // Reject non-finite / negative times: a negative start would drag
+            // the playhead behind 0 (pause-on-miss clamps the gate to it), and
+            // NaN/∞ would poison `duration_s` and all downstream timing.
+            if !t.is_finite() || t < 0.0 {
+                continue;
+            }
             duration_s = duration_s.max(t);
             match ev["e"].as_str() {
                 Some("sep") => {
@@ -382,16 +400,21 @@ impl Score {
                     let (Some(n), Some(who)) = (ev["n"].as_u64(), ev["who"].as_str()) else {
                         continue;
                     };
-                    let (midi, w) = (n as u8, if who == "r" { 1 } else { 0 });
-                    if midi < MIDI_LOW || midi > MIDI_HIGH {
+                    // Range-check on the *u64* before narrowing: `n as u8` would
+                    // wrap (note 300 → 44) and sneak past an after-the-cast check.
+                    if n < MIDI_LOW as u64 || n > MIDI_HIGH as u64 {
                         continue;
                     }
+                    let (midi, w) = (n as u8, if who == "r" { 1 } else { 0 });
                     if kind == "on" {
                         if open[w][midi as usize].is_none() {
                             open[w][midi as usize] = Some(tracks[w].len());
                             let velocity = ev["v"]
+                                // Saturate on the *u64* before narrowing: `v as u8`
+                                // would wrap (300 → 44, 256 → 0) and sneak past the
+                                // clamp — the same class the `"n"` cast above fixes (F30).
                                 .as_u64()
-                                .map_or(FILE_DEFAULT_VELOCITY, |v| (v as u8).clamp(1, 127));
+                                .map_or(FILE_DEFAULT_VELOCITY, |v| v.clamp(1, 127) as u8);
                             tracks[w].push(Note { start_s: t, end_s: t, midi, velocity });
                         }
                     } else if let Some(i) = open[w][midi as usize].take() {
@@ -405,7 +428,10 @@ impl Score {
                         continue;
                     };
                     let w = if who == "r" { 1 } else { 0 };
-                    pedal[w].push((t, (v as u8).min(127)));
+                    // Saturate before narrowing (F30): `v as u8` would wrap
+                    // (pedal 300 → 44 < 64), reporting an intended full press as
+                    // pedal-up and corrupting `required_pedal_down` targets.
+                    pedal[w].push((t, v.min(127) as u8));
                 }
                 _ => {}
             }
@@ -415,6 +441,19 @@ impl Score {
                 tracks[w][slot].end_s = tracks[w][slot].end_s.max(duration_s);
             }
         }
+        // Notes and pedal events must be sorted by time: `gate_at_or_after`
+        // (wait-mode gating), `Track::pedal_down_at` (pedal grading), and the
+        // segment builder all assume it. A hand-written / out-of-order jsonl
+        // otherwise silently mis-gates and mis-grades (F15). `load_midi` already
+        // emits them in order; sorting a sorted list is cheap.
+        for w in 0..2 {
+            tracks[w].sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+            pedal[w].sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+        // Markers drive segment boundaries; `build_segments` assumes them
+        // sorted (as `load_midi` guarantees). A hand-written / out-of-order
+        // jsonl otherwise yields `end_s < start_s` segments.
+        markers.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         let [local, remote] = tracks;
         let [local_pedal, remote_pedal] = pedal;
@@ -552,6 +591,74 @@ mod tests {
             assert!((w[0].end_s - w[1].start_s).abs() < 1e-9);
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_notes_and_pedal_sorted_and_values_saturated() {
+        // Hand-written, out-of-order jsonl with hostile velocity/pedal values.
+        // Notes and pedal must load time-sorted (F15) and their values must
+        // saturate before narrowing, not wrap (F30: `300 as u8` == 44).
+        let jsonl = concat!(
+            "{}\n",                                                        // header
+            "{\"t\":2.0,\"e\":\"on\",\"n\":64,\"v\":300,\"who\":\"l\"}\n", // later note first
+            "{\"t\":2.5,\"e\":\"off\",\"n\":64,\"who\":\"l\"}\n",
+            "{\"t\":0.5,\"e\":\"on\",\"n\":60,\"v\":100,\"who\":\"l\"}\n",  // earlier note second
+            "{\"t\":1.0,\"e\":\"off\",\"n\":60,\"who\":\"l\"}\n",
+            "{\"t\":1.5,\"e\":\"pedal\",\"v\":300,\"who\":\"l\"}\n",        // out-of-order pedal
+            "{\"t\":0.2,\"e\":\"pedal\",\"v\":80,\"who\":\"l\"}\n",
+        );
+        let dir = std::env::temp_dir().join(format!("op-score-sort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hand.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let score = Score::load(&path).unwrap();
+        let notes = &score.tracks[0].notes;
+        assert_eq!(notes.len(), 2);
+        // Sorted by start_s (F15): note 60 (t=0.5) before note 64 (t=2.0).
+        assert_eq!(notes[0].midi, 60);
+        assert_eq!(notes[1].midi, 64);
+        // v:300 saturates to 127, not `300 as u8` == 44 (F30).
+        assert_eq!(notes[1].velocity, 127);
+        // Pedal sorted by time (F15), values saturated (F30): 300 -> 127 (down).
+        let pedal = &score.tracks[0].pedal_events;
+        assert_eq!(pedal.len(), 2);
+        assert_eq!(pedal[0], (0.2, 80));
+        assert_eq!(pedal[1], (1.5, 127));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_zero_division_midi() {
+        use midly::num::{u15, u28, u4, u7};
+        use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+        // A legally-parsing but nonsensical division-0 file: loading must fail
+        // rather than produce NaN/∞ note times (H6).
+        let mut smf = Smf::new(Header::new(Format::SingleTrack, Timing::Metrical(u15::from(0))));
+        smf.tracks.push(vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn { key: u7::from(60), vel: u7::from(100) },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(10),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff { key: u7::from(60), vel: u7::from(0) },
+                },
+            },
+            TrackEvent { delta: u28::from(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) },
+        ]);
+        let dir = std::env::temp_dir().join(format!("op-score-ppq0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("z.mid");
+        smf.save(&path).unwrap();
+        assert!(Score::load(&path).is_err(), "division-0 file must be rejected");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -211,10 +211,14 @@ async fn run_host(
     // Offline/LAN-only hosts get no relay and no discovery, so after the
     // timeout fall back to the long code with the direct addresses inline.
     status("Contacting relay…".into());
-    let code = if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
-        .await
-        .is_ok()
-    {
+    // Race the relay-contact wait against the UI dropping the session, so a
+    // "Host → close" during this up-to-15 s window shuts the net thread down
+    // promptly instead of lingering (L4).
+    let online = tokio::select! {
+        r = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()) => r.is_ok(),
+        _ = discard_until_closed(outgoing) => return,
+    };
+    let code = if online {
         endpoint.id().to_string()
     } else {
         status("No relay reachable — invite code will only work on this network".into());
@@ -351,9 +355,16 @@ async fn relay_session(
                 }
             },
             packet = outgoing.recv() => match packet {
-                // Best-effort, like the old UDP path: a send error just means
-                // the connection is going away; read_datagram reports it.
-                Some(p) => { let _ = conn.send_datagram(Bytes::from(p.encode())); }
+                // Best-effort, like the old UDP path: a lost datagram is expected
+                // (the heartbeat re-sends). But a *persistent* error like
+                // `TooLarge` (an oversized snapshot exceeding the path MTU) would
+                // silently stop that packet type from ever arriving, so surface
+                // it rather than discarding it blindly (F21).
+                Some(p) => {
+                    if let Err(e) = conn.send_datagram(Bytes::from(p.encode())) {
+                        eprintln!("[net] datagram send failed: {e}");
+                    }
+                }
                 None => {
                     conn.close(0u32.into(), b"closed");
                     return SessionEnd::UiGone;
@@ -425,7 +436,7 @@ mod tests {
             }
             panic!("never received {what}");
         };
-        exchange(&joiner, &host, Packet::Note(NoteMsg::On(60, 100)), "note at host");
+        exchange(&joiner, &host, Packet::Note(NoteMsg::On(60, 100), 0), "note at host");
         exchange(&host, &joiner, Packet::Color([1, 2, 3]), "color at joiner");
 
         // Metronome beat markers surface as a distinct `NetEvent::MetroBeat`

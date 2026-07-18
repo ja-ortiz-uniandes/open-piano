@@ -180,6 +180,12 @@ pub fn run(
         // a note. The frame grid is the primary gate because on a mic it separates
         // real notes from noise far better than the onset grid (see `ONSET_TRIG`).
         let trig_thresh = threshold.get();
+        // Enforce the hysteresis invariant frame_off <= trig_thresh at the point
+        // of use: the two knobs are independent sliders, and a release threshold
+        // set *above* the trigger would let a note turn on then immediately
+        // accumulate absent-frames and release — a ~5×/s strobe on any note
+        // whose posterior sits between them.
+        let frame_off = frame_off.min(trig_thresh);
         for k in 0..KEY_COUNT {
             let m = (MIDI_LOW as usize) + k;
             let note_p = note.get(k).copied().unwrap_or(0.0);

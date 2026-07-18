@@ -50,6 +50,12 @@ const LOOP_PAD_S: f64 = 5.0;
 /// Nudge past a satisfied onset-gate so float equality can't re-trigger it.
 const GATE_EPS: f64 = 1e-6;
 
+/// Minimum length given to a played note recorded during a take, so a
+/// same-frame press+release (staccato, or a GUI stall pumping On+Off in one
+/// frame) isn't stored as a zero-length note — invisible/silent in review,
+/// where `active_at`'s half-open `start <= t < end` is never true (F31).
+const MIN_PLAYED_NOTE_S: f64 = 0.02;
+
 /// Within this long after a segment's start, the "previous segment" button
 /// goes back one segment instead of restarting the current one (the standard
 /// media-player double-tap convention).
@@ -281,15 +287,37 @@ struct EvaluationState {
     window_s: f64,
     force_tol: f32,
     pedal_tol: f32,
+    /// The Learn key range frozen at take start: out-of-range notes aren't
+    /// required *and* out-of-range presses aren't penalized as extras (H7).
+    /// Frozen here so a mid-take range edit can't desync live scoring from the
+    /// already-built `required` list (M13 restarts the take on any edit).
+    key_range: Option<(u8, u8)>,
 }
 
 impl EvaluationState {
+    /// Whether `midi` is inside the frozen key range (or always, if unset).
+    fn in_key_range(&self, midi: u8) -> bool {
+        self.key_range.map_or(true, |(lo, hi)| (lo..=hi).contains(&midi))
+    }
+
     /// Playhead position at which the earliest pending note's tolerance window
     /// closes — mirrors the expiry-sweep condition in [`Self::record_frame`].
     /// `pending` is in score order and `window_s` is constant for the take, so
     /// checking only the front suffices.
     fn next_expiry_s(&self) -> Option<f64> {
         self.pending.front().map(|&i| self.required[i].start_s + self.window_s)
+    }
+
+    /// Where the take should end: the later of the piece's duration and the
+    /// final required note's tolerance-window close. Running just past
+    /// `duration_s` when the last note sits near the end gives that note its
+    /// full window instead of truncating a slightly-late-but-in-tolerance
+    /// press into a miss (L16). `required` is start-sorted, so the last entry
+    /// has the greatest start.
+    fn take_end_s(&self, duration_s: f64) -> f64 {
+        self.required
+            .last()
+            .map_or(duration_s, |r| (r.start_s + self.window_s).max(duration_s))
     }
 
     /// Per-frame pause bookkeeping for the pause-on-miss gate: total frozen
@@ -334,6 +362,13 @@ impl EvaluationState {
         }
 
         for &(midi, velocity) in onsets {
+            // Outside the 88-key piano range a press can never be a required
+            // note and renders on no lane — ignore it entirely (mirroring the
+            // score loaders), so an octave-shifted controller or a >88-key
+            // instrument isn't charged an extra press for perfect play (F13).
+            if midi_to_key_index(midi).is_none() {
+                continue;
+            }
             // The played track records every press, matched or not.
             if self.open_played[midi as usize].is_none() {
                 self.open_played[midi as usize] = Some(self.played_notes.len());
@@ -343,6 +378,13 @@ impl EvaluationState {
                     midi,
                     velocity,
                 });
+            }
+            // Out-of-key-range presses take no part in scoring: those notes were
+            // filtered out of `required` (not expected), so charging them as
+            // extra presses would penalize perfect play of a range-scoped part
+            // (H7). They still render on the played track above.
+            if !self.in_key_range(midi) {
+                continue;
             }
             // Match in FIFO score order — oldest pending first, a simple,
             // accepted approximation over full bipartite matching.
@@ -359,6 +401,23 @@ impl EvaluationState {
             }
         }
 
+        // A note pressed *and* released within one frame (staccato, or a stalled
+        // frame) never enters `held`, so the prev/held release diff above never
+        // closes its played note. Close any freshly-opened played note that
+        // isn't currently held, so it doesn't stretch to end-of-piece in review
+        // and its pitch can be pressed (and recorded) again (M15).
+        for m in 0..128u8 {
+            if let Some(i) = self.open_played[m as usize] {
+                if !held.contains(&m) {
+                    // Give a same-frame press+release a minimum length so it
+                    // isn't a zero-length note (silent/invisible in review) (F31).
+                    let n = &mut self.played_notes[i];
+                    n.end_s = playhead_s.max(n.start_s + MIN_PLAYED_NOTE_S);
+                    self.open_played[m as usize] = None;
+                }
+            }
+        }
+
         self.prev_held = held.clone();
     }
 
@@ -372,15 +431,21 @@ impl EvaluationState {
             (1.0 - diff / self.force_tol.max(1e-3)).clamp(0.0, 1.0)
         });
         // Pedal is judged only here — at the instant of a required note's
-        // press — never independently during silence.
+        // press — never independently during silence. Both sides are binarized
+        // (the score's target is already down/up, from `pedal_down_at`): what
+        // matters is whether the pedal was *down* (CC64 >= 64) as the score
+        // wants, not hitting an exact analog level — so genuine half-pedaling
+        // that is "down" scores full credit rather than near-failing (M12).
         let pedal_score = match (self.score_pedal, r.required_pedal_down) {
             (true, Some(down)) => {
-                let target = if down { 127.0 } else { 0.0 };
-                let diff = (pedal_level as f32 - target).abs() / 127.0;
-                Some((1.0 - diff / self.pedal_tol.max(1e-3)).clamp(0.0, 1.0))
+                let played_down = pedal_level >= 64;
+                Some(if played_down == down { 1.0 } else { 0.0 })
             }
             _ => None,
         };
+        // `pedal_tol` no longer scales pedal scoring (it's binary now); the
+        // Custom preset still carries it for forward-compat.
+        let _ = self.pedal_tol;
         self.judged.push(NoteJudgement {
             note_index: r.note_index,
             midi: r.midi,
@@ -411,7 +476,11 @@ impl EvaluationState {
     fn finalize(&mut self, duration_s: f64) {
         for m in 0..128 {
             if let Some(i) = self.open_played[m].take() {
-                self.played_notes[i].end_s = duration_s;
+                // A note opened during the end-extension window (start_s past
+                // duration_s) must not close before it opened (end_s < start_s):
+                // that renders as an inverted sliver and never sounds in review
+                // (F29). Close at the later of the two.
+                self.played_notes[i].end_s = duration_s.max(self.played_notes[i].start_s);
             }
         }
         while let Some(i) = self.pending.pop_front() {
@@ -702,6 +771,27 @@ impl PlaybackEngine {
             .collect()
     }
 
+    /// The union of practiced-track notes active anywhere in `[a, b]` (scoped
+    /// to the Learn key range). Unlike [`required_set`](Self::required_set),
+    /// which samples a single instant, this catches notes shorter than one
+    /// frame's advance so hold-mode gating can't skip them (F32).
+    fn required_over(&self, a: f64, b: f64) -> BTreeSet<u8> {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let score = self.display_score();
+        [Who::Local, Who::Remote]
+            .into_iter()
+            .filter(|&w| self.practiced(w))
+            .flat_map(|w| {
+                score.tracks[w.idx()]
+                    .notes
+                    .iter()
+                    .filter(move |n| n.start_s <= hi && n.end_s > lo)
+                    .map(|n| n.midi)
+            })
+            .filter(|&m| self.in_key_range(m))
+            .collect()
+    }
+
     /// Smallest practiced-track note start time >= t, if any. Simultaneous
     /// chord notes (and cross-track ties) collapse to one checkpoint via min.
     fn gate_at_or_after(&self, t: f64) -> Option<f64> {
@@ -809,10 +899,14 @@ impl PlaybackEngine {
         self.finished = self.playhead_s >= self.score.duration_s;
     }
 
-    /// Continuous-hold gate: freeze in place unless everything required
-    /// right now is held.
+    /// Continuous-hold gate: freeze in place unless everything required across
+    /// the whole tentative advance is held. Gating on the interval, not just the
+    /// current instant, is what keeps a note shorter than one frame's step from
+    /// starting and ending between two samples and never being required (F32) —
+    /// the same class the wait-mode fix (M14) addresses.
     fn hold_mode_advance(&mut self, dt_s: f64, held: &BTreeSet<u8>) {
-        let required = self.required_set(self.playhead_s);
+        let new = (self.playhead_s + dt_s * self.speed as f64).min(self.score.duration_s);
+        let required = self.required_over(self.playhead_s, new);
         if self.gate_ok(&required, held) {
             self.advance(dt_s);
         }
@@ -828,7 +922,14 @@ impl PlaybackEngine {
             Some(g) => {
                 let required = self.required_set(g);
                 self.playhead_s = if self.gate_ok(&required, held) {
-                    want.max(g + GATE_EPS).min(self.score.duration_s)
+                    // Advance past the satisfied gate, but not past the *next*
+                    // onset: a frame can carry the playhead up to one advance
+                    // (0.1–0.2 s) beyond `g`, which would jump over — and never
+                    // require — any onset closer than that (M14).
+                    let next = self
+                        .gate_at_or_after(g + GATE_EPS)
+                        .unwrap_or(self.score.duration_s);
+                    want.max(g + GATE_EPS).min(next).min(self.score.duration_s)
                 } else {
                     g
                 };
@@ -864,7 +965,20 @@ impl PlaybackEngine {
         // turning true below IS the finished edge. By construction that edge
         // and `held_back` are mutually exclusive — a take never finalizes
         // mid-pause.
-        let want = (self.playhead_s + dt_s * self.speed as f64).min(self.score.duration_s);
+        // End the take at the later of the piece duration and the final note's
+        // window close, so a last note near the end still gets its full
+        // tolerance window instead of being truncated into a miss (L16).
+        // Extend a hair past the final gate: when the last note's window
+        // straddles the end, its gate (`start_s + window_s`) equals
+        // `take_end_s`, so `held_back = gate < want` (with `want` capped at the
+        // end) could never fire and pause-on-miss free-ran past the final note
+        // instead of freezing on it like every other note (F14).
+        let end = self
+            .eval_state
+            .as_ref()
+            .map_or(self.score.duration_s, |s| s.take_end_s(self.score.duration_s))
+            + GATE_EPS;
+        let want = (self.playhead_s + dt_s * self.speed as f64).min(end);
         let gate = self
             .eval_state
             .as_ref()
@@ -872,7 +986,7 @@ impl PlaybackEngine {
             .and_then(EvaluationState::next_expiry_s);
         let held_back = gate.is_some_and(|g| g < want);
         self.playhead_s = if held_back { gate.unwrap() } else { want };
-        self.finished = self.playhead_s >= self.score.duration_s;
+        self.finished = self.playhead_s >= end;
         let playhead_s = self.playhead_s;
         if let Some(state) = &mut self.eval_state {
             state.record_pause(held_back, dt_s);
@@ -968,6 +1082,7 @@ impl PlaybackEngine {
             window_s,
             force_tol,
             pedal_tol,
+            key_range: self.learn.key_range,
         }
     }
 
@@ -977,12 +1092,27 @@ impl PlaybackEngine {
     fn finalize_evaluation(&mut self) {
         let Some(mut state) = self.eval_state.take() else { return };
         state.finalize(self.score.duration_s);
+
+        // A take with no track selected to evaluate produced nothing meaningful:
+        // building a review would blank the real (auto-played) track from the
+        // falling panel, deselect all three mode radios, and park paused at 0
+        // with no results window to explain any of it. Fall back to normal
+        // Listen playback of the real score instead of entering review (F16).
+        let Some(who) = self.eval.evaluate else {
+            self.eval_result = None;
+            self.review_score = None;
+            self.mode = Mode::Listen;
+            self.playhead_s = 0.0;
+            self.finished = false;
+            self.playing = false;
+            self.review_just_started = false;
+            return;
+        };
         self.eval_result = Some(state.result());
 
         // Slot 0 = the original evaluated part, slot 1 = what was played.
         // Both review slots are spoken for, so the *other* (auto-played)
         // track, if any, is deliberately dropped from the review view.
-        let who = self.eval.evaluate.unwrap_or(Who::Local);
         let original = &self.score.tracks[who.idx()];
         self.review_score = Some(Score {
             tracks: [
@@ -1009,6 +1139,8 @@ impl PlaybackEngine {
         self.playhead_s = 0.0;
         self.finished = false;
         self.playing = false;
+        // A track was evaluated (the `None` case returned early above), so the
+        // results window always pops here.
         self.review_just_started = true;
     }
 
@@ -1531,6 +1663,69 @@ mod tests {
         assert_eq!(r.missed_count, 0);
         let p = r.pause_stats.as_ref().expect("setting on -> stats present");
         assert_eq!((p.count, p.total_s), (0, 0.0), "pause history leaked through restart");
+    }
+
+    #[test]
+    fn out_of_range_press_is_not_penalized_as_extra() {
+        // H7: with a key range set, out-of-range notes aren't required — and a
+        // press of one must not cost an extra-press penalty.
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.learn.key_range = Some((63, 80)); // excludes 60 & 62, includes 64
+        pb.start_evaluation(true, &synth);
+        // 60 is out of range (at 1.0); 64 is the in-range chord note (at 3.0).
+        run_take(&mut pb, &synth, &[(1.0, &[(60, 80)], 0), (3.0, &[(64, 80)], 0)]);
+        let r = pb.eval_result.as_ref().unwrap();
+        assert_eq!(r.extra_press_count, 0, "out-of-range press must not be an extra");
+        assert_eq!(r.matched_count, 1, "the one in-range required note matched");
+    }
+
+    #[test]
+    fn tap_within_one_frame_is_a_closed_played_note_not_a_hold() {
+        // M15: a note pressed and released inside one frame (held stays empty)
+        // must record as a bounded played note, and a later tap of the same
+        // pitch must record as a second note — not be swallowed.
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.eval.evaluate = Some(Who::Local);
+        pb.start_evaluation(true, &synth);
+        run_take(&mut pb, &synth, &[(1.0, &[(60, 80)], 0), (2.0, &[(60, 80)], 0)]);
+        let played: Vec<&Note> =
+            pb.display_score().tracks[1].notes.iter().filter(|n| n.midi == 60).collect();
+        assert_eq!(played.len(), 2, "two taps must be two played notes");
+        assert!(
+            played.iter().all(|n| n.end_s < pb.score.duration_s - 1e-6),
+            "a tap must not stretch to end-of-piece"
+        );
+    }
+
+    #[test]
+    fn wait_mode_does_not_skip_a_close_second_onset() {
+        // M14: two onsets closer than one frame's advance — the gate must stop
+        // at the second, not jump over it.
+        let n = |start_s: f64, midi: u8| Note { start_s, end_s: start_s + 0.5, midi, velocity: 80 };
+        let score = Score {
+            tracks: [
+                Track { notes: vec![n(1.0, 60), n(1.05, 62)], color: [0; 3], pedal_events: vec![] },
+                Track { notes: vec![], color: [0; 3], pedal_events: vec![] },
+            ],
+            duration_s: 3.0,
+            markers: vec![],
+            first_marker_name: None,
+            segments: vec![ScoreSegment { name: "a".into(), start_s: 0.0, end_s: 3.0 }],
+            warning: None,
+        };
+        let (mut pb, synth) = (PlaybackEngine::new(score, PathBuf::from("t.mid")), Synth::disconnected());
+        pb.mode = Mode::Learn;
+        pb.learn.practice = [true, false];
+        pb.learn.require_hold = false;
+        // Free-run to the first onset.
+        for _ in 0..20 {
+            pb.tick(0.1, &held(&[]), &[], 0, &synth);
+        }
+        assert!((pb.playhead_s - 1.0).abs() < 1e-9);
+        // Satisfy it with a big frame: must land at the 1.05 gate, not past it.
+        pb.tick(0.1, &held(&[60]), &[], 0, &synth);
+        assert!(pb.playhead_s <= 1.05 + 1e-9, "skipped the close onset: {}", pb.playhead_s);
     }
 
     #[test]
