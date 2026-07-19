@@ -235,12 +235,19 @@ async fn run_host(
         let conn = tokio::select! {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { return }; // endpoint closed
-                match incoming.await {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        status(format!("Peer failed to connect: {e}"));
-                        continue;
-                    }
+                // Race the QUIC handshake itself against UI shutdown too: a slow,
+                // stalled, or malicious handshake would otherwise pin the net
+                // thread here — never noticing the UI dropped the `Peer` nor
+                // draining `outgoing` — until it times out seconds later (R26).
+                tokio::select! {
+                    res = incoming => match res {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            status(format!("Peer failed to connect: {e}"));
+                            continue;
+                        }
+                    },
+                    _ = discard_until_closed(outgoing) => return,
                 }
             }
             // Drain (and drop) locally-played packets while nobody is
@@ -319,6 +326,12 @@ async fn relay_session(
         conn.remote_id().fmt_short()
     )));
 
+    // Last datagram-send error surfaced to the UI, so a *persistent* failure is
+    // reported once (not every frame) and only when the failure kind changes
+    // (R9). Without this the UI keeps showing "Connected" while a packet class —
+    // or all traffic — silently stops flowing.
+    let mut last_send_err: Option<String> = None;
+
     loop {
         tokio::select! {
             datagram = conn.read_datagram() => match datagram {
@@ -361,8 +374,30 @@ async fn relay_session(
                 // silently stop that packet type from ever arriving, so surface
                 // it rather than discarding it blindly (F21).
                 Some(p) => {
-                    if let Err(e) = conn.send_datagram(Bytes::from(p.encode())) {
-                        eprintln!("[net] datagram send failed: {e}");
+                    match conn.send_datagram(Bytes::from(p.encode())) {
+                        Ok(()) => {
+                            // Recovered: let the UI clear the warning.
+                            if last_send_err.take().is_some() {
+                                let _ = events.send(NetEvent::Status(format!(
+                                    "Connected to peer {}",
+                                    conn.remote_id().fmt_short()
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[net] datagram send failed: {e}");
+                            // Surface it to the UI (release builds have no
+                            // stderr), rate-limited to error-kind changes so a
+                            // sustained failure doesn't spam the status channel
+                            // (R9).
+                            let kind = e.to_string();
+                            if last_send_err.as_deref() != Some(kind.as_str()) {
+                                let _ = events.send(NetEvent::Status(format!(
+                                    "Connected, but some data isn't syncing: {kind}"
+                                )));
+                                last_send_err = Some(kind);
+                            }
+                        }
                     }
                 }
                 None => {

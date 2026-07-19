@@ -333,11 +333,15 @@ impl EvaluationState {
         self.was_paused = held_back;
     }
 
-    /// Feed one frame of live input. `playhead_s` is the post-advance
-    /// playhead; `onsets` are this frame's note-ons as `(midi, velocity)`.
+    /// Feed one frame of live input. `playhead_s` is the post-advance playhead
+    /// (used for scoring, expiry, and played-note ends); `pre_advance_s` is the
+    /// playhead at the *start* of this frame, so an onset can still match a note
+    /// whose tolerance window closed somewhere inside the frame (R36). `onsets`
+    /// are the note-ons as `(midi, velocity)`.
     fn record_frame(
         &mut self,
         playhead_s: f64,
+        pre_advance_s: f64,
         held: &BTreeSet<u8>,
         onsets: &[(u8, u8)],
         pedal_level: u8,
@@ -349,18 +353,11 @@ impl EvaluationState {
             }
         }
 
-        // Required notes whose window has fully passed become misses as the
-        // playhead sweeps by (`pending` is in score order, so only the front
-        // can have expired).
-        while let Some(&i) = self.pending.front() {
-            if self.required[i].start_s + self.window_s < playhead_s {
-                self.pending.pop_front();
-                self.judge_missed(i);
-            } else {
-                break;
-            }
-        }
-
+        // Match this frame's onsets *before* the expiry sweep (R36): a note whose
+        // window closes inside this frame's advance (possible after a GUI stall,
+        // where dt jumps up to 0.1 s) must be matchable by a press this frame,
+        // instead of being swept into a Miss *and* then having the press booked
+        // as an ExtraPress — one press double-charged.
         for &(midi, velocity) in onsets {
             // Outside the 88-key piano range a press can never be a required
             // note and renders on no lane — ignore it entirely (mirroring the
@@ -387,10 +384,16 @@ impl EvaluationState {
                 continue;
             }
             // Match in FIFO score order — oldest pending first, a simple,
-            // accepted approximation over full bipartite matching.
+            // accepted approximation over full bipartite matching. A note counts
+            // as reachable this frame if the playhead is within its window *or*
+            // its window overlapped this frame's advance (R36).
             let hit = self.pending.iter().position(|&i| {
                 let r = &self.required[i];
-                r.midi == midi && (playhead_s - r.start_s).abs() <= self.window_s
+                if r.midi != midi {
+                    return false;
+                }
+                (playhead_s - r.start_s).abs() <= self.window_s
+                    || (r.start_s <= playhead_s && r.start_s + self.window_s >= pre_advance_s)
             });
             match hit {
                 Some(pos) => {
@@ -398,6 +401,18 @@ impl EvaluationState {
                     self.judge_match(i, playhead_s, velocity, pedal_level);
                 }
                 None => self.extra_presses.push(ExtraPress { at_s: playhead_s, midi }),
+            }
+        }
+
+        // Required notes whose window has fully passed (and weren't just matched
+        // above) become misses as the playhead sweeps by (`pending` is in score
+        // order, so only the front can have expired).
+        while let Some(&i) = self.pending.front() {
+            if self.required[i].start_s + self.window_s < playhead_s {
+                self.pending.pop_front();
+                self.judge_missed(i);
+            } else {
+                break;
             }
         }
 
@@ -895,8 +910,15 @@ impl PlaybackEngine {
     }
 
     fn advance(&mut self, dt_s: f64) {
-        self.playhead_s = (self.playhead_s + dt_s * self.speed as f64).min(self.score.duration_s);
-        self.finished = self.playhead_s >= self.score.duration_s;
+        // Advance over the *displayed* score's duration, which in
+        // EvaluationReview is the review score — extended to cover any correct
+        // press made inside the end-extension window (R38). Clamping to the
+        // original `self.score.duration_s` there left such a played note above
+        // the end line, never crossed and never sounded. In Listen the displayed
+        // score *is* `self.score`, so this is unchanged.
+        let dur = self.display_score().duration_s;
+        self.playhead_s = (self.playhead_s + dt_s * self.speed as f64).min(dur);
+        self.finished = self.playhead_s >= dur;
     }
 
     /// Continuous-hold gate: freeze in place unless everything required across
@@ -978,6 +1000,7 @@ impl PlaybackEngine {
             .as_ref()
             .map_or(self.score.duration_s, |s| s.take_end_s(self.score.duration_s))
             + GATE_EPS;
+        let pre_advance = self.playhead_s;
         let want = (self.playhead_s + dt_s * self.speed as f64).min(end);
         let gate = self
             .eval_state
@@ -990,7 +1013,7 @@ impl PlaybackEngine {
         let playhead_s = self.playhead_s;
         if let Some(state) = &mut self.eval_state {
             state.record_pause(held_back, dt_s);
-            state.record_frame(playhead_s, held, onsets, pedal_level);
+            state.record_frame(playhead_s, pre_advance, held, onsets, pedal_level);
         }
         if self.finished {
             self.finalize_evaluation();
@@ -1114,6 +1137,15 @@ impl PlaybackEngine {
         // Both review slots are spoken for, so the *other* (auto-played)
         // track, if any, is deliberately dropped from the review view.
         let original = &self.score.tracks[who.idx()];
+        // Extend the review duration to cover any played note whose press landed
+        // in the end-extension window (a late-but-in-tolerance final note), so it
+        // is reachable and audible in review instead of stranded above the end
+        // line (R38).
+        let review_duration = state
+            .played_notes
+            .iter()
+            .map(|n| n.end_s)
+            .fold(self.score.duration_s, f64::max);
         self.review_score = Some(Score {
             tracks: [
                 Track {
@@ -1127,7 +1159,7 @@ impl PlaybackEngine {
                     pedal_events: Vec::new(),
                 },
             ],
-            duration_s: self.score.duration_s,
+            duration_s: review_duration,
             markers: self.score.markers.clone(),
             first_marker_name: self.score.first_marker_name.clone(),
             segments: self.score.segments.clone(),

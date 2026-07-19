@@ -63,6 +63,23 @@ pub fn prepare_ort_dylib() {
     }
 }
 
+/// Refresh the mtime of the extracted ONNX Runtime (pointed at by
+/// `ORT_DYLIB_PATH`) so a concurrently-launched newer instance's reaper treats
+/// it as live. `prepare_ort_dylib` only stamps the mtime at startup, so a
+/// long-running (>[`RUNTIME_REAP_AGE`]) MIDI-only instance — which loads ORT
+/// lazily, maybe never — would otherwise see its still-needed DLL reaped and
+/// then fail a later mic fallback (R35). Call periodically from a long-lived
+/// thread (the input supervisor). Best-effort and cheap; a mapped file can't be
+/// opened for write on Windows, but a mapped file can't be reaped either.
+pub fn touch_runtime() {
+    let Some(path) = std::env::var_os("ORT_DYLIB_PATH") else {
+        return;
+    };
+    if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
 /// Write the embedded DLL to `<cache>/open-piano/onnxruntime-<hash>.dll` if
 /// it isn't there yet, and return its path.
 fn extract_dll() -> std::io::Result<PathBuf> {
@@ -74,13 +91,18 @@ fn extract_dll() -> std::io::Result<PathBuf> {
     let dir = base.join("open-piano");
     fs::create_dir_all(&dir)?;
 
-    let name = format!("onnxruntime-{:016x}.dll", fnv1a(ONNXRUNTIME_DLL));
+    let expected_hash = fnv1a(ONNXRUNTIME_DLL);
+    let name = format!("onnxruntime-{expected_hash:016x}.dll");
     let path = dir.join(&name);
-    // Reuse the cached copy only if it's the *full* expected size. A power loss
-    // can leave the rename (metadata) committed while the data blocks never
-    // reached disk — a truncated DLL the name-only fast path would otherwise
-    // trust forever, failing the mic path on every subsequent launch.
-    if fs::metadata(&path).is_ok_and(|m| m.len() == ONNXRUNTIME_DLL.len() as u64) {
+    // Reuse the cached copy only if its *contents* match, not just its size. A
+    // power loss can leave the rename (metadata) committed while the data blocks
+    // never reached disk, and any same-size corruption (a flipped byte) would
+    // otherwise be trusted forever by a size-only check — failing the ORT load
+    // on every launch with no self-healing (R34). Hashing ~10–20 MB is a few ms,
+    // paid once at startup; on mismatch we fall through and re-extract.
+    let cached_ok = fs::metadata(&path).is_ok_and(|m| m.len() == ONNXRUNTIME_DLL.len() as u64)
+        && fs::read(&path).is_ok_and(|b| fnv1a(&b) == expected_hash);
+    if cached_ok {
         // Refresh the mtime so the 24 h reaper (below, and in any concurrent
         // instance) treats this still-needed runtime as live. ORT loads lazily —
         // possibly never this session (a MIDI-only run) — so without this a

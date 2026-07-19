@@ -283,6 +283,20 @@ impl Roll {
                         self.separators.insert(pos, Instance { at: self.roll_now_s, name: None });
                         self.roll_now_s += self.section_lead_in.as_secs_f64();
                     }
+                    // Open a span at this resume time for any pedal a player was
+                    // holding across the pause, whose opening we deferred (R39).
+                    for w in [Who::Local, Who::Remote] {
+                        if self.pedal_level[w.idx()] > 0 && self.open_pedal[w.idx()].is_none() {
+                            self.open_pedal[w.idx()] = Some(self.pedal_segments.len());
+                            self.pedal_segments.push(PedalSegment {
+                                who: w,
+                                start_s: self.roll_now_s,
+                                end_s: None,
+                                level: self.pedal_level[w.idx()],
+                            });
+                            self.dirty = true;
+                        }
+                    }
                 }
                 self.open[who.idx()][key] = Some(self.segments.len());
                 self.open_count += 1;
@@ -339,6 +353,23 @@ impl Roll {
             return;
         }
         self.pedal_level[who.idx()] = level;
+        // While the roll clock is frozen (paused after an idle snap-back, or
+        // before the first note), every level change would open/close a span at
+        // the same frozen `roll_now_s`, piling up as stacked zero-length spans —
+        // a CC64 blip storm in the saved file (R39). Deliberately, pedal traffic
+        // never unpauses the clock (unlike `note`). So while paused: just track
+        // the level, close an open span on release, and defer *opening* a new
+        // span to the resume path (`note`), which opens it at the real resume
+        // time for any pedal still held.
+        if self.paused {
+            if level == 0 {
+                if let Some(i) = self.open_pedal[who.idx()].take() {
+                    self.pedal_segments[i].end_s = Some(self.roll_now_s);
+                    self.dirty = true;
+                }
+            }
+            return;
+        }
         if let Some(i) = self.open_pedal[who.idx()].take() {
             self.pedal_segments[i].end_s = Some(self.roll_now_s);
         }
@@ -446,6 +477,27 @@ impl Roll {
     /// (F1).
     pub fn has_separator_at(&self, at: f64) -> bool {
         self.separators.iter().any(|s| (s.at - at).abs() < 1e-9)
+    }
+
+    /// Remove an *unnamed* separator at `at` (same dedupe tolerance), if present.
+    /// Used to honor a peer's tombstone when its snap-back trimmed a shared
+    /// manual break, so the break disappears on both surfaces rather than
+    /// lingering as a permanent one-sided line (R13). Only `name.is_none()`
+    /// breaks are eligible; named sections stay put, and the 1e-9 tolerance makes
+    /// an accidental collision with a derived auto-pause boundary negligible.
+    /// Returns whether anything was removed.
+    pub fn remove_separator(&mut self, at: f64) -> bool {
+        if let Some(pos) = self
+            .separators
+            .iter()
+            .position(|s| s.name.is_none() && (s.at - at).abs() < 1e-9)
+        {
+            self.separators.remove(pos);
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
     }
 }
 

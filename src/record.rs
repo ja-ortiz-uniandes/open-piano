@@ -75,6 +75,14 @@ const MAX_WAV_SAMPLES: u64 = 1_000_000_000;
 /// error instead of growing memory forever (F26).
 const MAX_QUEUED_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 
+/// Minimum shared-clock gap (seconds) that a resumed/post-drop buffer must
+/// exceed before the writer fills it with silence (R5/R2). Routine callback
+/// scheduling jitter is at most a few buffers (tens of ms) and — crucially —
+/// smooth clock drift (R6) is a continuous slope with no discontinuity, so a
+/// threshold well above jitter fills only genuine drops/resumes and never
+/// masks the drift signal `effective_sample_rate` is meant to expose.
+const GAP_FILL_THRESHOLD_S: f64 = 0.25;
+
 /// Messages from the hot paths (audio callback, MIDI callback, supervisor) to the
 /// writer thread. Carrying the capture `Instant` lets the writer compute each
 /// event's time against the session `t0` off the hot path.
@@ -105,6 +113,12 @@ pub struct Recorder {
     /// User intent: the Record toggle in the UI. The supervisor reconciles this
     /// into actual session start/stop.
     armed: Arc<AtomicBool>,
+    /// Count of *real* arm/disarm edges (a `set_armed` that changed the level).
+    /// The supervisor polls a level ~once/second, so a quick Stop→Record (or
+    /// Record→Stop) completed within one poll is invisible to a level check and
+    /// merges two takes into one session dir (R10). A monotonic edge counter lets
+    /// the reconciler notice an in-between full cycle and cut the session.
+    arm_edges: Arc<AtomicU64>,
     /// True between `begin()` and `end()` — i.e. a session is actively writing.
     recording: Arc<AtomicBool>,
     tx: Sender<RecEvent>,
@@ -168,6 +182,7 @@ impl Recorder {
 
         Recorder {
             armed: Arc::new(AtomicBool::new(false)),
+            arm_edges: Arc::new(AtomicU64::new(0)),
             recording: Arc::new(AtomicBool::new(false)),
             tx,
             midi_events,
@@ -199,7 +214,16 @@ impl Recorder {
     }
 
     pub fn set_armed(&self, armed: bool) {
-        self.armed.store(armed, Ordering::Relaxed);
+        // Count only genuine toggles so the supervisor can detect a full off→on
+        // (or on→off) cycle that landed between two polls (R10).
+        if self.armed.swap(armed, Ordering::Relaxed) != armed {
+            self.arm_edges.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Monotonic count of arm/disarm edges — see [`arm_edges`](Self::arm_edges).
+    pub fn arm_edges(&self) -> u64 {
+        self.arm_edges.load(Ordering::Relaxed)
     }
 
     pub fn is_recording(&self) -> bool {
@@ -264,11 +288,23 @@ impl Recorder {
         self.midi_events.store(0, Ordering::Relaxed);
         self.audio_samples.store(0, Ordering::Relaxed);
         self.sample_rate.store(0, Ordering::Relaxed);
-        self.queued_bytes.store(0, Ordering::Relaxed);
+        // Do NOT reset `queued_bytes` here: `Audio` events from the just-ended
+        // session may still be in flight toward the writer, and each carries a
+        // reservation the writer will `fetch_sub` when it drains them. Zeroing
+        // now would make those subs underflow the counter to ~usize::MAX — after
+        // which every new-session buffer is dropped and a debug build panics in
+        // the realtime callback (R4). The add/sub pairing is already balanced, so
+        // the counter self-returns to ~0 across the session boundary.
         self.overflowed.store(false, Ordering::Relaxed);
 
-        self.recording.store(true, Ordering::Relaxed);
+        // Queue `Begin` *before* publishing `recording = true`, mirroring the
+        // ordering `end()` uses. A MIDI/audio callback on another thread that
+        // observes `recording == true` then enqueues its event strictly after
+        // `Begin` in the channel FIFO — so the writer always opens the session
+        // before the first event, instead of dropping a hot-path event that
+        // raced ahead of the session open (R30).
         let _ = self.tx.send(RecEvent::Begin { t0, dir, wall_unix });
+        self.recording.store(true, Ordering::Relaxed);
     }
 
     /// End the current session: stop accepting data and finalize the files.
@@ -347,6 +383,17 @@ struct Session {
     audio_start_s: Option<f64>,
     /// How many buffers have contributed to the `audio_start_s` estimate.
     anchor_buffers: u32,
+    /// Set when audio was dropped (backpressure, R5) or when capture resumed into
+    /// an already-open WAV after a mid-session failure (R2). The next written
+    /// buffer fills the elapsed gap with silence so the sample-index → time
+    /// contract stays true instead of splicing later audio earlier.
+    gap_pending: bool,
+    /// Silence samples inserted to fill drop/resume gaps (R5), surfaced in
+    /// `meta.json` so the offline pipeline can excise them.
+    gap_samples: u64,
+    /// Arrival time (seconds since `t0`) of the most recent audio buffer, used to
+    /// derive an `effective_sample_rate` that captures mic-clock drift (R6).
+    last_arrival_s: f64,
     midi_count: u64,
     sample_count: u64,
     /// Last time the session was flushed to disk (WAV header + MIDI log +
@@ -357,6 +404,17 @@ struct Session {
 /// Seconds from `t0` to `at` on the shared monotonic clock (never negative).
 fn secs_since(t0: Instant, at: Instant) -> f64 {
     at.saturating_duration_since(t0).as_secs_f64()
+}
+
+/// Record a session error into the shared cell the UI reads, and log it. Used by
+/// the free finalize/meta paths so a disk-full/permission failure there is
+/// surfaced instead of only hitting a stderr that doesn't exist in release
+/// builds (`windows_subsystem = "windows"`) (R8).
+fn report_error(error: &Arc<Mutex<String>>, msg: String) {
+    eprintln!("[record] {msg}");
+    if let Ok(mut e) = error.lock() {
+        *e = msg;
+    }
 }
 
 /// The writer thread. Owns all files; processes one [`RecEvent`] at a time.
@@ -384,9 +442,9 @@ fn writer_loop(
                 // A new Begin while one is open shouldn't happen (the supervisor
                 // ends first), but be defensive: finalize the old one.
                 if let Some(s) = session.take() {
-                    finalize(s);
+                    finalize(s, &error);
                 }
-                match open_session(t0, dir, wall_unix) {
+                match open_session(t0, dir, wall_unix, &error) {
                     Ok(s) => session = Some(s),
                     // Surface it: a failed dir/log create otherwise leaves the
                     // UI showing a live recording while nothing is written (L18).
@@ -396,6 +454,29 @@ fn writer_loop(
 
             RecEvent::AudioFormat { sample_rate: sr, channels, device } => {
                 if let Some(s) = session.as_mut() {
+                    if s.wav.is_some() {
+                        // A WAV is already open: this is a *resume* after a
+                        // mid-session capture failure (input.rs keeps the session
+                        // open and retries). `hound::WavWriter::create` truncates
+                        // unconditionally, so recreating here would destroy every
+                        // prior sample and finalize a corrupt header through the
+                        // stale handle (R2). Keep the open writer; the resumed
+                        // audio appends. If the retried device came up with a
+                        // different format we can't append to this WAV — surface
+                        // it rather than silently splicing mismatched audio.
+                        if sr != s.sample_rate || channels != s.channels {
+                            set_error(format!(
+                                "capture resumed with a different audio format \
+                                 ({sr} Hz/{channels}ch vs {} Hz/{}ch) — new audio not recorded",
+                                s.sample_rate, s.channels
+                            ));
+                        } else {
+                            // Fill the downtime with silence so the sample-index →
+                            // time contract holds across the gap (R2 + R5).
+                            s.gap_pending = true;
+                        }
+                        continue;
+                    }
                     s.sample_rate = sr;
                     s.channels = channels;
                     s.device = device;
@@ -421,16 +502,64 @@ fn writer_loop(
 
             RecEvent::Audio { samples, at } => {
                 // Release the queue reservation this buffer made, whether or not
-                // it ends up written (F26).
-                queued_bytes.fetch_sub(
-                    samples.len() * std::mem::size_of::<f32>(),
-                    Ordering::Relaxed,
-                );
-                if overflowed.swap(false, Ordering::Relaxed) {
+                // it ends up written (F26). Saturating, never wrapping: a stray
+                // unbalanced drain must clamp at 0, not underflow to ~usize::MAX
+                // and wedge all future backpressure checks (R4).
+                {
+                    let bytes = samples.len() * std::mem::size_of::<f32>();
+                    let _ = queued_bytes.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |q| Some(q.saturating_sub(bytes)),
+                    );
+                }
+                let just_overflowed = overflowed.swap(false, Ordering::Relaxed);
+                if just_overflowed {
                     set_error("disk too slow — dropping audio; recording may have gaps".into());
                 }
                 if let Some(s) = session.as_mut() {
                     let arrival = secs_since(s.t0, at);
+                    s.last_arrival_s = arrival;
+                    // A backpressure drop just happened: the samples that were
+                    // discarded on the push side left a hole. Fill it with silence
+                    // (below) so subsequent audio isn't spliced earlier than its
+                    // true capture time (R5).
+                    if just_overflowed {
+                        s.gap_pending = true;
+                    }
+                    // Fill a pending drop/resume gap with silence, sized from the
+                    // shared clock, before writing this buffer. Only a gap well
+                    // above routine callback jitter is filled (R2/R5).
+                    if s.gap_pending {
+                        s.gap_pending = false;
+                        if let (Some(start), true) = (s.audio_start_s, s.sample_rate > 0) {
+                            let sr = s.sample_rate as f64;
+                            // Expected index of this buffer's *first* sample on the
+                            // shared clock (the buffer's samples end ~now).
+                            let expected_start =
+                                ((arrival - start) * sr - samples.len() as f64).max(0.0);
+                            let gap = expected_start - s.sample_count as f64;
+                            if gap > GAP_FILL_THRESHOLD_S * sr {
+                                // Never let padding push past the WAV size cap.
+                                let room = MAX_WAV_SAMPLES.saturating_sub(s.sample_count);
+                                let pad = (gap as u64).min(room);
+                                if let Some(w) = s.wav.as_mut() {
+                                    let mut ok = true;
+                                    for _ in 0..pad {
+                                        if w.write_sample(0.0f32).is_err() {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if ok {
+                                        s.sample_count += pad;
+                                        s.gap_samples += pad;
+                                        audio_samples.store(s.sample_count, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Stop before hound's u32 data-byte counter wraps at 4 GiB
                     // (F17): finalize the WAV so its header stays valid; MIDI
                     // keeps recording.
@@ -440,7 +569,7 @@ fn writer_loop(
                         );
                         if let Some(w) = s.wav.take() {
                             if let Err(e) = w.finalize() {
-                                eprintln!("[record] WAV finalize error: {e}");
+                                report_error(&error, format!("WAV finalize failed: {e}"));
                             }
                         }
                     }
@@ -473,7 +602,7 @@ fn writer_loop(
                         s.anchor_buffers += 1;
                     }
                     // Crash-safety flush cadence (F5).
-                    maintain(s);
+                    maintain(s, &error);
                 }
             }
 
@@ -487,19 +616,19 @@ fn writer_loop(
                     }
                     // Flush the MIDI log + meta.json on the crash-safety cadence
                     // even when no audio is arriving (MIDI-only recording) (F5).
-                    maintain(s);
+                    maintain(s, &error);
                 }
             }
 
             RecEvent::End => {
                 if let Some(s) = session.take() {
-                    finalize(s);
+                    finalize(s, &error);
                 }
             }
 
             RecEvent::Shutdown => {
                 if let Some(s) = session.take() {
-                    finalize(s);
+                    finalize(s, &error);
                 }
                 break; // orderly app exit: let the writer thread be joined
             }
@@ -508,12 +637,17 @@ fn writer_loop(
 
     // Channel closed (all handles dropped): finalize anything still open.
     if let Some(s) = session.take() {
-        finalize(s);
+        finalize(s, &error);
     }
 }
 
 /// Create the session directory and open the MIDI log.
-fn open_session(t0: Instant, dir: PathBuf, wall_unix: u64) -> std::io::Result<Session> {
+fn open_session(
+    t0: Instant,
+    dir: PathBuf,
+    wall_unix: u64,
+    error: &Arc<Mutex<String>>,
+) -> std::io::Result<Session> {
     fs::create_dir_all(&dir)?;
     let midi_log = BufWriter::new(File::create(dir.join("midi.jsonl"))?);
     let session = Session {
@@ -527,6 +661,9 @@ fn open_session(t0: Instant, dir: PathBuf, wall_unix: u64) -> std::io::Result<Se
         device: String::new(),
         audio_start_s: None,
         anchor_buffers: 0,
+        gap_pending: false,
+        gap_samples: 0,
+        last_arrival_s: 0.0,
         midi_count: 0,
         sample_count: 0,
         last_maintenance: Instant::now(),
@@ -534,42 +671,57 @@ fn open_session(t0: Instant, dir: PathBuf, wall_unix: u64) -> std::io::Result<Se
     // Write meta.json up front (with zero counts) so a crash before the first
     // maintenance tick still leaves *some* alignment anchor on disk; it is
     // rewritten with live counts on the maintenance cadence and at finalize (F5).
-    write_meta(&session);
+    write_meta(&session, error);
     Ok(session)
 }
 
 /// Write (or rewrite) meta.json from the session's current counts. Called at
 /// session open, on the maintenance cadence, and at finalize so a killed
 /// process always leaves an alignment anchor (F5).
-fn write_meta(s: &Session) {
+fn write_meta(s: &Session, error: &Arc<Mutex<String>>) {
     let audio_start = s.audio_start_s.unwrap_or(0.0);
     let duration = if s.sample_rate > 0 {
         s.sample_count as f64 / s.sample_rate as f64
     } else {
         0.0
     };
+    // Effective sample rate measured against the shared monotonic clock over the
+    // whole captured span (R6). Consumer mic crystals drift 10–100 ppm from the
+    // nominal rate — a *slope* error the fixed offline-measured offset can't
+    // correct — so the offline aligner should prefer this over `sample_rate` when
+    // it differs meaningfully. Falls back to nominal until enough span accrues.
+    let effective_rate = {
+        let span = s.last_arrival_s - audio_start;
+        if s.sample_count > 0 && span > 1.0 {
+            s.sample_count as f64 / span
+        } else {
+            s.sample_rate as f64
+        }
+    };
     // Hand-written JSON keeps the dependency surface tiny; the fields are simple
     // scalars/strings so there's nothing to escape beyond the device name.
     let meta = format!(
-        "{{\n  \"sample_rate\": {sr},\n  \"channels\": {ch},\n  \"audio_start_s\": {astart},\n  \"audio_duration_s\": {dur},\n  \"midi_events\": {midi},\n  \"audio_samples\": {samp},\n  \"wall_clock_unix\": {wall},\n  \"device\": \"{dev}\",\n  \"clock\": \"audio.wav sample i is at time audio_start_s + i/sample_rate on the same clock as midi.jsonl 't'\"\n}}\n",
+        "{{\n  \"sample_rate\": {sr},\n  \"effective_sample_rate\": {eff},\n  \"channels\": {ch},\n  \"audio_start_s\": {astart},\n  \"audio_duration_s\": {dur},\n  \"gap_samples\": {gap},\n  \"midi_events\": {midi},\n  \"audio_samples\": {samp},\n  \"wall_clock_unix\": {wall},\n  \"device\": \"{dev}\",\n  \"clock\": \"audio.wav sample i is at time audio_start_s + i/sample_rate on the same clock as midi.jsonl 't'; prefer effective_sample_rate for drift; gap_samples of that total are inserted silence filling capture drops\"\n}}\n",
         sr = s.sample_rate,
+        eff = effective_rate,
         ch = s.channels,
         astart = audio_start,
         dur = duration,
+        gap = s.gap_samples,
         midi = s.midi_count,
         samp = s.sample_count,
         wall = s.wall_unix,
         dev = json_escape(&s.device),
     );
     if let Err(e) = fs::write(s.dir.join("meta.json"), meta) {
-        eprintln!("[record] meta.json write error: {e}");
+        report_error(error, format!("meta.json write failed: {e}"));
     }
 }
 
 /// Flush everything to disk (WAV header + MIDI log + meta.json) if the
 /// maintenance interval has elapsed, so a crash leaves an aligned, playable
 /// session (F5). Cheap and idempotent; called from the audio and MIDI handlers.
-fn maintain(s: &mut Session) {
+fn maintain(s: &mut Session, error: &Arc<Mutex<String>>) {
     if s.last_maintenance.elapsed() < MAINTENANCE_INTERVAL {
         return;
     }
@@ -577,21 +729,21 @@ fn maintain(s: &mut Session) {
         let _ = w.flush();
     }
     let _ = s.midi_log.flush();
-    write_meta(s);
+    write_meta(s, error);
     s.last_maintenance = Instant::now();
 }
 
 /// Flush + close everything and write the final `meta.json`.
-fn finalize(mut s: Session) {
+fn finalize(mut s: Session, error: &Arc<Mutex<String>>) {
     let _ = s.midi_log.flush();
     if let Some(w) = s.wav.take() {
         if let Err(e) = w.finalize() {
-            eprintln!("[record] WAV finalize error: {e}");
+            report_error(error, format!("WAV finalize failed: {e}"));
         }
     }
     // Rewrite meta.json with the final counts (it was written up front and on
     // the maintenance cadence for crash-safety) (F5).
-    write_meta(&s);
+    write_meta(&s, error);
     let duration = if s.sample_rate > 0 {
         s.sample_count as f64 / s.sample_rate as f64
     } else {

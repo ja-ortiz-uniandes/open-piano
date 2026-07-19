@@ -46,6 +46,15 @@ pub enum UpdateState {
     Checking,
     /// The running build is already the newest release.
     UpToDate,
+    /// A newer release exists but is **not** installed. We deliberately do not
+    /// download or swap the exe automatically: `self_update` verifies nothing
+    /// about the payload beyond TLS (no checksum, no signature), so a silent
+    /// launch-time self-install would let anyone able to publish a release ship
+    /// arbitrary code to every installed copy with no interaction (R7). The
+    /// swap now happens only on an explicit user click ([`Updater::install`]).
+    Available { version: String },
+    /// The user consented; the download + exe swap is in flight.
+    Installing { version: String },
     /// A newer build was downloaded and staged; relaunch to run it.
     Ready { version: String },
     /// The check or download failed (offline, rate-limited, read-only folder,
@@ -60,15 +69,46 @@ pub struct Updater {
 }
 
 impl Updater {
-    /// A snapshot of the current update state for rendering.
+    /// A snapshot of the current update state for rendering. Never panics on a
+    /// poisoned lock (an updater-thread panic must not take down the GUI) (R17).
     pub fn state(&self) -> UpdateState {
-        self.state.lock().unwrap().clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Begin downloading and installing `version` — called only from the UI when
+    /// the user explicitly consents (R7). Idempotent: a click while already
+    /// installing/ready is ignored. Runs off the GUI thread.
+    pub fn install(&self, version: String) {
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(&*s, UpdateState::Available { version: v } if *v == version) {
+                return; // stale click / already progressing
+            }
+            *s = UpdateState::Installing { version: version.clone() };
+        }
+        let state = Arc::clone(&self.state);
+        thread::Builder::new()
+            .name("auto-update-install".into())
+            .spawn(move || {
+                let next = match install_version(&version) {
+                    Ok(()) => UpdateState::Ready { version },
+                    Err(e) => UpdateState::Failed { reason: e.to_string() },
+                };
+                if let Ok(mut s) = state.lock() {
+                    *s = next;
+                }
+            })
+            .expect("failed to spawn auto-update install thread");
     }
 }
 
-/// Spawn the update check on a background thread and return immediately. The
-/// thread is detached (one-shot work): if the app exits mid-download the OS
-/// reaps it, leaving at worst a temp file that `self_update` cleans up next run.
+/// Spawn the (check-only) update probe on a background thread and return
+/// immediately. The thread is detached (one-shot work). It never downloads or
+/// swaps anything — a newer release surfaces as [`UpdateState::Available`] and
+/// waits for the user to click Install (R7).
 pub fn start() -> Updater {
     let state = Arc::new(Mutex::new(UpdateState::Checking));
     {
@@ -76,8 +116,8 @@ pub fn start() -> Updater {
         thread::Builder::new()
             .name("auto-update".into())
             .spawn(move || {
-                let next = match run_update() {
-                    Ok(Some(version)) => UpdateState::Ready { version },
+                let next = match check_update() {
+                    Ok(Some(version)) => UpdateState::Available { version },
                     Ok(None) => UpdateState::UpToDate,
                     Err(e) => UpdateState::Failed { reason: e.to_string() },
                 };
@@ -90,16 +130,17 @@ pub fn start() -> Updater {
     Updater { state }
 }
 
-/// Check GitHub, and if a newer release exists download it and swap the running
-/// exe. Returns `Ok(Some(version))` when a newer build was staged, `Ok(None)`
-/// when already current, and `Err` on any network/IO failure (offline,
-/// rate-limited, non-writable install folder, …).
+/// Check GitHub for a newer release **without downloading or installing
+/// anything**. Returns `Ok(Some(version))` when a strictly-newer release exists,
+/// `Ok(None)` when already current, and `Err` on any network failure (offline,
+/// rate-limited, …). The actual download + exe swap is deferred to
+/// [`install_version`], gated on explicit user consent (R7).
 ///
 /// We don't let `self_update`'s `.update()` pick the release: its built-in logic
 /// just takes the newest release by date among higher versions, which can't
 /// express the stable-vs-preview policy we want. Instead we list every release,
 /// choose one ourselves ([`pick_update`]), and pin that exact tag.
-fn run_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
+fn check_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let current = self_update::cargo_crate_version!();
 
     // List *all* published releases — the GitHub `/releases` endpoint, which
@@ -113,10 +154,20 @@ fn run_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
         .build()?
         .fetch()?;
 
-    let Some(target) = pick_update(current, &releases)? else {
-        return Ok(None);
-    };
+    pick_update(current, &releases)
+}
 
+/// Download the chosen release's portable zip and atomically swap the running
+/// exe. Only ever called after the user explicitly clicks Install (R7).
+///
+/// SECURITY NOTE: `self_update` still verifies nothing about the payload beyond
+/// the HTTPS connection. The user-consent gate removes the *silent, automatic*
+/// blast radius, but a full fix should embed a signing public key here and
+/// verify a signature asset published alongside the zip before the swap. That
+/// requires provisioning a keypair in the release workflow (a CI secret), so it
+/// is left as the follow-up — do not restore silent auto-install.
+fn install_version(target: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let current = self_update::cargo_crate_version!();
     // Pin the exact tag we chose (releases carry the version sans `v`; the tag is
     // `vX.Y.Z`). With a target version set, `self_update` downloads and swaps
     // that release unconditionally — it does *no* internal newer-than gate — so
@@ -145,7 +196,7 @@ fn run_update() -> Result<Option<String>, Box<dyn std::error::Error>> {
         .build()?
         .update()?;
 
-    Ok(Some(target))
+    Ok(())
 }
 
 /// Choose which release (if any) to update `current` to, under our pre-1.0

@@ -19,6 +19,24 @@ use crate::roll::seconds;
 /// historically wrote.
 const FILE_DEFAULT_VELOCITY: u8 = 64;
 
+/// Minimum length forced onto a loaded note. A press+release captured in one
+/// GUI frame (mic hysteresis flap, or any stall pumping On+Off together) is
+/// saved with `start_s == end_s`; playback's activity test is half-open
+/// (`start <= t < end`), so a zero-length note is never "active" — it never
+/// sounds or lights a key, yet Evaluation still *requires* it. Clamp it here so
+/// it behaves like any other short note (mirrors playback's `MIN_PLAYED_NOTE_S`
+/// for its own recorded notes) (R37).
+const MIN_SCORE_NOTE_S: f64 = 0.02;
+
+/// Clamp every note to at least [`MIN_SCORE_NOTE_S`] long (R37).
+fn ensure_min_note_len(notes: &mut [Note]) {
+    for n in notes {
+        if n.end_s < n.start_s + MIN_SCORE_NOTE_S {
+            n.end_s = n.start_s + MIN_SCORE_NOTE_S;
+        }
+    }
+}
+
 /// One note of a loaded score. Times are seconds from the start of the file.
 #[derive(Clone)]
 pub struct Note {
@@ -226,23 +244,33 @@ impl Score {
             return Err("MIDI file has an invalid ticks-per-quarter of 0".into());
         }
 
-        // Single constant tempo: the first Tempo event anywhere wins (500000
+        // Single constant tempo: the *earliest-in-time* Tempo event wins (500000
         // µs/quarter if none — the MIDI default). This app's own exports are
-        // always single-tempo; a foreign multi-tempo file plays at its
-        // initial tempo throughout, flagged via `warning`.
-        let mut tempo: Option<u32> = None;
+        // always single-tempo; a foreign multi-tempo file plays at its initial
+        // tempo throughout, flagged via `warning`. We scan by absolute tick, not
+        // track-scan order: in a format-1 file the real tick-0 conductor tempo
+        // can live in a *later* track while an earlier track carries only a
+        // mid-piece change — taking the first-seen would scale the whole piece by
+        // the wrong tempo (R14). Ties (same abs_tick) keep the first track's.
+        let mut tempo: Option<(u32, u32)> = None; // (abs_tick, us_per_quarter)
         let mut tempo_changes = 0u32;
         for track in &smf.tracks {
+            let mut abs_ticks = 0u32;
             for ev in track {
+                abs_ticks = abs_ticks.saturating_add(ev.delta.as_int());
                 if let midly::TrackEventKind::Meta(midly::MetaMessage::Tempo(us)) = ev.kind {
                     tempo_changes += 1;
-                    if tempo.is_none() {
-                        tempo = Some(us.as_int());
+                    let earlier = match tempo {
+                        None => true,
+                        Some((best_tick, _)) => abs_ticks < best_tick,
+                    };
+                    if earlier {
+                        tempo = Some((abs_ticks, us.as_int()));
                     }
                 }
             }
         }
-        let tempo = tempo.unwrap_or(500_000);
+        let tempo = tempo.map(|(_, us)| us).unwrap_or(500_000);
         let mut warnings: Vec<String> = Vec::new();
         if tempo_changes > 1 {
             warnings.push("tempo changes ignored (initial tempo used throughout)".into());
@@ -314,6 +342,9 @@ impl Score {
             for slot in open.into_iter().flatten() {
                 notes[slot].end_s = notes[slot].end_s.max(track_end);
             }
+            // A same-tick on/off (or a zero-duration authored note) would never
+            // sound or light a key — give it a minimum length (R37).
+            ensure_min_note_len(&mut notes);
             // A track with pedal data but no notes is dropped along with any
             // other noteless track — pedal only means anything under notes.
             if !notes.is_empty() {
@@ -449,6 +480,9 @@ impl Score {
         for w in 0..2 {
             tracks[w].sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
             pedal[w].sort_by(|a, b| a.0.total_cmp(&b.0));
+            // A same-`t` on/off pair loads as a zero-length note that never
+            // sounds/lights but is still required by Evaluation — clamp it (R37).
+            ensure_min_note_len(&mut tracks[w]);
         }
         // Markers drive segment boundaries; `build_segments` assumes them
         // sorted (as `load_midi` guarantees). A hand-written / out-of-order
@@ -631,6 +665,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_notes_are_given_a_minimum_length_at_load() {
+        // A same-`t` on/off pair (a mic-hysteresis flap, or a stall pumping both
+        // in one frame) would load as `start_s == end_s` — never active, so it
+        // never sounds or lights a key, yet Evaluation still requires it. It must
+        // be clamped to a minimum length at load (R37).
+        let jsonl = concat!(
+            "{}\n",
+            "{\"t\":1.0,\"e\":\"on\",\"n\":60,\"v\":100,\"who\":\"l\"}\n",
+            "{\"t\":1.0,\"e\":\"off\",\"n\":60,\"who\":\"l\"}\n",
+        );
+        let dir = std::env::temp_dir().join(format!("op-score-zerolen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("zero.jsonl");
+        std::fs::write(&path, jsonl).unwrap();
+
+        let score = Score::load(&path).unwrap();
+        let notes = &score.tracks[0].notes;
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].end_s >= notes[0].start_s + MIN_SCORE_NOTE_S,
+            "zero-length note should be clamped: {} -> {}",
+            notes[0].start_s,
+            notes[0].end_s
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn rejects_zero_division_midi() {
         use midly::num::{u15, u28, u4, u7};
         use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
@@ -659,6 +722,59 @@ mod tests {
         let path = dir.join("z.mid");
         smf.save(&path).unwrap();
         assert!(Score::load(&path).is_err(), "division-0 file must be rejected");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn initial_tempo_is_earliest_in_time_not_first_track_scanned() {
+        use midly::num::{u15, u24, u28, u4, u7};
+        use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+        // Format-1 file: track 0 carries only a *mid-piece* tempo change (at a
+        // late tick), while the real tick-0 conductor tempo lives in track 1. The
+        // whole piece must scale by the tick-0 tempo (500000 µs/qtr = 120 BPM),
+        // not the first-scanned one (R14). A note at tick 480 (one quarter at
+        // ppq 480) must therefore land at 0.5 s, not 0.25 s.
+        let ppq = 480u16;
+        let mut smf = Smf::new(Header::new(Format::Parallel, Timing::Metrical(u15::from(ppq))));
+        // Track 0: a mid-piece tempo (250000 = 240 BPM) at a late tick, plus the note.
+        smf.tracks.push(vec![
+            TrackEvent {
+                delta: u28::from(4800),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(250_000))),
+            },
+            TrackEvent { delta: u28::from(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) },
+        ]);
+        // Track 1: the real conductor tempo at tick 0, then a one-quarter note.
+        smf.tracks.push(vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(500_000))),
+            },
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn { key: u7::from(60), vel: u7::from(100) },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(480),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff { key: u7::from(60), vel: u7::from(0) },
+                },
+            },
+            TrackEvent { delta: u28::from(0), kind: TrackEventKind::Meta(MetaMessage::EndOfTrack) },
+        ]);
+        let dir = std::env::temp_dir().join(format!("op-score-tempo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.mid");
+        smf.save(&path).unwrap();
+
+        let score = Score::load(&path).unwrap();
+        let note = score.tracks.iter().flat_map(|t| &t.notes).next().expect("a note");
+        // 120 BPM: one quarter = 0.5 s. (At the wrong 240 BPM it would be 0.25 s.)
+        assert!((note.end_s - note.start_s - 0.5).abs() < 1e-3, "duration {}", note.end_s - note.start_s);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -168,11 +168,22 @@ pub fn run(
         let frame_off = tunables.frame_off.get();
         let norm_max_gain = tunables.norm_max_gain.get();
 
-        // Per-key note (frame) and onset probabilities (empty == silence).
-        let Frames { note, onset } = if rms(&input) < silence_rms {
+        // Gate and normalize on the *real* samples in `window`, not the
+        // zero-padded `input`: during the ~2 s warm-up `input` is mostly padding,
+        // which dilutes the RMS — false-gating soft playing right after mic start
+        // and then over-amplifying once it passes (R43). `!(sig_rms >=
+        // silence_rms)` (rather than `<`) also treats a NaN RMS from NaN audio as
+        // silence instead of skipping the gate (R42).
+        let sig_rms = rms(&window);
+        // Treat non-finite RMS (NaN audio) as silence explicitly, rather than a
+        // bare `sig_rms < silence_rms` that a NaN slips through (`NaN < x` is
+        // false), which would run inference on garbage and could wedge a note on
+        // (R42).
+        let is_silent = !sig_rms.is_finite() || sig_rms < silence_rms;
+        let Frames { note, onset } = if is_silent {
             Frames::default()
         } else {
-            infer(&mut session, &input, norm_max_gain)
+            infer(&mut session, &input, norm_max_gain, sig_rms)
         };
         let onset_gating = !onset.is_empty();
 
@@ -188,7 +199,14 @@ pub fn run(
         let frame_off = frame_off.min(trig_thresh);
         for k in 0..KEY_COUNT {
             let m = (MIDI_LOW as usize) + k;
-            let note_p = note.get(k).copied().unwrap_or(0.0);
+            // Sanitize a non-finite posterior to 0.0: a NaN `note_p` never
+            // satisfies `note_p < frame_off`, so an ON note would never
+            // accumulate absent-frames and would stay wedged on forever, lit
+            // locally and on the peer (R42).
+            let note_p = {
+                let p = note.get(k).copied().unwrap_or(0.0);
+                if p.is_finite() { p } else { 0.0 }
+            };
             if on[m] {
                 // Sustain on the frame grid: release only once it stays below
                 // frame_off for RELEASE_HOPS (keeps decaying notes alive).
@@ -209,7 +227,10 @@ pub fn run(
                 // the debounce for an instant attack. The onset bypass still
                 // requires frame support, so a lone onset spike on noise (no frame
                 // support) can't fire a phantom note.
-                let onset_p = onset.get(k).copied().unwrap_or(0.0);
+                let onset_p = {
+                    let p = onset.get(k).copied().unwrap_or(0.0);
+                    if p.is_finite() { p } else { 0.0 }
+                };
                 let frame_hit = note_p >= trig_thresh;
                 let triggered = if frame_hit && onset_gating && onset_p >= ONSET_TRIG {
                     true // genuine attack: both grids agree — fire immediately
@@ -259,10 +280,12 @@ struct Frames {
 }
 
 /// Run one inference pass and return the note (frame) and onset grids per key.
-fn infer(session: &mut Session, audio: &[f32], norm_max_gain: f32) -> Frames {
+fn infer(session: &mut Session, audio: &[f32], norm_max_gain: f32, raw_rms: f32) -> Frames {
     // Level-normalize so quiet mic input still drives the model (see fn below).
-    let raw_rms = rms(audio);
-    let normalized = normalize_for_model(audio, norm_max_gain);
+    // `raw_rms` is measured on the *real* samples by the caller, not this
+    // (possibly zero-padded) window, so warm-up padding can't deflate the gain
+    // and over-amplify (R43).
+    let normalized = normalize_for_model(audio, norm_max_gain, raw_rms);
     let tensor = match Tensor::from_array((vec![1_i64, normalized.len() as i64, 1_i64], normalized)) {
         Ok(t) => t,
         Err(e) => {
@@ -417,8 +440,8 @@ fn rms(buf: &[f32]) -> f32 {
 /// is capped so near-silence isn't blown up into noise — and the caller already
 /// skips windows below `SILENCE_RMS`. Output is clamped to [-1, 1] to avoid
 /// out-of-range distortion.
-fn normalize_for_model(audio: &[f32], norm_max_gain: f32) -> Vec<f32> {
-    let gain = norm_gain(rms(audio), norm_max_gain);
+fn normalize_for_model(audio: &[f32], norm_max_gain: f32, raw_rms: f32) -> Vec<f32> {
+    let gain = norm_gain(raw_rms, norm_max_gain);
     audio.iter().map(|x| (x * gain).clamp(-1.0, 1.0)).collect()
 }
 

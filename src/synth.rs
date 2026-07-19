@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -57,8 +57,9 @@ pub enum Channel {
     Metronome = 3,
 }
 
-/// Number of distinct channels; sizes the per-channel gain table.
-const CHANNELS: usize = 4;
+/// Number of distinct channels; sizes the per-channel gain table (and main.rs's
+/// `echo_held`, so it can never be indexed out of range by a `Channel`).
+pub const CHANNELS: usize = 4;
 
 /// A command from the GUI thread to the audio callback.
 enum Cmd {
@@ -92,6 +93,9 @@ struct Voice {
     inc: f32,         // phase advance per sample = freq / sample_rate
     env: f32,         // current envelope amplitude, 0..1
     stage: Stage,
+    /// Monotonic trigger order, so voice-stealing can break envelope ties by
+    /// age and prefer sacrificing the *oldest* over the newest (R40).
+    age: u64,
 }
 
 impl Voice {
@@ -102,7 +106,24 @@ impl Voice {
         inc: 0.0,
         env: 0.0,
         stage: Stage::Idle,
+        age: 0,
     };
+}
+
+impl Stage {
+    /// How willing we are to steal a voice in this stage for a new note-on —
+    /// lower steals first. A `Release` voice is already fading toward silence
+    /// (least missed); a `Decay` voice is ringing down while held; an `Attack`
+    /// voice was just struck, so stealing it drops the newest note — the R40
+    /// bug when every fresh voice sits at env 0.0 and reads as "quietest".
+    fn steal_priority(self) -> u8 {
+        match self {
+            Stage::Idle => 0,
+            Stage::Release => 1,
+            Stage::Decay => 2,
+            Stage::Attack => 3,
+        }
+    }
 }
 
 /// Per-sample envelope coefficients, precomputed from the device sample rate.
@@ -142,6 +163,9 @@ struct SynthState {
     click_inc: f32,   // phase advance per sample = click freq / sample_rate
     click_decay: f32, // per-sample env multiplier (fast, ~30 ms tail)
     click_amp: f32,   // peak amplitude of the current click (accent = louder)
+    /// Monotonic counter stamped onto each triggered voice for age-based steal
+    /// tie-breaking (R40).
+    next_age: u64,
 }
 
 impl SynthState {
@@ -161,6 +185,7 @@ impl SynthState {
             // a tight percussive tick rather than a lingering beep.
             click_decay: (-1.0 / (0.012 * sample_rate)).exp(),
             click_amp: 0.0,
+            next_age: 0,
         }
     }
 
@@ -181,6 +206,8 @@ impl SynthState {
     fn note_on(&mut self, midi: u8, channel: Channel) {
         let freq = 440.0 * 2f32.powf((midi as f32 - 69.0) / 12.0);
         let inc = freq / self.sample_rate;
+        self.next_age += 1;
+        let age = self.next_age;
 
         // Retrigger of a voice already on this note+channel: re-enter Attack but
         // *keep* its phase and current envelope. Resetting them to 0 (as a fresh
@@ -193,23 +220,37 @@ impl SynthState {
         {
             self.voices[slot].inc = inc;
             self.voices[slot].stage = Stage::Attack;
+            self.voices[slot].age = age; // freshly played → not a steal candidate
             return;
         }
 
-        // Else a free slot, else steal the quietest voice (lowest env → smallest
-        // discontinuity when it's cut).
+        // Else a free slot, else steal a voice — preferring one already fading
+        // (Release), then ringing down (Decay), and only an Attack voice last;
+        // within a stage, the quietest, breaking envelope ties by oldest age.
+        // The old "lowest env wins" rule stole a just-struck voice (env 0.0), so
+        // a big chord arriving in one drain cannibalized itself (R40).
         let slot = self
             .voices
             .iter()
             .position(|v| v.stage == Stage::Idle)
             .unwrap_or_else(|| {
-                let mut quietest = 0;
+                let mut best = 0;
                 for i in 1..self.voices.len() {
-                    if self.voices[i].env < self.voices[quietest].env {
-                        quietest = i;
+                    let v = &self.voices[i];
+                    let b = &self.voices[best];
+                    let key_v = (v.stage.steal_priority(), v.env, v.age);
+                    let key_b = (b.stage.steal_priority(), b.env, b.age);
+                    // Compare (priority asc, env asc, age asc): steal the
+                    // easiest-to-lose, quietest, oldest voice.
+                    if key_v.0 < key_b.0
+                        || (key_v.0 == key_b.0
+                            && (key_v.1 < key_b.1
+                                || (key_v.1 == key_b.1 && key_v.2 < key_b.2)))
+                    {
+                        best = i;
                     }
                 }
-                quietest
+                best
             });
 
         self.voices[slot] = Voice {
@@ -219,6 +260,7 @@ impl SynthState {
             inc,
             env: 0.0,
             stage: Stage::Attack,
+            age,
         };
     }
 
@@ -395,22 +437,75 @@ impl Drop for Synth {
     }
 }
 
-/// Build the output stream and keep it alive until `stop` is set. The cpal
-/// `Stream` is `!Send`, so it must be created and held on this one thread.
+/// Supervise the output stream: build it, run it, and — mirroring the capture
+/// side (`audio.rs`) — rebuild it if the device dies (headphones unplugged,
+/// Bluetooth drop, default-device switch) instead of parking a corpse until
+/// process exit and leaving the app permanently silent (R16). Returns only when
+/// `stop` is set or the format is unsupported (no point retrying that).
+///
+/// The command `Receiver` is shared through an `Arc<Mutex<…>>` so it survives a
+/// rebuild while the [`Synth`] handle's `Sender` stays valid. The audio callback
+/// only ever `try_lock`s it — uncontended in steady state (the supervisor never
+/// holds it while a stream runs), so the realtime path stays effectively
+/// lock-free; a failed try-lock (only possible mid-rebuild, when no stream is
+/// running anyway) simply skips draining that block.
 fn output_loop(
     cmd_rx: Receiver<Cmd>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match run_output_stream(&cmd_rx, &stop) {
+            // Clean stop.
+            Ok(()) => return Ok(()),
+            // Unsupported format never gets better on retry — give up (mute).
+            Err(OutputError::Fatal(e)) => return Err(e),
+            // Device/build/transient failure: back off briefly, then rebuild.
+            Err(OutputError::Rebuildable(e)) => {
+                eprintln!("[synth] output stream failed: {e}; rebuilding");
+                for _ in 0..10 {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of one output-stream attempt.
+enum OutputError {
+    /// Retrying could help (device gone, build failed, stream errored).
+    Rebuildable(Box<dyn std::error::Error>),
+    /// Retrying can't help (unsupported sample format) — stay mute.
+    Fatal(Box<dyn std::error::Error>),
+}
+
+/// Build and run one output stream until `stop` is set (→ `Ok`) or the device
+/// errors (→ `Err(Rebuildable)`, so [`output_loop`] rebuilds). A fresh
+/// `SynthState` per attempt means a device switch silences any in-flight voices
+/// cleanly; the next note-on re-triggers them.
+fn run_output_stream(
+    cmd_rx: &Arc<Mutex<Receiver<Cmd>>>,
+    stop: &Arc<AtomicBool>,
+) -> Result<(), OutputError> {
     // WASAPI on Windows; default host elsewhere (keeps it compiling on dev macs).
     #[cfg(target_os = "windows")]
-    let host = cpal::host_from_id(cpal::HostId::Wasapi)?;
+    let host = cpal::host_from_id(cpal::HostId::Wasapi)
+        .map_err(|e| OutputError::Rebuildable(e.into()))?;
     #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
 
     let device = host
         .default_output_device()
-        .ok_or("no default output device (speakers) found")?;
-    let config = device.default_output_config()?;
+        .ok_or_else(|| OutputError::Rebuildable("no default output device (speakers) found".into()))?;
+    let config = device
+        .default_output_config()
+        .map_err(|e| OutputError::Rebuildable(e.into()))?;
     let sample_rate = config.sample_rate().0 as f32;
     let channels = config.channels() as usize;
     let sample_format = config.sample_format();
@@ -418,18 +513,32 @@ fn output_loop(
 
     let mut state = SynthState::new(sample_rate);
     let env = EnvParams::new(sample_rate);
-    let err_fn = |e| eprintln!("[synth] output stream error: {e}");
+    // Failure flag set by the cpal error callback and observed by the park loop
+    // below, so a mid-session device error triggers a rebuild (R16).
+    let failed = Arc::new(AtomicBool::new(false));
+    let err_failed = Arc::clone(&failed);
+    let err_fn = move |e| {
+        eprintln!("[synth] output stream error: {e}");
+        err_failed.store(true, Ordering::Relaxed);
+    };
 
     // Drain queued note on/off commands, then render the block. Shared by every
     // sample format; the closures below only differ in how they write a sample.
+    // `rx` is cloned per match arm (only one arm ever runs, so the repeated move
+    // is fine) and `try_lock`ed to stay off the realtime lock (see `output_loop`).
+    let rx = Arc::clone(cmd_rx);
     macro_rules! fill {
         ($data:expr, $channels:expr, $write:expr) => {{
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    Cmd::On(m, ch) => state.note_on(m, ch),
-                    Cmd::Off(m, ch) => state.note_off(m, ch),
-                    Cmd::Gain(ch, g) => state.gain_target[ch as usize] = g,
-                    Cmd::Tick(freq_hz, accent, volume) => state.trigger_click(freq_hz, accent, volume),
+            if let Ok(rxg) = rx.try_lock() {
+                while let Ok(cmd) = rxg.try_recv() {
+                    match cmd {
+                        Cmd::On(m, ch) => state.note_on(m, ch),
+                        Cmd::Off(m, ch) => state.note_off(m, ch),
+                        Cmd::Gain(ch, g) => state.gain_target[ch as usize] = g,
+                        Cmd::Tick(freq_hz, accent, volume) => {
+                            state.trigger_click(freq_hz, accent, volume)
+                        }
+                    }
                 }
             }
             for frame in $data.chunks_mut($channels) {
@@ -441,19 +550,19 @@ fn output_loop(
         }};
     }
 
-    let stream = match sample_format {
+    let build = match sample_format {
         SampleFormat::F32 => device.build_output_stream(
             &cfg,
             move |data: &mut [f32], _| fill!(data, channels, |s: f32| s),
             err_fn,
             None,
-        )?,
+        ),
         SampleFormat::I16 => device.build_output_stream(
             &cfg,
             move |data: &mut [i16], _| fill!(data, channels, |s: f32| (s * i16::MAX as f32) as i16),
             err_fn,
             None,
-        )?,
+        ),
         SampleFormat::U16 => device.build_output_stream(
             &cfg,
             move |data: &mut [u16], _| {
@@ -463,12 +572,20 @@ fn output_loop(
             },
             err_fn,
             None,
-        )?,
-        other => return Err(format!("unsupported output sample format: {other:?}").into()),
+        ),
+        other => {
+            return Err(OutputError::Fatal(
+                format!("unsupported output sample format: {other:?}").into(),
+            ))
+        }
     };
+    let stream = build.map_err(|e| OutputError::Rebuildable(e.into()))?;
 
-    stream.play()?;
+    stream.play().map_err(|e| OutputError::Rebuildable(e.into()))?;
     while !stop.load(Ordering::Relaxed) {
+        if failed.load(Ordering::Relaxed) {
+            return Err(OutputError::Rebuildable("output device error".into()));
+        }
         thread::sleep(Duration::from_millis(100));
     }
     Ok(())

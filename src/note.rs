@@ -336,7 +336,11 @@ impl Packet {
                 let volumes = (0..len).map(|i| sanitize_volume(read_f32(len + i))).collect();
                 Some(Packet::MetroBeatTable { freqs, volumes })
             }
-            0xB3 if buf.len() >= 2 => Some(Packet::Pedal { level: buf[1] }),
+            // Clamp to a valid CC value at the decode boundary (like the other
+            // sanitized packets): an out-of-range 128–255 otherwise flows into
+            // the persistent session record — the `.mid` export masks it to a
+            // wrong depth and the `.jsonl` stores the raw invalid value (R24).
+            0xB3 if buf.len() >= 2 => Some(Packet::Pedal { level: buf[1].min(127) }),
             0xB4 if buf.len() >= 5 + HELD_MASK_BYTES => {
                 let mut mask = [0u8; HELD_MASK_BYTES];
                 mask.copy_from_slice(&buf[5..5 + HELD_MASK_BYTES]);
@@ -442,6 +446,27 @@ mod tests {
     }
 
     #[test]
+    fn pedal_level_is_clamped_at_decode() {
+        // A hostile 128–255 level must be clamped to a valid CC value at the
+        // wire boundary, not flow into the saved session record (R24).
+        assert_eq!(Packet::decode(&[0xB3, 200]), Some(Packet::Pedal { level: 127 }));
+        assert_eq!(Packet::decode(&[0xB3, 255]), Some(Packet::Pedal { level: 127 }));
+        assert_eq!(Packet::decode(&[0xB3, 64]), Some(Packet::Pedal { level: 64 }));
+    }
+
+    #[test]
+    fn solfege_to_midi_rejects_out_of_range_octaves_without_overflow() {
+        // Valid notes still parse.
+        assert_eq!(solfege_to_midi("Do4"), Some(60));
+        assert_eq!(solfege_to_midi("La0"), Some(21));
+        // A huge octave must return None, not overflow `(octave + 1) * 12` (a
+        // debug-build panic) or wrap into a bogus in-range note in release (R25).
+        assert_eq!(solfege_to_midi("do357913946"), None);
+        assert_eq!(solfege_to_midi("do178956970"), None);
+        assert_eq!(solfege_to_midi("Do-99999"), None);
+    }
+
+    #[test]
     fn velocity_less_note_on_decodes_with_the_default() {
         // An older peer's 2-byte On: degrade to the flat placeholder velocity
         // instead of dropping the note.
@@ -529,6 +554,13 @@ pub fn solfege_to_midi(s: &str) -> Option<u8> {
         .max_by_key(|(_, name)| name.len())
         .map(|(i, name)| (i as i32, &s[name.len()..]))?;
     let octave: i32 = rest.parse().ok()?;
+    // Reject absurd octaves before the arithmetic: a huge parsed value overflows
+    // `(octave + 1) * 12` — a debug-build panic from a text field, and a value
+    // that wraps into 0..=127 and is wrongly accepted in release (R25). Any octave
+    // outside the MIDI range can't yield a valid note anyway.
+    if !(-2..=9).contains(&octave) {
+        return None;
+    }
     let midi = (octave + 1) * 12 + pc;
     u8::try_from(midi).ok().filter(|&m| m <= 127)
 }

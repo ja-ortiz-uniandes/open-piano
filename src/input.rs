@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use midir::MidiInputConnection;
 
 use crate::audio::{self, AudioHandle, EngineStatus, InferenceTunables, Threshold};
+use crate::bundle;
 use crate::midi;
 use crate::note::NoteMsg;
 use crate::record::Recorder;
@@ -54,6 +55,11 @@ const MIC_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 /// After the record-capture stream fails, wait this long before retrying it —
 /// so a busy/absent mic doesn't respawn the capture thread every poll (F25).
 const RECORD_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// How often the supervisor refreshes the extracted ONNX Runtime's mtime, well
+/// under the 24 h reap age, so a long-lived instance's runtime is never reaped
+/// by a concurrent newer instance (R35).
+const RUNTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // `source` atomic encoding (it's read by the UI thread).
 const SRC_DETECTING: u8 = 0;
@@ -229,6 +235,14 @@ fn supervise(
     // Time the record-capture stream last failed, so a busy mic doesn't respawn
     // capture every poll (F25).
     let mut failed_record: Option<Instant> = None;
+    // Arm/disarm edge count seen at the last reconcile, to catch a full toggle
+    // cycle completed between two polls (R10).
+    let mut last_arm_edges: u64 = recorder.arm_edges();
+    // Periodically bump the extracted ONNX Runtime's mtime so a concurrent newer
+    // instance's 24 h reaper never deletes a runtime this long-lived (possibly
+    // MIDI-only, never-loads-ORT) instance still depends on (R35).
+    let mut last_runtime_touch = Instant::now();
+    bundle::touch_runtime();
 
     while !stop_all.load(Ordering::Relaxed) {
         let ports = midi::port_names();
@@ -256,7 +270,20 @@ fn supervise(
             if let Active::Mic(h) = std::mem::replace(&mut active, Active::None) {
                 h.stop();
             }
-            set_detecting(&status, &source);
+            // Preserve the failure text through the retry cooldown rather than
+            // showing the generic "detecting…", which reads as a healthy
+            // transient state on a machine with no usable mic (R29). Keep the
+            // audio thread's error message if it left one.
+            let prev = status.lock().ok().map(|s| s.device.clone()).unwrap_or_default();
+            source.store(SRC_DETECTING, Ordering::Relaxed);
+            if let Ok(mut s) = status.lock() {
+                s.device = if prev.is_empty() || prev == "Input: detecting…" {
+                    "Mic failed — retrying in 10 s".to_string()
+                } else {
+                    format!("{prev} — retrying in 10 s")
+                };
+                s.model = String::new();
+            }
             failed_mic = Some(Instant::now());
         }
 
@@ -276,6 +303,13 @@ fn supervise(
                 if failed_midi.get(want).is_some_and(|at| at.elapsed() < MIDI_RETRY_COOLDOWN) {
                     continue;
                 }
+                // Bump the epoch *before* `connect_to`, which starts delivering
+                // Note-Ons into `note_tx` the instant it returns: a note struck
+                // in the gap between the callback going live and a later bump was
+                // consumed under the old epoch and then wiped by the force-release
+                // (R28). A failed attempt over-bumps by one (a harmless spurious
+                // force-release), but succeeding candidates open on the first try.
+                epoch.fetch_add(1, Ordering::Relaxed);
                 // Only MIDI gets the pedal sender: the mic backend is never
                 // wired to it (the pedal feature's structural guarantee).
                 match midi::connect_to(
@@ -296,7 +330,6 @@ fn supervise(
                 }
             }
             if let Some((conn, name)) = opened {
-                epoch.fetch_add(1, Ordering::Relaxed);
                 failed_midi.remove(&name);
                 failed_mic = None;
                 source.store(SRC_MIDI, Ordering::Relaxed);
@@ -341,7 +374,19 @@ fn supervise(
         // Reconcile the recording harness with the UI's Record toggle. A session
         // runs whenever armed: the capture-only mic logs audio, and the MIDI
         // callback (already teeing) logs labels whenever a device is connected.
-        reconcile_recording(&recorder, &mut record_capture, &mut failed_record);
+        reconcile_recording(
+            &recorder,
+            &mut record_capture,
+            &mut failed_record,
+            &mut last_arm_edges,
+        );
+
+        // Keep the extracted ONNX Runtime's mtime fresh (~hourly) so a concurrent
+        // newer instance's reaper doesn't delete it out from under us (R35).
+        if last_runtime_touch.elapsed() >= RUNTIME_TOUCH_INTERVAL {
+            bundle::touch_runtime();
+            last_runtime_touch = Instant::now();
+        }
 
         // Live poll interval (Preferences ▸ Advanced), floored so a tiny value
         // can't busy-spin the supervisor.
@@ -375,8 +420,25 @@ fn reconcile_recording(
     recorder: &Recorder,
     record_capture: &mut Option<AudioHandle>,
     failed_record: &mut Option<Instant>,
+    last_arm_edges: &mut u64,
 ) {
     let want = recorder.is_armed();
+    // Did a full arm/disarm cycle complete since the last poll? Two-or-more edges
+    // ending in the same level as our current session state means a take boundary
+    // was toggled between polls (R10). Cut the session so a quick Stop→Record
+    // doesn't merge two takes into one dir.
+    let edges = recorder.arm_edges();
+    let cycled = edges.wrapping_sub(*last_arm_edges) >= 2;
+    *last_arm_edges = edges;
+    if cycled && want && record_capture.is_some() && recorder.is_recording() {
+        // Off→on happened while a session was running: finalize the current take
+        // and start a fresh one so the two are separate sessions.
+        if let Some(handle) = record_capture.take() {
+            handle.stop();
+        }
+        recorder.end();
+        *failed_record = None;
+    }
     match (want, record_capture.is_some()) {
         (true, false) => {
             // Cooling down after a capture failure: keep the session open (MIDI

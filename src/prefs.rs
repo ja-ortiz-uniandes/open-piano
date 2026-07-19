@@ -24,7 +24,13 @@ use std::time::Duration;
 /// switch flips back off.
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Limit {
+    // Per-field serde defaults so a *partial* nested object — a natural hand
+    // edit like `{"idle_pause":{"infinite":true}}` — fills the missing field
+    // instead of failing the deserialize and throwing away the *whole* prefs
+    // file (R32). `sanitize` then re-clamps `secs` to a sane value.
+    #[serde(default)]
     pub infinite: bool,
+    #[serde(default)]
     pub secs: f64,
 }
 
@@ -196,6 +202,14 @@ impl Prefs {
         let mut prefs = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 eprintln!("[prefs] {} is unreadable ({e}); using defaults", path.display());
+                // Preserve the unparseable file as `.bak` before proceeding: the
+                // first preference edit `save()`s over the original, so without
+                // this a user who hand-edited one value loses every setting with
+                // no way to recover the file (R31).
+                let backup = path.with_extension("json.bak");
+                if let Err(e) = std::fs::rename(&path, &backup) {
+                    eprintln!("[prefs] could not back up corrupt prefs to {}: {e}", backup.display());
+                }
                 Prefs::default()
             }),
             // Missing file is the normal first-run case — silent.
@@ -262,6 +276,15 @@ impl Prefs {
                 None
             }
         });
+        // Keyboard height fraction flows straight into every keyboard rect
+        // (main.rs); `f32::clamp` returns NaN for NaN input, so a non-finite
+        // value would propagate NaN into layout and be re-saved (R33). Drop a
+        // non-finite hint; clamp a finite one to a usable range.
+        self.keyboard_height_frac = self
+            .keyboard_height_frac
+            .filter(|f| f.is_finite())
+            .map(|f| f.clamp(0.05, 0.85));
+
         // Echo holdoff: a huge value leaves the mic permanently deaf after any
         // synth note. Cap at 60 s (F27).
         self.echo_holdoff_ms = self.echo_holdoff_ms.min(60_000);

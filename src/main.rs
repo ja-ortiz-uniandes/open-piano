@@ -135,6 +135,11 @@ const DEFAULT_REMOTE_NAME: &str = "Peer";
 /// announcement, at a negligible 1 datagram/sec.
 const COLOR_HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// After a local click-table edit, ignore incoming (stale) `MetroBeatTable`
+/// snapshots for this long so a host's ≤ RTT-old heartbeat echo can't yank a
+/// slider back mid-drag (R19). Comfortably past one heartbeat + a round trip.
+const METRO_TABLE_EDIT_GRACE: Duration = Duration::from_millis(1500);
+
 /// Cap on the number of manual segment breaks put in one `Packet::Separators`
 /// snapshot. Each is 8 bytes; the datagram must stay under the ~1200-byte
 /// path-MTU limit (past which QUIC drops it and separator sync silently stops),
@@ -424,7 +429,10 @@ struct PianoApp {
     // track, per MIDI note, whether the synth is currently voicing it (indexed by
     // `synth::Channel as usize`) and, once it stops, an instant until which a
     // mic-detected onset of that note is still ignored (`prefs.echo_holdoff_ms`).
-    echo_held: [[bool; 2]; 128],
+    // Sized by `synth::CHANNELS` (not the two live channels) so routing any
+    // `Channel` — including a future Playback/Metronome caller — through
+    // `synth_note_on/off` can never index out of bounds (R44).
+    echo_held: [[bool; synth::CHANNELS]; 128],
     echo_until: [Option<Instant>; 128],
 
     // --- mouse "play the on-screen keyboard" input ---
@@ -478,9 +486,34 @@ struct PianoApp {
     // a line on one screen (M2). Auto-pause breaks stay local — the two rolls
     // run independent clocks, so syncing derived boundaries would misplace them.
     manual_separators: Vec<f64>,
+    // Our roll-clock reading at the moment the peer connected. Manual breaks are
+    // synced as offsets from this shared anchor rather than as raw roll seconds:
+    // the two peers' roll clocks are independent (each starts at its own first
+    // note and pauses on its own prefs), so a raw `now_s()` from one lands at an
+    // unrelated point on the other (R13). Anchoring at connect aligns the origin
+    // and scopes sync to breaks placed *while connected*.
+    sep_anchor: f64,
+    // Local-coordinate times of separators we inserted on the peer's behalf, so a
+    // break the peer's snap-back later trims can be removed here too — otherwise
+    // it lingers as a permanent one-sided line, which the golden rule forbids
+    // (R13). Reconciled against every incoming `Packet::Separators`.
+    remote_separators: Vec<f64>,
 
     // --- synced metronome (see Metronome + drive_metronome) ---
     metro: Metronome,
+    // Follower's pending metronome on/off request awaiting the host's confirming
+    // echo. A `MetroCtl` rides one unreliable datagram; if it drops, the host's
+    // authoritative heartbeat would silently revert the button. Re-sent on the
+    // heartbeat until the host's echoed state matches, then cleared (R20).
+    metro_ctl_pending: Option<(bool, u16)>,
+    // Follower has a local click-table edit not yet acknowledged by the host's
+    // echo. Re-sent on the heartbeat so a dropped edit self-heals instead of
+    // being reverted by the host's stale heartbeat (R21), and used to ignore
+    // incoming (stale) tables while our edit is in flight (R19).
+    metro_table_dirty: bool,
+    // When we last edited the click table locally, so an incoming table can't
+    // stomp a slider mid-drag (R19).
+    last_metro_table_edit: Option<Instant>,
 
     // --- in-app auto-update (checks GitHub Releases on launch) ---
     updater: update::Updater,
@@ -678,7 +711,7 @@ impl PianoApp {
             remote_pedal: 0,
             last_pedal_sent: 0,
             frame_onsets: Vec::new(),
-            echo_held: [[false; 2]; 128],
+            echo_held: [[false; synth::CHANNELS]; 128],
             echo_until: [None; 128],
             mouse_note: None,
             pointer_still_since: Instant::now(),
@@ -697,7 +730,12 @@ impl PianoApp {
             last_key_range: None,
             prefs_save_due: None,
             manual_separators: Vec::new(),
+            sep_anchor: 0.0,
+            remote_separators: Vec::new(),
             metro,
+            metro_ctl_pending: None,
+            metro_table_dirty: false,
+            last_metro_table_edit: None,
             // Kick off the background GitHub Releases check; the UI polls its
             // state each frame (see `update_controls`).
             updater: update::start(),
@@ -768,12 +806,16 @@ impl PianoApp {
         }
     }
 
-    /// Send our chosen color to the peer (if connected) and reset the heartbeat.
-    fn send_color(&mut self) {
+    /// Send our chosen color to the peer (if connected). Does *not* reset the
+    /// heartbeat timer: only the heartbeat itself does (R12). A color-picker drag
+    /// calls this every frame, and resetting here postponed the 1 s self-heal
+    /// snapshot (live notes / pins / pedal / separators) for the whole drag —
+    /// leaving a previously-dropped note-off stuck on the peer while the user
+    /// plays with colors.
+    fn send_color(&self) {
         if let Some(peer) = &self.peer {
             peer.send(Packet::Color(self.local_color));
         }
-        self.last_color_send = Instant::now();
     }
 
     /// Send our display name to the peer (if connected). Rides the color
@@ -834,6 +876,20 @@ impl PianoApp {
     /// break shows on both screens (M2). The full manual-break list is re-sent
     /// on the heartbeat, so a dropped datagram converges.
     fn insert_manual_separator(&mut self, at: f64) {
+        // Refuse once we've hit the wire cap rather than drawing a break locally
+        // that can never reach the peer — a silent one-sided line violates the
+        // golden rule at the boundary (R22). Only breaks placed while connected
+        // count toward the shared cap (those are what we broadcast).
+        let shared = self
+            .manual_separators
+            .iter()
+            .filter(|&&t| t >= self.sep_anchor)
+            .count();
+        if self.peer_connected && shared >= MAX_WIRE_SEPARATORS {
+            self.net_status =
+                format!("Section-break limit reached ({MAX_WIRE_SEPARATORS}) — not added");
+            return;
+        }
         self.roll.insert_separator(at);
         // Track the clamped time the roll actually used, deduped, so our
         // snapshot matches what we rendered.
@@ -851,16 +907,26 @@ impl PianoApp {
     /// the heartbeat keeps *re-creating* it on the peer, so the originator shows
     /// no break while the peer shows one forever (F1). Capped so an oversized
     /// snapshot can't silently blow the datagram MTU and stop sync (F21).
+    ///
+    /// Breaks are sent as offsets from `sep_anchor` (our roll clock at connect),
+    /// not raw roll seconds, because the peers' roll clocks are independent
+    /// (R13) — and only breaks placed while connected (`t >= sep_anchor`) map to
+    /// a shared coordinate at all. The list is sent even when empty so the peer
+    /// can drop breaks we've since trimmed (removal path).
     fn broadcast_separators(&mut self) {
         self.manual_separators.retain(|&t| self.roll.has_separator_at(t));
-        if self.manual_separators.len() > MAX_WIRE_SEPARATORS {
-            self.manual_separators.truncate(MAX_WIRE_SEPARATORS);
-        }
-        if self.manual_separators.is_empty() {
-            return;
+        let anchor = self.sep_anchor;
+        let mut offsets: Vec<f64> = self
+            .manual_separators
+            .iter()
+            .filter(|&&t| t >= anchor)
+            .map(|&t| t - anchor)
+            .collect();
+        if offsets.len() > MAX_WIRE_SEPARATORS {
+            offsets.truncate(MAX_WIRE_SEPARATORS);
         }
         if let Some(peer) = &self.peer {
-            peer.send(Packet::Separators(self.manual_separators.clone()));
+            peer.send(Packet::Separators(offsets));
         }
     }
 
@@ -874,6 +940,8 @@ impl PianoApp {
         // previous, unrelated session (F1). The breaks stay on our own roll;
         // we just stop broadcasting the stale list.
         self.manual_separators.clear();
+        self.remote_separators.clear();
+        self.sep_anchor = 0.0;
         self.net_status = "Starting…".into();
         self.is_host = true;
         self.peer_connected = false;
@@ -894,6 +962,8 @@ impl PianoApp {
         self.clear_remote_keys();
         // Fresh session: don't leak a previous session's manual breaks (F1).
         self.manual_separators.clear();
+        self.remote_separators.clear();
+        self.sep_anchor = 0.0;
         self.net_status = "Joining…".into();
         self.is_host = false;
         self.peer_connected = false;
@@ -1009,12 +1079,22 @@ impl PianoApp {
         // genuine MIDI events.
         let mic_source = self.input.source() == Source::Microphone;
         while let Ok(msg) = self.input.notes.try_recv() {
-            // Drop any mic transition for a note the synth is voicing (or just
+            // Drop a mic *onset* for a note the synth is voicing (or just
             // stopped voicing): it's our own output echoing back, not a real
-            // play. Both the On and the trailing Off are dropped so a note we
-            // light from the mouse/peer isn't torn down by the echo's Off.
+            // play. A note-*off* for a note we currently hold locally always
+            // passes — an off is idempotent and can never create an echo
+            // artifact, whereas swallowing it (R1) strands `local[n] = true`
+            // forever, and the `Packet::Live` heartbeat then re-asserts the
+            // stuck key to the peer every second. Only genuine echo offs (for
+            // notes we do *not* hold) are still dropped, so a key we light from
+            // the mouse/peer isn't torn down by the echo's trailing Off.
             if mic_source && self.echo_suppressed(msg.midi()) {
-                continue;
+                let held_local =
+                    midi_to_key_index(msg.midi()).is_some_and(|idx| self.local[idx]);
+                let genuine_off = matches!(msg, NoteMsg::Off(..)) && held_local;
+                if !genuine_off {
+                    continue;
+                }
             }
             // Muted mic: drop new onsets but let offs through, so anything
             // already sounding when the mute flipped on closes normally.
@@ -2086,15 +2166,19 @@ impl PianoApp {
                 // Push the change immediately; the heartbeat covers the rest.
                 self.send_name();
                 self.prefs.local_name = self.local_name.clone();
-                self.prefs.save();
+                // Debounced, not immediate: `.changed()` fires per keystroke —
+                // an fsync per character on the GUI thread otherwise (R12).
+                self.save_prefs_soon();
             }
             ui.label("My color:");
             if ui.color_edit_button_srgb(&mut self.local_color).changed() {
                 // Push the change immediately; the heartbeat covers the rest.
                 self.send_color();
-                // Persist as the new default color.
+                // Persist as the new default color — debounced, since a picker
+                // drag fires `.changed()` every frame (~60 Hz). An immediate
+                // `prefs.save()` here fsync'd the whole file per frame (R12).
                 self.prefs.local_color = self.local_color;
-                self.prefs.save();
+                self.save_prefs_soon();
             }
             ui.separator();
             ui.label(format!("Peer: {}", self.remote_name));
@@ -2126,6 +2210,31 @@ impl PianoApp {
     /// skip the separator when there's nothing to show.
     fn update_controls(&mut self, ui: &mut egui::Ui) -> bool {
         match self.updater.state() {
+            update::UpdateState::Available { version } => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(90, 180, 110),
+                    format!("Update available: v{version}"),
+                );
+                if ui
+                    .button("Install")
+                    .on_hover_text(
+                        "Download and install this version now. Only install updates \
+                         you trust — the app does not verify the download's signature.",
+                    )
+                    .clicked()
+                {
+                    // Explicit user consent — never auto-installed at launch (R7).
+                    self.updater.install(version);
+                }
+                true
+            }
+            update::UpdateState::Installing { version } => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(150, 170, 200),
+                    format!("Installing v{version}…"),
+                );
+                true
+            }
             update::UpdateState::Ready { version } => {
                 ui.colored_label(
                     egui::Color32::from_rgb(90, 180, 110),
@@ -2254,25 +2363,36 @@ impl PianoApp {
             // Record every processed beat (sounded or muted) so a follower can
             // dedup a re-delivered marker (F3).
             self.metro.last_beat_at = Some(at);
-            if !self.metro.muted {
-                self.synth.tick(
-                    self.metro.freq_for_beat(beat_in_bar),
-                    beat_in_bar == 0,
-                    self.metro.volume_for_beat(beat_in_bar),
-                );
-            }
-            if authority {
-                if let Some(peer) = &self.peer {
-                    peer.send(Packet::MetroBeat {
-                        bpm: self.metro.bpm,
-                        beat_in_bar,
-                        beats_per_bar: self.metro.beats_per_bar,
-                        on: true,
-                    });
+            let next_at = at + period;
+            // If the *next* beat is also already due this frame, this one is a
+            // stale catch-up beat from a short GUI stall. The synth has a single
+            // click voice, so N beats sounded in one frame collapse into one
+            // click carrying the *last* beat's pitch/accent anyway (R41) — worse,
+            // a caught-up downbeat could be replaced by a weak beat. Skip sounding
+            // and broadcasting stale beats; only the most recent overdue beat
+            // clicks and reaches the peer, keeping both metronomes in step.
+            let stale = now >= next_at;
+            if !stale {
+                if !self.metro.muted {
+                    self.synth.tick(
+                        self.metro.freq_for_beat(beat_in_bar),
+                        beat_in_bar == 0,
+                        self.metro.volume_for_beat(beat_in_bar),
+                    );
+                }
+                if authority {
+                    if let Some(peer) = &self.peer {
+                        peer.send(Packet::MetroBeat {
+                            bpm: self.metro.bpm,
+                            beat_in_bar,
+                            beats_per_bar: self.metro.beats_per_bar,
+                            on: true,
+                        });
+                    }
                 }
             }
             self.metro.next_beat_in_bar = (beat_in_bar + 1) % bpb;
-            self.metro.next_beat_at = Some(at + period);
+            self.metro.next_beat_at = Some(next_at);
         }
     }
 
@@ -2306,9 +2426,15 @@ impl PianoApp {
                     });
                 }
             }
-        } else if let Some(peer) = &self.peer {
+        } else {
             // Follower: request the change; the host's markers are authoritative.
-            peer.send(Packet::MetroCtl { on: enabled, bpm });
+            // Record it as pending so a dropped datagram is re-requested on the
+            // heartbeat until the host confirms, instead of being silently
+            // reverted by the host's authoritative state (R20).
+            self.metro_ctl_pending = Some((enabled, bpm));
+            if let Some(peer) = &self.peer {
+                peer.send(Packet::MetroCtl { on: enabled, bpm });
+            }
         }
     }
 
@@ -2329,11 +2455,26 @@ impl PianoApp {
         }
         self.metro.bpm = bpm.clamp(MIN_BPM, MAX_BPM);
         self.metro.beats_per_bar = beats_per_bar.max(1);
+
+        // Resolve an unacknowledged local on/off request against the host's echo:
+        // only the host confirming *our* requested state clears it. A stale,
+        // pre-request state is ignored so a dropped `MetroCtl` datagram can't
+        // flip our button back — the heartbeat keeps re-requesting until the host
+        // agrees (R20).
+        if let Some((want_on, _)) = self.metro_ctl_pending {
+            if on == want_on {
+                self.metro_ctl_pending = None;
+            } else {
+                return;
+            }
+        }
+
         if !on {
             self.metro.enabled = false;
             self.metro.next_beat_at = None;
             return;
         }
+        let was_enabled = self.metro.enabled;
         self.metro.enabled = true;
         let now = Instant::now();
         let period = Duration::from_secs_f64(self.metro.period());
@@ -2344,6 +2485,18 @@ impl PianoApp {
         // `beat_in_bar % bpb < bpb`, so the `+ 1` is always in range (L2).
         let bpb = self.metro.beats_per_bar; // already `.max(1)` above
         let beat_in_bar = beat_in_bar % bpb;
+
+        // Enable *announce* (we were off): the enable-edge / connect / MetroCtl-
+        // echo markers are sent at the toggle instant, but the host itself waits
+        // for the next roll-grid line before its first real beat. Firing this
+        // marker now would inject a spurious, off-grid click up to a full period
+        // early (R11). Anchor the next beat instead and let the host's first
+        // genuine grid-aligned marker set the phase — no click sounds here.
+        if !was_enabled {
+            self.metro.next_beat_at = Some(this_beat_at + period);
+            self.metro.next_beat_in_bar = (beat_in_bar + 1) % bpb;
+            return;
+        }
 
         // Have we already handled ~this beat? On low-latency links the marker
         // for beat N arrives right as our local schedule for beat N comes due;
@@ -3311,6 +3464,16 @@ impl PianoApp {
             self.send_metro_table();
             changed = true;
         }
+        // A local table edit: stamp it so an incoming (stale) table can't stomp a
+        // slider mid-drag (R19), and — as a follower — mark it dirty so the
+        // heartbeat re-sends until the host echoes it back, instead of the host's
+        // authority-only heartbeat reverting a dropped edit (R21).
+        if changed {
+            self.last_metro_table_edit = Some(Instant::now());
+            if !self.metro_authority() {
+                self.metro_table_dirty = true;
+            }
+        }
         changed
     }
 
@@ -3424,6 +3587,10 @@ impl PianoApp {
         let update_line = match self.updater.state() {
             update::UpdateState::Checking => "Checking for updates…".to_string(),
             update::UpdateState::UpToDate => "Up to date — this is the latest release".to_string(),
+            update::UpdateState::Available { version } => {
+                format!("Update available: v{version} (install from the status bar)")
+            }
+            update::UpdateState::Installing { version } => format!("Installing v{version}…"),
             update::UpdateState::Ready { version } => {
                 format!("Update ready: v{version} (restart to apply)")
             }
@@ -3465,6 +3632,15 @@ impl PianoApp {
                     // Fresh connection: remote state is unknown (this may be a
                     // reconnect mid-chord), and the peer needs our color.
                     self.peer_connected = true;
+                    // Anchor the shared separator coordinate at this moment on our
+                    // roll clock (R13); forget any breaks we mirrored from a prior
+                    // peer so removal reconciliation starts clean.
+                    self.sep_anchor = self.roll.now_s();
+                    self.remote_separators.clear();
+                    // Fresh session: drop any stale follower-side metronome
+                    // requests from a previous peer (R20/R21).
+                    self.metro_ctl_pending = None;
+                    self.metro_table_dirty = false;
                     self.clear_remote_keys();
                     self.send_color();
                     self.send_name();
@@ -3503,6 +3679,13 @@ impl PianoApp {
                 }
                 NetEvent::Disconnected => {
                     self.peer_connected = false;
+                    // Stop mirroring the peer's breaks; our own stay on our roll.
+                    self.remote_separators.clear();
+                    self.sep_anchor = 0.0;
+                    // We reclaim metronome authority when solo; drop stale
+                    // follower requests so they don't fire on reconnect (R20/R21).
+                    self.metro_ctl_pending = None;
+                    self.metro_table_dirty = false;
                     self.clear_remote_keys();
                     // Drop the peer's announced name so a stale one isn't shown
                     // while nobody's connected; it re-announces on reconnect.
@@ -3513,7 +3696,9 @@ impl PianoApp {
                     // independent; reordered events for different keys must not
                     // cancel), and advance the high-water mark so a stale Live
                     // snapshot that reordered past this note is later ignored (F6).
-                    self.remote_live_seq = self.remote_live_seq.max(seq);
+                    if seq_ge(seq, self.remote_live_seq) {
+                        self.remote_live_seq = seq;
+                    }
                     apply(&mut self.remote, msg);
                     self.roll.note(roll::Who::Remote, msg, self.remote_color);
                     // The peer's notes have no local sound source, so voice them.
@@ -3528,7 +3713,7 @@ impl PianoApp {
                 // when they release Ctrl). Display only: no synth, no roll.
                 NetEvent::Packet(Packet::Held { seq, mask }) => {
                     // Ignore a snapshot that reordered behind a newer one (F6).
-                    if seq >= self.remote_held_seq {
+                    if seq_ge(seq, self.remote_held_seq) {
                         self.remote_held_seq = seq;
                         self.remote_held = unpack_held(&mask);
                     }
@@ -3538,7 +3723,7 @@ impl PianoApp {
                 // reordered behind a newer note/snapshot, which would resurrect a
                 // released note or extinguish a fresh press (F6).
                 NetEvent::Packet(Packet::Live { seq, mask }) => {
-                    if seq >= self.remote_live_seq {
+                    if seq_ge(seq, self.remote_live_seq) {
                         self.remote_live_seq = seq;
                         self.reconcile_remote_live(mask);
                     }
@@ -3550,13 +3735,31 @@ impl PianoApp {
                 // re-delivery land at the (ever-advancing) live edge, spawning a
                 // fresh separator line every second (F1). A break the peer placed
                 // ahead of our clock is simply inserted once our clock reaches it.
-                NetEvent::Packet(Packet::Separators(times)) => {
+                NetEvent::Packet(Packet::Separators(offsets)) => {
+                    // Offsets are seconds since the peer's connect anchor; map
+                    // them into our roll coordinate via our own anchor (R13).
                     let now = self.roll.now_s();
-                    for at in times {
-                        if at > 0.0 && at <= now {
-                            self.roll.insert_separator(at);
+                    let anchor = self.sep_anchor;
+                    let desired: Vec<f64> = offsets.iter().map(|&o| anchor + o).collect();
+                    // Tombstone: remove any break we previously inserted for the
+                    // peer that's no longer in their list (their snap-back trimmed
+                    // it). Skip times we also hold as our own manual break.
+                    for &old in &self.remote_separators {
+                        let still = desired.iter().any(|&d| (d - old).abs() < 1e-9);
+                        let ours = self.manual_separators.iter().any(|&t| (t - old).abs() < 1e-9);
+                        if !still && !ours {
+                            self.roll.remove_separator(old);
                         }
                     }
+                    // Insert newly-desired breaks our clock has reached; a break
+                    // placed ahead of our clock is inserted once we reach it.
+                    for &d in &desired {
+                        if d > 0.0 && d <= now {
+                            self.roll.insert_separator(d);
+                        }
+                    }
+                    self.remote_separators =
+                        desired.into_iter().filter(|&d| d > 0.0 && d <= now).collect();
                 }
                 // Intentionally *not* applied to `remote_color`: every fresh
                 // install defaults `local_color` to the same red, so honoring
@@ -3603,12 +3806,27 @@ impl PianoApp {
                     // per-packet `prefs.save()` disk-write storm into a write
                     // only on a genuine change (H3). Values arrive already
                     // finite/in-range (sanitized in `Packet::decode`).
-                    if self.metro.beat_freqs != freqs || self.metro.beat_volumes != volumes {
-                        self.metro.beat_freqs = freqs.clone();
-                        self.metro.beat_volumes = volumes.clone();
-                        self.prefs.metro_beat_freqs = freqs;
-                        self.prefs.metro_beat_volumes = volumes;
-                        self.prefs.save();
+                    let matches_local =
+                        self.metro.beat_freqs == freqs && self.metro.beat_volumes == volumes;
+                    if matches_local {
+                        // The host echoed our edit back: request satisfied (R21).
+                        self.metro_table_dirty = false;
+                    } else {
+                        // Differs. Ignore it while our own edit is still in flight
+                        // — either flagged dirty (R21) or within a short window of
+                        // the last local edit so a heartbeat echo can't yank a
+                        // slider mid-drag (R19). Otherwise adopt + persist.
+                        let editing_locally = self.metro_table_dirty
+                            || self
+                                .last_metro_table_edit
+                                .is_some_and(|t| t.elapsed() < METRO_TABLE_EDIT_GRACE);
+                        if !editing_locally {
+                            self.metro.beat_freqs = freqs.clone();
+                            self.metro.beat_volumes = volumes.clone();
+                            self.prefs.metro_beat_freqs = freqs;
+                            self.prefs.metro_beat_volumes = volumes;
+                            self.prefs.save();
+                        }
                     }
                 }
                 NetEvent::MetroBeat { bpm, beat_in_bar, beats_per_bar, on, one_way } => {
@@ -3617,6 +3835,16 @@ impl PianoApp {
             }
         }
     }
+}
+
+/// Serial-number "is `seq` at least as new as high-water mark `hwm`?" — a
+/// wrapping comparison (RFC 1982 style) rather than a plain `>=`, so the u32
+/// note/snapshot counters keep self-healing across a 2^32 wrap instead of
+/// freezing every `Live`/`Held` snapshot until reconnect (R23). Reachable only
+/// after ~4 billion events, but a plain `>=` there silently kills the self-heal.
+/// Equal counts count as "new" so a same-seq heartbeat re-send still reconciles.
+fn seq_ge(seq: u32, hwm: u32) -> bool {
+    seq.wrapping_sub(hwm) as i32 >= 0
 }
 
 /// Apply a note transition to a key-state array.
@@ -3753,6 +3981,10 @@ impl eframe::App for PianoApp {
         // here is a whole-state snapshot the receiver reconciles idempotently,
         // so re-sending is safe.
         if self.peer.is_some() && self.last_color_send.elapsed() >= COLOR_HEARTBEAT {
+            // Reset the heartbeat timer here — the *only* place it's reset —
+            // rather than in `send_color`, so a color-picker drag can't starve
+            // the self-heal snapshots below (R12).
+            self.last_color_send = Instant::now();
             self.send_color();
             self.send_name();
             // Live notes + pinned keys, re-sent unconditionally: the pin-clear
@@ -3791,6 +4023,19 @@ impl eframe::App for PianoApp {
                             on: false,
                         });
                     }
+                }
+            } else {
+                // Follower self-heal on the same heartbeat: re-request an
+                // unacknowledged on/off toggle (R20) and re-send an unechoed
+                // click-table edit (R21), so a dropped single datagram converges
+                // instead of being reverted by the host's authoritative state.
+                if let Some((on, bpm)) = self.metro_ctl_pending {
+                    if let Some(peer) = &self.peer {
+                        peer.send(Packet::MetroCtl { on, bpm });
+                    }
+                }
+                if self.metro_table_dirty {
+                    self.send_metro_table();
                 }
             }
         }
@@ -4153,12 +4398,15 @@ impl eframe::App for PianoApp {
                         self.local_color[2],
                     ),
                 )];
-                // The peer's pinned overlay is part of the shared surface, so it
-                // shows even while we have a score open (our own pinning is
-                // locked during playback, but theirs may not be).
-                if self.remote_held.iter().any(|&h| h) {
+                // The peer's live presses *and* pinned overlay are part of the
+                // shared surface, so they show even while we have a score open —
+                // the keyboard is one thing both players look at (golden rule). We
+                // draw the merged `remote_shown` (live ∪ pinned), not just the
+                // pins: forgetting the peer's live notes here left their keys dark
+                // on our screen for as long as a score was open (R3).
+                if remote_shown.iter().any(|&h| h) {
                     layers.push((
-                        self.remote_held,
+                        remote_shown,
                         egui::Color32::from_rgb(
                             self.remote_color[0],
                             self.remote_color[1],
@@ -4885,22 +5133,27 @@ fn evaluation_settings_body(
     if let Strictness::Custom { temporal_tolerance_s, force_tolerance, pedal_tolerance } =
         &mut pb.eval.strictness
     {
-        changed |= ui
+        // Restart on drag-end / focus-loss, not per changed frame: a `Slider`'s
+        // `.changed()` fires ~60×/s during a drag, and each restart yanks the
+        // playhead to 0 and silences the synth — so a single strictness tweak
+        // machine-guns restarts for the whole gesture (R18). The value still
+        // updates live via the `&mut` binding; only the take restart is deferred.
+        let ttol = ui
             .add(
                 egui::Slider::new(temporal_tolerance_s, 0.02..=0.5)
                     .text("timing ±s")
                     .logarithmic(true),
             )
-            .on_hover_text("How far off a press can be and still match its note")
-            .changed();
-        changed |= ui
+            .on_hover_text("How far off a press can be and still match its note");
+        changed |= ttol.drag_stopped() || ttol.lost_focus();
+        let ftol = ui
             .add(egui::Slider::new(force_tolerance, 0.05..=1.0).text("force tol."))
-            .on_hover_text("How far off the key force can be before scoring zero")
-            .changed();
-        changed |= ui
+            .on_hover_text("How far off the key force can be before scoring zero");
+        changed |= ftol.drag_stopped() || ftol.lost_focus();
+        let ptol = ui
             .add(egui::Slider::new(pedal_tolerance, 0.05..=1.0).text("pedal tol."))
-            .on_hover_text("How far off the pedal can be before scoring zero")
-            .changed();
+            .on_hover_text("How far off the pedal can be before scoring zero");
+        changed |= ptol.drag_stopped() || ptol.lost_focus();
     }
 
     ui.separator();
@@ -5246,7 +5499,18 @@ fn draw_falling(
             }
             let track = &score.tracks[who.idx()];
             let [r, g, b] = track.color;
-            for n in &track.notes {
+            // Bound the scan to the visible window instead of walking every note
+            // every frame (O(total notes) — a dense "black MIDI" then drags the
+            // whole UI). Notes are sorted by `start_s` (both loaders sort), so a
+            // binary search gives the upper end; the lower end looks back one
+            // max-note-duration (`MARK_LOOKBACK_S`) so a long note that started
+            // before the window but still sounds isn't skipped (R15, mirroring
+            // `draw_roll`).
+            let lo = track
+                .notes
+                .partition_point(|n| n.start_s < view_playhead_s - MARK_LOOKBACK_S);
+            let hi = track.notes.partition_point(|n| n.start_s <= top_s);
+            for n in &track.notes[lo..hi] {
                 let Some((xr, black)) = lanes[n.midi as usize] else { continue };
                 if black != pass_black {
                     continue;
@@ -5340,6 +5604,20 @@ fn draw_keyboard_layered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_ge_uses_wrapping_serial_number_comparison() {
+        // Normal ordering.
+        assert!(seq_ge(5, 5)); // equal counts as "at least as new" (heartbeat)
+        assert!(seq_ge(6, 5));
+        assert!(!seq_ge(4, 5));
+        // Across the u32 wrap the self-heal must keep working: a fresh small seq
+        // right after the counter wrapped past u32::MAX is still "newer" than the
+        // pre-wrap high-water mark (R23) — a plain `>=` would reject it forever.
+        assert!(seq_ge(2, u32::MAX - 2));
+        assert!(seq_ge(0, u32::MAX));
+        assert!(!seq_ge(u32::MAX, 0)); // the old value is not newer than the wrap
+    }
 
     #[test]
     fn metro_grid_aligns_to_next_beat_and_repeats_every_whole_minute() {
