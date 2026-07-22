@@ -4414,10 +4414,15 @@ impl eframe::App for PianoApp {
                         ),
                     ));
                 }
-                for who in [roll::Who::Local, roll::Who::Remote] {
-                    if !pb.practiced(who) && pb.track_visible(who) {
-                        let [r, g, b] = pb.display_score().tracks[who.idx()].color;
-                        layers.push((pb.active_key_array(who), egui::Color32::from_rgb(r, g, b)));
+                // During the silent loop pad nothing sounds, so keep the
+                // keyboard dark too — otherwise a note ending right on the
+                // segment boundary would stay lit through the whole breather.
+                if !pb.in_loop_pad() {
+                    for who in [roll::Who::Local, roll::Who::Remote] {
+                        if !pb.practiced(who) && pb.track_visible(who) {
+                            let [r, g, b] = pb.display_score().tracks[who.idx()].color;
+                            layers.push((pb.active_key_array(who), egui::Color32::from_rgb(r, g, b)));
+                        }
                     }
                 }
                 draw_keyboard_layered(ui.painter(), kb_rect, &keys, &layers);
@@ -4466,7 +4471,7 @@ impl eframe::App for PianoApp {
                         falling_resp.rect,
                         &keys,
                         pb.display_score(),
-                        pb.playhead_s,
+                        pb.falling_view(),
                         pb.learn.key_range,
                         self.range_drag,
                         self.falling_scrollback.unwrap_or(0.0),
@@ -5411,19 +5416,24 @@ fn range_band_x(keys: &[KeyRect], lo: u8, hi: u8) -> Option<egui::Rangef> {
 }
 
 /// The falling-notes panel: the loaded score's future, sliding down to reach
-/// the keyboard exactly when each note starts. "Now" (the playhead) sits at
+/// the keyboard exactly when each note starts. "Now" (the view edge) sits at
 /// the *bottom* edge — the mirror of `draw_roll`, which hangs history off its
 /// top edge. Both tracks normally draw (this shows the score, not who's
 /// practicing what) with the same half-lane convention as the history roll;
 /// `visible` (per `Who::idx()`) lets EvaluationReview skip a track entirely
 /// (not dim it) — every other call site passes `[true, true]`.
+///
+/// `view.view_s` is the score time at the bottom edge and `view.wrap` is
+/// `Some` while a segment loops: then only that segment's notes draw, each
+/// also as a ghost copy one period ahead so the next repeat falls into view
+/// and the loop wrap is seamless (see [`playback::FallingView`]).
 #[allow(clippy::too_many_arguments)]
 fn draw_falling(
     painter: &egui::Painter,
     rect: egui::Rect,
     keys: &[KeyRect],
     score: &score::Score,
-    playhead_s: f64,
+    view: playback::FallingView,
     key_range: Option<(u8, u8)>,
     range_drag: Option<(f32, f32)>,
     scroll_offset_s: f64,
@@ -5436,7 +5446,7 @@ fn draw_falling(
 
     // Wheel-scroll review shifts only this view time; the real playhead (and
     // with it Learn gating and auto-play) is untouched by construction.
-    let view_playhead_s = playhead_s + scroll_offset_s;
+    let view_playhead_s = view.view_s + scroll_offset_s;
 
     // Future time -> y (f64 subtraction before the f32 cast, as in draw_roll).
     let y_of = |t: f64| rect.bottom() - ((t - view_playhead_s) as f32) * px_per_s;
@@ -5478,11 +5488,28 @@ fn draw_falling(
     }
 
     // Segment boundaries ahead, same style as the history roll's separators.
+    // While looping, the only boundary that matters is the start of each repeat
+    // (a single segment plays over and over), so draw those instead — falling
+    // in with the pickup, they read as clean restart lines.
     let sep_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
-    for seg in score.segments.iter().skip(1) {
-        let y = y_of(seg.start_s);
-        if y >= rect.top() && y <= rect.bottom() {
-            painter.hline(rect.x_range(), y, sep_stroke);
+    match view.wrap {
+        Some(w) => {
+            let mut b = w.seg_start_s;
+            while b <= top_s {
+                let y = y_of(b);
+                if y >= rect.top() && y <= rect.bottom() {
+                    painter.hline(rect.x_range(), y, sep_stroke);
+                }
+                b += w.period_s;
+            }
+        }
+        None => {
+            for seg in score.segments.iter().skip(1) {
+                let y = y_of(seg.start_s);
+                if y >= rect.top() && y <= rect.bottom() {
+                    painter.hline(rect.x_range(), y, sep_stroke);
+                }
+            }
         }
     }
 
@@ -5515,12 +5542,19 @@ fn draw_falling(
                 if black != pass_black {
                     continue;
                 }
-                // Cull: already fully past, or not yet inside the window.
-                if n.end_s <= view_playhead_s || n.start_s > top_s {
-                    continue;
-                }
-                let y_top = y_of(n.end_s);
-                let y_bot = y_of(n.start_s);
+                // How many copies of this note to draw, and the per-copy time
+                // shift. Off a loop: one copy at its real time. While looping:
+                // only notes belonging to the looping segment draw at all — a
+                // real copy plus a ghost one period ahead, so the next repeat
+                // is already falling in as this pass ends (notes outside the
+                // segment aren't part of the loop, so they're hidden).
+                let (copies, period_s) = match view.wrap {
+                    None => (1u32, 0.0),
+                    Some(w) if n.start_s < w.seg_end_s && n.end_s > w.seg_start_s => {
+                        (2, w.period_s)
+                    }
+                    Some(_) => (0, 0.0),
+                };
                 let mid = xr.center();
                 let (x0, x1) = match who {
                     roll::Who::Local => (xr.min + 1.0, mid),
@@ -5532,11 +5566,21 @@ fn draw_falling(
                 } else {
                     egui::Color32::from_rgb(r, g, b)
                 };
-                let mark = egui::Rect::from_min_max(
-                    egui::pos2(x0, y_top),
-                    egui::pos2(x1, y_bot.max(y_top + 2.0)),
-                );
-                painter.rect_filled(mark, 2.0, color);
+                for k in 0..copies {
+                    let off = k as f64 * period_s;
+                    let (start_s, end_s) = (n.start_s + off, n.end_s + off);
+                    // Cull: already fully past, or not yet inside the window.
+                    if end_s <= view_playhead_s || start_s > top_s {
+                        continue;
+                    }
+                    let y_top = y_of(end_s);
+                    let y_bot = y_of(start_s);
+                    let mark = egui::Rect::from_min_max(
+                        egui::pos2(x0, y_top),
+                        egui::pos2(x1, y_bot.max(y_top + 2.0)),
+                    );
+                    painter.rect_filled(mark, 2.0, color);
+                }
             }
         }
     }

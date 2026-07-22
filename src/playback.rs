@@ -119,6 +119,35 @@ pub struct LoopState {
     pub pad_left_s: Option<f64>,
 }
 
+/// The looping segment, expressed for the falling-roll renderer so it can draw
+/// the *next* repeat's notes falling into view (see [`FallingView`] and
+/// `draw_falling`). Times are score seconds.
+#[derive(Clone, Copy)]
+pub struct LoopWrap {
+    pub seg_start_s: f64,
+    pub seg_end_s: f64,
+    /// One whole repeat's span *including* the silent pad: `(end - start) +
+    /// LOOP_PAD_S`. Ghost note copies are drawn shifted by this, so a copy sits
+    /// exactly where the real note lands one repeat later — which makes the
+    /// wrap seamless (the ghost's on-screen position at the wrap instant equals
+    /// the real note's position right after it).
+    pub period_s: f64,
+}
+
+/// What the falling-notes panel should render this frame. Normally the roll's
+/// "now" edge is just the playhead, but while a segment loops the playhead
+/// freezes at the segment end through the silent pad and then snaps back to the
+/// start — which alone would freeze the roll and then jump it. [`FallingView`]
+/// instead carries a *continuous* view time that keeps advancing through the
+/// pad, plus the looping segment so the renderer can wrap the next repeat into
+/// view; together they make the roll scroll seamlessly across the boundary.
+pub struct FallingView {
+    /// Score-time the roll's bottom (keyboard) edge sits at.
+    pub view_s: f64,
+    /// `Some` exactly while a segment loops.
+    pub wrap: Option<LoopWrap>,
+}
+
 /// How forgiving evaluation scoring is. The presets fix all three tolerances
 /// at once; `Custom` exposes them individually.
 #[derive(Clone, Copy, PartialEq)]
@@ -1254,6 +1283,39 @@ impl PlaybackEngine {
         self.loop_state.pad_left_s = None;
     }
 
+    /// True while silently padding between loop repeats — the breather where
+    /// nothing sounds. The keyboard's playback lighting is suppressed here so a
+    /// note that ends right on the segment boundary doesn't stay lit through
+    /// the pad even though `silence` already killed its sound.
+    pub fn in_loop_pad(&self) -> bool {
+        self.loop_state.pad_left_s.is_some()
+    }
+
+    /// View state for the falling-notes panel (see [`FallingView`]). Off a
+    /// loop this is simply the playhead; while looping it returns a continuous
+    /// view time (advancing through the pad rather than freezing) and the
+    /// looping segment, so `draw_falling` can wrap the next repeat into view
+    /// and the roll never stalls-then-jumps at the loop boundary.
+    pub fn falling_view(&self) -> FallingView {
+        if !self.loop_state.enabled {
+            return FallingView { view_s: self.playhead_s, wrap: None };
+        }
+        // During the pad the playhead is parked just *inside* the segment end
+        // (see `begin_loop_pad`), so `current_segment_index` still resolves to
+        // the looping segment.
+        let seg = &self.score.segments[self.current_segment_index()];
+        let (seg_start_s, seg_end_s) = (seg.start_s, seg.end_s);
+        let period_s = (seg_end_s - seg_start_s) + LOOP_PAD_S;
+        // While padding, drive the view off the countdown so it slides
+        // continuously from the segment end toward the wrap point
+        // (seg_end + LOOP_PAD_S); otherwise it's just the (advancing) playhead.
+        let view_s = match self.loop_state.pad_left_s {
+            Some(left) => seg_end_s + (LOOP_PAD_S - left).clamp(0.0, LOOP_PAD_S),
+            None => self.playhead_s,
+        };
+        FallingView { view_s, wrap: Some(LoopWrap { seg_start_s, seg_end_s, period_s }) }
+    }
+
     /// Segment containing the playhead (the last one at/after the end).
     pub fn current_segment_index(&self) -> usize {
         let n = self.score.segments.len(); // never 0: see Score::build_segments
@@ -1466,6 +1528,49 @@ mod tests {
         }
         assert!(!pb.loop_state.enabled);
         assert!(pb.playhead_s > 2.5);
+    }
+
+    #[test]
+    fn falling_view_advances_through_the_pad_and_wraps_by_one_period() {
+        // The roll's view time must keep sliding forward through the silent pad
+        // (never freeze) and, at the loop boundary, drop by exactly one period —
+        // which is what makes the next repeat's ghost notes, drawn one period
+        // ahead, land seamlessly where the real notes then continue.
+        let (mut pb, synth) = (engine(), Synth::disconnected());
+        pb.loop_state.enabled = true;
+        pb.loop_state.remaining = None; // loop segment "a" (0..2.5) forever
+        let dt = 0.1;
+        let period = 2.5 + LOOP_PAD_S;
+
+        // Off the pad the view is just the playhead, with the looping segment
+        // reported so the renderer can wrap.
+        let fv = pb.falling_view();
+        assert_eq!(fv.view_s, 0.0);
+        let w = fv.wrap.expect("looping => a wrap is present");
+        assert!((w.period_s - period).abs() < 1e-9);
+        assert_eq!((w.seg_start_s, w.seg_end_s), (0.0, 2.5));
+
+        let mut prev = pb.falling_view().view_s;
+        let mut wraps = 0;
+        for _ in 0..120 {
+            pb.tick(dt, &held(&[]), &[], 0, &synth);
+            let cur = pb.falling_view().view_s;
+            let d = cur - prev;
+            if d < 0.0 {
+                // The only permitted decrease is the wrap: it drops by ~one
+                // period, and only after the view has reached ~the wrap point,
+                // so the on-screen picture doesn't jump.
+                wraps += 1;
+                assert!((d + period).abs() <= dt + 1e-6, "wrap dropped {d:.3}, want ~-{period}");
+                assert!((prev - period).abs() <= dt + 1e-6, "wrap fired early at view {prev:.3}");
+            } else {
+                // Otherwise the view only ever creeps forward by one frame —
+                // including all the way through the pad (in_loop_pad true).
+                assert!(d <= dt * pb.speed as f64 + 1e-6, "view jumped forward {d:.3}");
+            }
+            prev = cur;
+        }
+        assert!(wraps >= 1, "expected at least one loop wrap within 12s");
     }
 
     #[test]
