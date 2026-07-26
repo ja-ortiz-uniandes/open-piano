@@ -124,23 +124,34 @@ through a public relay server, hole-punch a direct connection when the
 networks allow it, and silently fall back to the relay when they don't (strict
 NATs, VPNs, CGNAT). Traffic is end-to-end encrypted (QUIC/TLS) and the host is
 authenticated by that same key, so a leaked code is the only way for a
-stranger to join — generate a fresh one per session.
+stranger to join. Edit ▸ Preferences ▸ Networking ▸ **Reset my identity**
+mints a new one on demand if that ever happens.
 
 Details worth knowing:
 
-- **Invite codes are per-session.** A code stays valid while that instance is
-  hosting, and a new **Host session** click mints a new one. If the peer drops
-  off (network blip), the host keeps listening — the joiner just presses
-  **Join** again with the same code.
+- **Your invite code is stable across restarts.** It's derived from an
+  identity saved on your machine (Edit ▸ Preferences ▸ Networking), not
+  regenerated per session, so a peer who wrote it down can reach you again
+  after you close and reopen the app, update, or even crash — no need to
+  re-share a code every time.
+- **A dropped connection reconnects on its own.** If the peer drops (network
+  blip, the other app closed for a moment), both sides keep trying — the host
+  keeps listening, and the joiner keeps redialing in the background with no
+  time limit and no button to press. A **↻ Rejoin** button also appears next
+  to Host/Join for one-click manual restore of your last session, and
+  Preferences has an **auto-reconnect at startup** toggle if you'd rather it
+  happen automatically every launch.
 - **Joining right after hosting may take a few extra seconds.** The host's
   address is published to a lookup service when it starts; a joiner who pastes
   the code within seconds can race that. The app retries automatically
   ("Not reachable yet, retrying…" in the status bar).
-- **No internet?** A host that can't reach the relay servers falls back to a
-  longer (~250-character) invite code with its LAN addresses baked in, so
-  same-network play works fully offline. Joining accepts both code forms.
+- **No internet, or the short code won't connect?** Click **Same-network
+  code** next to the invite code — a longer (~250-character) code with this
+  machine's LAN addresses baked in, so play works fully offline as long as
+  you're both on the same Wi-Fi/LAN. Joining accepts either code form.
 - **Order doesn't matter for colors.** A 1 s color heartbeat syncs colors
-  whenever both ends are up (it also keeps the connection warm).
+  whenever both ends are up (it also keeps the connection warm), and each
+  side always renders the other in their real chosen color.
 - **Quick local test:** run the app twice on one machine, Host in one, paste
   the code in the other.
 
@@ -151,11 +162,37 @@ Details worth knowing:
 - **Status bar says "Contacting relay…" forever:** the machine can't reach the
   relay servers (offline, or a network blocking them). On a shared LAN it still
   works — the invite code carries direct addresses too.
-- **"Could not reach host":** the host closed the app (or clicked Host again,
-  which invalidates the old code). Ask for a fresh code.
+- **"Not reachable yet, retrying…" for a while:** the host closed the app or
+  hasn't opened it yet — since invite codes are now stable across restarts,
+  just have them click **Host session** again with the same code; the joiner
+  keeps redialing in the background and connects as soon as the host is back,
+  no fresh code needed. Click **Cancel** if you'd rather stop and try later.
 - Notes are sent as fire-and-forget datagrams (lowest latency over guaranteed
   delivery), so an occasional dropped packet is expected and harmless; a key
   that never lights at all is a connection issue, not packet loss.
+
+### If the app closes with no warning
+
+Every run writes a small log to `%LOCALAPPDATA%\open-piano\open-piano.log` —
+**Help ▸ View diagnostics log** shows it in-app (and flags it automatically
+next time you launch, with a dismissible banner, if the previous run didn't
+exit cleanly). **Help ▸ Open log folder** jumps straight to the file, handy
+when reporting a bug. It records what led up to a crash plus the crash itself
+(a Rust panic, or a native crash such as an access violation), even though the
+app has no console window to print to.
+
+If you're diagnosing a report with no log to go on (e.g. it happened before
+this existed), Windows itself already recorded a native crash — no setup
+needed:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000} -MaxEvents 50 |
+  Where-Object { $_.Message -match 'open-piano' } |
+  Format-List TimeCreated, Message
+```
+
+That reports the faulting module (`onnxruntime.dll` vs `open-piano.exe` vs a
+GPU driver), which is often the whole answer.
 
 ## Distribution & updates
 

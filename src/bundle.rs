@@ -42,6 +42,18 @@ const ONNXRUNTIME_DLL: &[u8] = include_bytes!("../onnxruntime.dll");
 /// and committed to the repo — no download step involved.
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
+/// `%LOCALAPPDATA%\open-piano` (or the system temp dir if `LOCALAPPDATA` is
+/// unset) — the per-user directory this app writes everything into: the
+/// extracted ONNX Runtime (below), `preferences.json` (`prefs.rs`), and the
+/// crash log + session markers (`diag.rs`). Pure env read + path join, no I/O
+/// — safe to call as the very first thing in `main`.
+pub fn app_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("open-piano")
+}
+
 /// Make the embedded ONNX Runtime loadable and set `ORT_DYLIB_PATH` to it.
 ///
 /// Called once from `main()` **before** the inference thread starts. This is
@@ -59,7 +71,7 @@ pub fn prepare_ort_dylib() {
     }
     match extract_dll() {
         Ok(path) => std::env::set_var("ORT_DYLIB_PATH", &path),
-        Err(e) => eprintln!("[bundle] could not extract onnxruntime.dll: {e}"),
+        Err(e) => crate::diag::log(crate::diag::Area::Bundle, format!("could not extract onnxruntime.dll: {e}")),
     }
 }
 
@@ -83,12 +95,7 @@ pub fn touch_runtime() {
 /// Write the embedded DLL to `<cache>/open-piano/onnxruntime-<hash>.dll` if
 /// it isn't there yet, and return its path.
 fn extract_dll() -> std::io::Result<PathBuf> {
-    // %LOCALAPPDATA% on Windows; fall back to the system temp dir so this
-    // still works in odd environments (it just may re-extract more often).
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("open-piano");
+    let dir = app_dir();
     fs::create_dir_all(&dir)?;
 
     let expected_hash = fnv1a(ONNXRUNTIME_DLL);

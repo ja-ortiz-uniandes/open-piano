@@ -16,6 +16,7 @@
 
 mod audio;
 mod bundle;
+mod diag;
 mod inference;
 mod input;
 mod midi;
@@ -31,6 +32,7 @@ mod update;
 
 use eframe::egui;
 
+use diag::Area;
 use std::path::PathBuf;
 
 use std::time::{Duration, Instant};
@@ -59,6 +61,12 @@ fn suppress_dll_error_dialogs() {
 }
 
 fn main() -> eframe::Result<()> {
+    // Absolute first statement: rotates/opens the crash log, detects whether
+    // the previous run exited uncleanly, and installs the panic hook + native
+    // (SEH) crash handler — so everything after this point, including ORT
+    // extraction and window creation, is covered. See diag.rs.
+    let last_run = diag::begin_session();
+
     #[cfg(windows)]
     suppress_dll_error_dialogs();
 
@@ -71,6 +79,10 @@ fn main() -> eframe::Result<()> {
     // inference thread (see inference.rs) where a slow or failing load can't
     // block the GUI.
     bundle::prepare_ort_dylib();
+    diag::log(
+        Area::Bundle,
+        format!("ORT_DYLIB_PATH = {}", std::env::var("ORT_DYLIB_PATH").unwrap_or_default()),
+    );
 
     let icon = eframe::icon_data::from_png_bytes(bundle::ICON_PNG)
         .expect("assets/icon.png must be a valid PNG (embedded at compile time)");
@@ -104,11 +116,16 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "open-piano",
         options,
-        Box::new(move |_cc| Ok(Box::new(PianoApp::new(prefs)))),
-    )
+        Box::new(move |_cc| Ok(Box::new(PianoApp::new(prefs, last_run)))),
+    );
+    // Belt-and-suspenders: `on_exit` already marks a clean exit, but this
+    // covers a return path that skips it (e.g. `run_native` erroring out
+    // before the app ever starts).
+    diag::mark_clean_exit();
+    result
 }
 
 /// The version compiled into this build (from Cargo.toml) — what the About
@@ -119,12 +136,19 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default note colors (sRGB). The live *local* color is seeded from
 /// [`prefs::Prefs`] (user-configurable and persisted); these constants remain
 /// the compile-time fallbacks — `DEFAULT_LOCAL_COLOR` also colors a loaded
-/// file's Local track (see `score.rs`), and `DEFAULT_REMOTE_COLOR` is what the
-/// peer always renders as locally: we deliberately ignore the peer's announced
-/// color (see the `Packet::Color` handler) so two un-customized peers — both
-/// defaulting `local_color` to the same red — never render identically.
+/// file's Local track (see `score.rs`). `DEFAULT_REMOTE_COLOR` is only the
+/// placeholder shown for the peer until their first `Packet::Color`
+/// announcement arrives (~1s, see `COLOR_HEARTBEAT`); after that, the peer is
+/// rendered in their real announced color, identically on both screens, per
+/// the golden rule in CLAUDE.md. `DEFAULT_LOCAL_COLOR_FALLBACK` is the
+/// deterministic substitute a *joiner* switches to (see the `Packet::Color`
+/// handler in `pump_network`) when both sides are still at the untouched
+/// `DEFAULT_LOCAL_COLOR` default and would otherwise be indistinguishable —
+/// only the joiner ever shifts, so this needs no coordination beyond each
+/// side already knowing `is_host`.
 const DEFAULT_LOCAL_COLOR: [u8; 3] = [220, 60, 60]; // warm red
-const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (the peer, always)
+const DEFAULT_REMOTE_COLOR: [u8; 3] = [60, 110, 230]; // blue (placeholder until announced)
+const DEFAULT_LOCAL_COLOR_FALLBACK: [u8; 3] = [210, 150, 40]; // amber (joiner-side default collision fallback)
 
 /// Placeholder name shown for the peer until it announces its own (see the
 /// `Packet::Name` heartbeat). Transient — overwritten on the first announce.
@@ -134,6 +158,16 @@ const DEFAULT_REMOTE_NAME: &str = "Peer";
 /// color syncs regardless of who connects first, and recovers from a dropped
 /// announcement, at a negligible 1 datagram/sec.
 const COLOR_HEARTBEAT: Duration = Duration::from_secs(1);
+
+/// How stale `prefs.last_join_at` can be before the `↻ Rejoin` button (and
+/// `auto_rejoin`) stop offering to restore it — a session from last week
+/// isn't "the same conversation", it's a new one.
+const REJOIN_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+/// With `auto_rejoin` off, how recent the last session must be for an
+/// *unclean* exit (§1.4) to still auto-restore it. Short by design — this is
+/// "the crash didn't happen", not a standing instruction to keep reconnecting
+/// to whatever was open a day ago.
+const REJOIN_AFTER_CRASH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// After a local click-table edit, ignore incoming (stale) `MetroBeatTable`
 /// snapshots for this long so a host's ≤ RTT-old heartbeat echo can't yank a
@@ -190,6 +224,91 @@ const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 620.0];
 /// and a tap there starts a resize instead of closing (F23).
 const TITLEBAR_H: f32 = 30.0;
 
+/// Ceiling on manual window-drag speed, points per second. A SAFETY NET for
+/// stale-grab / contact-swap failure modes (see `TitleDrag`, `touch_driving`),
+/// not the primary fix — every legitimate input passes through untouched.
+/// Calibration: a deliberately fast edge-to-edge swipe on a tablet-class touch
+/// panel takes a few tenths of a second (a few thousand pt/s); dragging a
+/// window is slower than swiping. A teleport moves hundreds of points inside
+/// one 16 ms frame — tens of thousands of pt/s. 6000 leaves headroom over the
+/// fastest plausible real drag while still catching a teleport by an order of
+/// magnitude. Flagged in the plan as worth re-checking empirically on real
+/// hardware before it ships silently — the debug-only breadcrumb below is
+/// that check.
+const MAX_DRAG_SPEED: f32 = 6000.0;
+/// `stable_dt` is clamped before it scales the cap: a frame hitch (a slow ONNX
+/// frame, a resume-from-sleep frame) must not widen the gate into uselessness,
+/// and a very fast frame must not shrink it below a usable step. 25 pt / 400 pt
+/// at the cap above.
+const MIN_DRAG_DT: f32 = 1.0 / 240.0;
+const MAX_DRAG_DT: f32 = 1.0 / 15.0;
+
+/// Clamp a single-frame drag step (`from` -> `to`) to `MAX_DRAG_SPEED`,
+/// scaled by this frame's duration. Shared by the title-bar move-drag.
+fn clamp_drag_step(from: egui::Pos2, to: egui::Pos2, stable_dt: f32) -> egui::Pos2 {
+    let max = MAX_DRAG_SPEED * stable_dt.clamp(MIN_DRAG_DT, MAX_DRAG_DT);
+    let d = to - from;
+    if d.length() <= max {
+        to
+    } else {
+        from + d.normalized() * max
+    }
+}
+
+/// Same cap, for a resize handle's incremental `drag_delta()` rather than an
+/// absolute grab-relative offset — `drag_delta()` is immune to grab
+/// staleness but not to a contact swap.
+fn clamp_drag_vec(delta: egui::Vec2, stable_dt: f32) -> egui::Vec2 {
+    let max = MAX_DRAG_SPEED * stable_dt.clamp(MIN_DRAG_DT, MAX_DRAG_DT);
+    if delta.length() <= max {
+        delta
+    } else {
+        delta.normalized() * max
+    }
+}
+
+/// The touch contact that best explains `pointer` this frame: the
+/// Start/Move contact nearest to it. `None` when the frame carried no touch
+/// events at all — i.e. a mouse/trackpad drag, which needs none of this.
+fn touch_driving(ctx: &egui::Context, pointer: egui::Pos2) -> Option<(egui::TouchDeviceId, egui::TouchId)> {
+    ctx.input(|i| {
+        i.raw
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Touch { device_id, id, phase, pos, .. }
+                    if matches!(phase, egui::TouchPhase::Start | egui::TouchPhase::Move) =>
+                {
+                    Some((*device_id, *id, pos.distance(pointer)))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(device_id, id, _)| (device_id, id))
+    })
+}
+
+/// This frame's news about one touch contact: latest position (`None` = no
+/// event for it this frame — hold still) and whether it ended or was
+/// cancelled.
+fn touch_update(ctx: &egui::Context, who: (egui::TouchDeviceId, egui::TouchId)) -> (Option<egui::Pos2>, bool) {
+    ctx.input(|i| {
+        let mut pos = None;
+        let mut ended = false;
+        for e in &i.raw.events {
+            if let egui::Event::Touch { device_id, id, phase, pos: p, .. } = e {
+                if (*device_id, *id) == who {
+                    match phase {
+                        egui::TouchPhase::Start | egui::TouchPhase::Move => pos = Some(*p),
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => ended = true,
+                    }
+                }
+            }
+        }
+        (pos, ended)
+    })
+}
+
 /// With a score loaded, the space not taken by the keyboard splits between
 /// the falling-notes panel (above the keys) and the history roll (below).
 /// Biased toward the falling notes — the forward-looking practice aid — over
@@ -203,6 +322,22 @@ const SAVE_SHORTCUT: egui::KeyboardShortcut =
 /// Ctrl+, (Cmd+, on mac) opens Edit ▸ Preferences — the conventional shortcut.
 const PREFS_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+
+/// Debug-only test aids for diag.rs (see plan §Stage 1 verification): force a
+/// real panic on demand so the panic hook, backtrace capture, and crash-chip
+/// path can be exercised without waiting for a real bug. Never compiled into
+/// a release build (`cfg(debug_assertions)`), and unlikely enough to never
+/// collide with a real chord.
+#[cfg(debug_assertions)]
+const DEBUG_PANIC_GUI_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers { ctrl: true, alt: true, shift: true, mac_cmd: false, command: false },
+    egui::Key::F11,
+);
+#[cfg(debug_assertions)]
+const DEBUG_PANIC_INFERENCE_SHORTCUT: egui::KeyboardShortcut = egui::KeyboardShortcut::new(
+    egui::Modifiers { ctrl: true, alt: true, shift: true, mac_cmd: false, command: false },
+    egui::Key::F12,
+);
 
 /// Metronome tempo bounds (BPM), shared by the UI control and the wire clamp.
 const MIN_BPM: u16 = 30;
@@ -304,12 +439,13 @@ enum PrefsSection {
     RollBehavior,
     AudioMic,
     Metronome,
+    Networking,
     Advanced,
 }
 
 impl PrefsSection {
     /// Sidebar order.
-    const ALL: [PrefsSection; 8] = [
+    const ALL: [PrefsSection; 9] = [
         PrefsSection::StartupWindow,
         PrefsSection::RollHistory,
         PrefsSection::Appearance,
@@ -317,6 +453,7 @@ impl PrefsSection {
         PrefsSection::RollBehavior,
         PrefsSection::AudioMic,
         PrefsSection::Metronome,
+        PrefsSection::Networking,
         PrefsSection::Advanced,
     ];
 
@@ -329,9 +466,65 @@ impl PrefsSection {
             PrefsSection::RollBehavior => "Roll behavior",
             PrefsSection::AudioMic => "Audio / mic",
             PrefsSection::Metronome => "Metronome",
+            PrefsSection::Networking => "Networking",
             PrefsSection::Advanced => "Advanced",
         }
     }
+}
+
+/// State for an active title-bar move drag (see `title_bar` /
+/// `handle_titlebar_drag`). We drive the frameless window ourselves every
+/// frame from egui's drag deltas, instead of handing off to Windows' native
+/// SC_MOVE modal loop (`ViewportCommand::StartDrag`) — that native loop is
+/// built around real mouse-button state and does not sustain a
+/// touch-originated gesture, which is why touch move was broken.
+struct TitleDrag {
+    /// The pointer's position *relative to the window's client origin* at the
+    /// moment the drag started (or was last re-pinned), held constant
+    /// in-between. Each frame we solve the window origin absolutely
+    /// (`outer_rect.min + pointer_local - grab`) so the grab point stays
+    /// pinned under the pointer. Absolute (not delta-accumulated), so
+    /// re-issuing the same command is idempotent and a one-frame lag in the
+    /// reported outer rect self-corrects instead of feeding the window's own
+    /// motion back in as jitter.
+    grab: egui::Pos2,
+    /// `pixels_per_point` when `grab` was taken. A scale-factor change
+    /// mid-drag (docking the Surface, crossing onto a differently-scaled
+    /// monitor) invalidates `grab` by a FACTOR, not an offset.
+    ppp: f32,
+    /// `maximized` when `grab` was taken — restoring mid-drag changes the
+    /// window size, so the same finger is over a different local point.
+    maximized: bool,
+    /// The touch contact actually driving this gesture, if it started as
+    /// touch. `None` for a mouse/trackpad drag, or touch that hasn't
+    /// identified its driving contact yet.
+    touch: Option<(egui::TouchDeviceId, egui::TouchId)>,
+}
+
+/// State for an active edge/corner resize drag (see `resize_handles`).
+struct ResizeDrag {
+    /// Index into `resize_handles`' handle array — a seed is only reused when
+    /// this matches, so releasing one handle and grabbing a different one
+    /// (or a contact swap mid-gesture) can't bleed the wrong handle's
+    /// accumulated state into this one.
+    handle_idx: usize,
+    /// Accumulated target outer position.
+    pos: egui::Pos2,
+    /// Accumulated target inner size.
+    size: egui::Vec2,
+    /// `pixels_per_point` when this seed was taken; a change re-seeds from
+    /// the live viewport rect instead of continuing from stale values.
+    ppp: f32,
+}
+
+/// The host's current invite-code snapshot (see `net::NetEvent::Ticket`).
+/// `short` is the UX-friendly bare endpoint id, available once a self-resolve
+/// confirms discovery can actually serve it; `full` is the strictly-more-
+/// dialable (but uglier) ticket, available from the moment the endpoint
+/// binds and always offered as the "same-network code".
+struct Invite {
+    short: Option<String>,
+    full: String,
 }
 
 struct PianoApp {
@@ -446,11 +639,12 @@ struct PianoApp {
 
     // --- colors (sRGB) ---
     local_color: [u8; 3], // our notes; editable, broadcast to the peer
-    // The color the peer's notes are drawn in *on this screen*. Fixed to
-    // `DEFAULT_REMOTE_COLOR`: the peer's announced `Packet::Color` is
-    // deliberately discarded on receive (every fresh install defaults to the
-    // same red, so honoring it would render both sides identically). Not "the
-    // peer's chosen color".
+    // The peer's actual chosen color, applied from their `Packet::Color`
+    // announcement as soon as it arrives (within one `COLOR_HEARTBEAT`).
+    // `DEFAULT_REMOTE_COLOR` is only the placeholder shown before that first
+    // announcement lands. See the `Packet::Color` handler in `pump_network`
+    // for the deterministic, joiner-only fallback that keeps two
+    // un-customized peers visually distinct without needing this to lie.
     remote_color: [u8; 3],
     last_color_send: Instant,
 
@@ -459,9 +653,10 @@ struct PianoApp {
     remote_name: String, // the peer's name; received from the peer
 
     // --- networking (see net.rs: host/join with a one-string invite code) ---
-    // Our invite code, once the net thread reports it (hosting only). Shown
-    // with a Copy button so it can be pasted to the other player.
-    my_ticket: Option<String>,
+    // Our current invite-code snapshot (hosting only) — mirrors whatever
+    // `net::NetEvent::Ticket` last published; a later, better snapshot just
+    // overwrites this one (see `pump_network`), no upgrade logic needed here.
+    invite: Option<Invite>,
     // The paste box for an invite code received from a host.
     join_ticket: String,
     peer: Option<Peer>,
@@ -520,6 +715,19 @@ struct PianoApp {
 
     // Whether the About window is open (toggled from the status bar).
     show_about: bool,
+
+    // --- crash diagnostics (see diag.rs) ---
+    // Set at startup when the *previous* run of this app never got to clean up
+    // after itself (crash, hang, Task-Manager kill). Drives the dismissible
+    // status-bar chip; cleared on `[X]` without touching the log itself.
+    last_unclean: Option<diag::UncleanRun>,
+    // Whether the "Crash report" window (the log tail since `last_unclean`'s
+    // offset) is open.
+    show_crash_report: bool,
+    // Byte offset into the log that `crash_report_window` reads from — the
+    // relevant session's start when opened from the crash chip, or the file's
+    // last 64 KiB when opened generically from Help ▸ View diagnostics log.
+    crash_report_offset: u64,
 
     // --- persisted user preferences (see prefs.rs + Edit ▸ Preferences) ---
     // Loaded on startup; every Preferences edit mutates this, applies live to
@@ -604,18 +812,12 @@ struct PianoApp {
     // built around real mouse-button state and does not sustain a
     // touch-originated gesture, which is why touch move was broken.
     //
-    // Grab offset for an active title-bar move drag: the pointer's position
-    // *relative to the window's client origin* at the moment the drag started,
-    // held constant for the whole gesture. Each frame we solve the window
-    // origin absolutely (`outer_rect.min + pointer_local - grab`) so the grab
-    // point stays pinned under the pointer. Absolute (not delta-accumulated),
-    // so re-issuing the same command is idempotent and a one-frame lag in the
-    // reported outer rect self-corrects instead of feeding the window's own
-    // motion back in as jitter. `None` when not moving.
-    titlebar_drag: Option<egui::Pos2>,
-    // Target (outer position, inner size) accumulated across an active
-    // edge/corner resize drag; `None` when not resizing.
-    resize_drag: Option<(egui::Pos2, egui::Vec2)>,
+    // State for an active title-bar move drag; `None` when not moving. See
+    // `TitleDrag` for why each field exists.
+    titlebar_drag: Option<TitleDrag>,
+    // State for an active edge/corner resize drag; `None` when not resizing.
+    // See `ResizeDrag` for why each field exists.
+    resize_drag: Option<ResizeDrag>,
     // Whether recent input came from touch (vs. mouse/trackpad). Drives the
     // enlarged, visible resize-handle affordance so it only appears in actual
     // tablet use. Updated once per frame from raw egui events; left unchanged
@@ -651,7 +853,7 @@ struct PianoApp {
 }
 
 impl PianoApp {
-    fn new(prefs: prefs::Prefs) -> Self {
+    fn new(prefs: prefs::Prefs, last_run: diag::LastRun) -> Self {
         // Preferences drive the startup seeds below (and the input backend's
         // initial tunables). Loaded by `main()` — which also sized the OS
         // window from them — and passed in.
@@ -721,7 +923,7 @@ impl PianoApp {
             last_color_send: Instant::now(),
             local_name: prefs.local_name.clone(),
             remote_name: DEFAULT_REMOTE_NAME.to_string(),
-            my_ticket: None,
+            invite: None,
             join_ticket: String::new(),
             peer: None,
             net_status: "Not connected".to_string(),
@@ -740,6 +942,9 @@ impl PianoApp {
             // state each frame (see `update_controls`).
             updater: update::start(),
             show_about: false,
+            last_unclean: last_run.unclean,
+            show_crash_report: false,
+            crash_report_offset: 0,
             prefs,
             show_prefs: false,
             prefs_section: PrefsSection::StartupWindow,
@@ -784,6 +989,39 @@ impl PianoApp {
         // status — startup never blocks on a stale path.
         if let Some(path) = reopen_path {
             app.load_score_path(path);
+        } else {
+            // Session restore (4.3) — mutually exclusive with the file reopen
+            // above (playback and live P2P already are; see `net_enabled`).
+            // Two independent triggers, checked in order:
+            //   1. `auto_rejoin` (explicit opt-in): restore whenever the last
+            //      session is still within `REJOIN_MAX_AGE`.
+            //   2. The crash exception (only when `auto_rejoin` is off, so the
+            //      two triggers never double up): the previous exit was
+            //      unclean (§1.4) *and* the last session is within the much
+            //      tighter `REJOIN_AFTER_CRASH_WINDOW` — "the crash didn't
+            //      happen", not a standing instruction.
+            let age_s = app.prefs.last_join_at.map(|t| unix_now().saturating_sub(t));
+            let has_session = age_s.is_some()
+                && (app.prefs.last_session_was_host || app.prefs.last_join_code.is_some());
+            let restore = if app.prefs.auto_rejoin {
+                has_session && age_s.is_some_and(|s| s <= REJOIN_MAX_AGE.as_secs())
+            } else {
+                has_session
+                    && app.last_unclean.is_some()
+                    && age_s.is_some_and(|s| s <= REJOIN_AFTER_CRASH_WINDOW.as_secs())
+            };
+            if restore {
+                let after_crash = !app.prefs.auto_rejoin;
+                if app.prefs.last_session_was_host {
+                    app.host();
+                } else if let Some(code) = app.prefs.last_join_code.clone() {
+                    app.join_ticket = code;
+                    app.join();
+                }
+                if after_crash {
+                    app.net_status = "Reconnecting after an unexpected exit…".to_string();
+                }
+            }
         }
         app
     }
@@ -934,7 +1172,8 @@ impl PianoApp {
     /// old `Peer` shuts its net thread down); the invite code arrives async
     /// as a `NetEvent::Ticket`.
     fn host(&mut self) {
-        self.my_ticket = None;
+        diag::log(Area::Ui, "host() clicked");
+        self.invite = None;
         self.clear_remote_keys();
         // Fresh session: don't feed a brand-new peer the manual breaks of a
         // previous, unrelated session (F1). The breaks stay on our own roll;
@@ -947,7 +1186,7 @@ impl PianoApp {
         self.peer_connected = false;
         // Fresh session: re-anchor the metronome (we're the authority now).
         self.metro.next_beat_at = None;
-        self.peer = Some(net::host());
+        self.peer = Some(net::host(Some(self.endpoint_secret())));
     }
 
     /// Join a host from the pasted invite code. Progress and errors (bad
@@ -958,7 +1197,8 @@ impl PianoApp {
             self.net_status = "Paste an invite code first".into();
             return;
         }
-        self.my_ticket = None;
+        diag::log(Area::Ui, "join() clicked");
+        self.invite = None;
         self.clear_remote_keys();
         // Fresh session: don't leak a previous session's manual breaks (F1).
         self.manual_separators.clear();
@@ -969,7 +1209,22 @@ impl PianoApp {
         self.peer_connected = false;
         // As a follower we no longer own the grid; wait for the host's markers.
         self.metro.next_beat_at = None;
-        self.peer = Some(net::join(code));
+        self.peer = Some(net::join(code, Some(self.endpoint_secret())));
+    }
+
+    /// This installation's persisted iroh identity, generating one lazily on
+    /// first use (never at startup — a user who never networks never has a
+    /// key on disk). Saved immediately, not debounced: a crash before the
+    /// next debounced save would orphan the invite code we're about to hand
+    /// out under this identity.
+    fn endpoint_secret(&mut self) -> [u8; 32] {
+        if let Some(bytes) = self.prefs.endpoint_secret_bytes() {
+            return bytes;
+        }
+        let bytes = net::generate_secret();
+        self.prefs.set_endpoint_secret_bytes(bytes);
+        self.prefs.save();
+        bytes
     }
 
     /// Unlight every remote key and stop the synth voicing it. Needed whenever
@@ -1345,10 +1600,11 @@ impl PianoApp {
     /// Load a score file into a playback engine — the dialog-free tail of
     /// [`open_score`], reused by the startup "reopen last file" path.
     fn load_score_path(&mut self, path: PathBuf) {
+        diag::log(Area::Ui, format!("load_score_path({})", path.display()));
         match score::Score::load(&path) {
             Ok(s) => {
                 self.peer = None;
-                self.my_ticket = None;
+                self.invite = None;
                 self.clear_remote_keys();
                 self.net_status = "Not connected".to_string();
                 if let Some(pb) = &mut self.playback {
@@ -2080,20 +2336,101 @@ impl PianoApp {
             {
                 self.host();
             }
-            // `my_ticket` is always `None` while a file is open (cleared
-            // in `open_score`), so this branch never renders mid-file.
-            if let Some(code) = &self.my_ticket {
-                if ui
-                    .button("📋 Copy invite code")
-                    .on_hover_text("Copy the code to the clipboard, then send it to the other player")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(code.clone());
+            // One-click restore of the last successful session (4.3): shown
+            // only while not already networked, and only within
+            // `REJOIN_MAX_AGE` — a session from last week isn't worth
+            // offering to restore. Host and joiner share one button: hosting
+            // just means listening again under the same persisted identity
+            // (4.2), so no code is needed for that branch.
+            if self.peer.is_none() {
+                if let Some(age_s) = self.prefs.last_join_at.map(|t| unix_now().saturating_sub(t)) {
+                    let restorable = self.prefs.last_session_was_host || self.prefs.last_join_code.is_some();
+                    if restorable && age_s <= REJOIN_MAX_AGE.as_secs() {
+                        let hover = if self.prefs.last_session_was_host {
+                            format!("Start hosting again under your last invite code · {}", format_ago(age_s))
+                        } else {
+                            let preview: String =
+                                self.prefs.last_join_code.as_deref().unwrap_or("").chars().take(12).collect();
+                            format!("{preview}… · {}", format_ago(age_s))
+                        };
+                        if ui
+                            .add_enabled(net_enabled, egui::Button::new("↻ Rejoin"))
+                            .on_hover_text(hover)
+                            .on_disabled_hover_text(disabled_hint)
+                            .clicked()
+                        {
+                            if self.prefs.last_session_was_host {
+                                self.host();
+                            } else if let Some(code) = self.prefs.last_join_code.clone() {
+                                self.join_ticket = code;
+                                self.join();
+                            }
+                        }
+                    }
                 }
-                // The code is 64 hex chars (or ~250 for the LAN-only
-                // fallback ticket); show just enough to see it exists.
-                // The Copy button is the real interface.
-                ui.weak(format!("{}…", &code[..code.len().min(12)]));
+            }
+            // `invite` is always `None` while a file is open (cleared in
+            // `open_score`), so none of these branches render mid-file.
+            // Three explicit states — the first being the key UX fix: never
+            // silently hand out the long code as if it were the answer.
+            match &self.invite {
+                None if self.is_host && self.peer.is_some() => {
+                    // 1. Hosting, but the net thread hasn't published anything
+                    // yet (the very first frame or two of a session).
+                    ui.spinner();
+                    ui.weak("Preparing invite code…");
+                }
+                Some(invite) => {
+                    let resp = ui.add_enabled(invite.short.is_some(), egui::Button::new("📋 Copy invite code"));
+                    match &invite.short {
+                        // 2. The short code is confirmed dialable.
+                        Some(code) => {
+                            if resp
+                                .on_hover_text("Copy the code to the clipboard, then send it to the other player")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(code.clone());
+                            }
+                            // Just enough to see it exists (64 hex chars) —
+                            // the Copy button is the real interface. `chars()`,
+                            // not a byte slice: safe even if a future code
+                            // form isn't pure ASCII.
+                            let preview: String = code.chars().take(12).collect();
+                            ui.weak(format!("{preview}…"));
+                        }
+                        // 3. Only the provisional long ticket is available so
+                        // far — disabled, not silently substituted, so it's
+                        // never mistaken for the real answer.
+                        None => {
+                            resp.on_disabled_hover_text(
+                                "Waiting for a relay — this code works across \
+                                 the internet once it's ready",
+                            );
+                        }
+                    }
+                    if ui
+                        .small_button("Same-network code")
+                        .on_hover_text(
+                            "A much longer code carrying this machine's local \
+                             addresses. Use it if the short code doesn't work \
+                             and you're both on the same Wi-Fi or LAN.",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(invite.full.clone());
+                    }
+                }
+                None => {}
+            }
+            // The joiner backoff now runs forever (no permanent give-up state,
+            // see `net::run_join`); without this the only way to stop it was
+            // pressing Join again.
+            if self.peer.is_some() && !self.is_host && !self.peer_connected {
+                ui.separator();
+                if ui.small_button("Cancel").on_hover_text("Stop trying to connect").clicked() {
+                    self.peer = None;
+                    self.net_status = "Not connected".to_string();
+                }
             }
             ui.separator();
             ui.label("Invite code:");
@@ -2184,11 +2521,6 @@ impl PianoApp {
             ui.label(format!("Peer: {}", self.remote_name));
             let (r, g, b) = (self.remote_color[0], self.remote_color[1], self.remote_color[2]);
             ui.colored_label(egui::Color32::from_rgb(r, g, b), "■");
-            // The peer is always drawn in the fixed remote color locally — the
-            // peer's own color choice is intentionally not applied (see the
-            // `Packet::Color` handler in pump_network), so this isn't "their"
-            // color, it's the color they appear in on your screen (L6).
-            ui.weak("(peer color on your screen)");
         });
         // ---- Synth volume / mute (screen + peer sources) ----
         ui.add_space(2.0);
@@ -2633,31 +2965,22 @@ impl PianoApp {
                 if drag.double_clicked() {
                     let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
-                } else if drag.dragged() {
+                } else if drag.dragged() && drag.is_pointer_button_down_on() {
                     // Drive the window ourselves each frame instead of handing
                     // off to the native SC_MOVE loop (which doesn't sustain a
                     // touch gesture — the actual cause of broken touch-move).
-                    // Skip while maximized: repositioning a maximized window is
-                    // meaningless, and the double-click above already toggles it.
-                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    if let Some(local) = drag.interact_pointer_pos() {
-                        // Pin the grab offset once, on the first drag frame.
-                        let grab = *self.titlebar_drag.get_or_insert(local);
-                        if !maximized {
-                            // Solve the window origin absolutely so the grab
-                            // point stays under the pointer. Delta-accumulation
-                            // (the old approach) measured pointer motion in
-                            // window-local space, which flips sign as the
-                            // window moves under it — a feedback loop that
-                            // jittered. Reading the live outer rect each frame
-                            // makes this idempotent instead.
-                            if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-                                let target = outer.min + (local - grab);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target));
-                            }
-                        }
-                    }
-                } else {
+                    self.handle_titlebar_drag(ctx, &drag);
+                }
+                // Clear on EVERY frame the gesture isn't live — including the
+                // `double_clicked()` frame, which the old if/else-if/else
+                // chain skipped. A stale grab surviving a double-click meant
+                // the *next* drag pinned to the previous gesture's grab point
+                // and teleported the window by the distance between them —
+                // trivially reachable on touch, where tap-tap-drag is a
+                // natural gesture and egui's double-click tolerance is loose.
+                // `is_pointer_button_down_on()` is the belt to `dragged()`'s
+                // braces.
+                if !drag.dragged() || !drag.is_pointer_button_down_on() {
                     self.titlebar_drag = None;
                 }
 
@@ -2713,6 +3036,7 @@ impl PianoApp {
                         egui::menu::bar(ui, |ui| {
                             self.file_menu(ui);
                             self.edit_menu(ui);
+                            self.help_menu(ui);
                             self.unsaved_chip(ui);
                         });
                     },
@@ -2720,6 +3044,101 @@ impl PianoApp {
             });
 
         self.resize_handles(ctx);
+    }
+
+    /// Drive the frameless window's move-drag from `drag` (already confirmed
+    /// `dragged() && is_pointer_button_down_on()` by the caller). Extracted
+    /// from `title_bar` for clarity — see `TitleDrag` for what each field
+    /// means and why.
+    fn handle_titlebar_drag(&mut self, ctx: &egui::Context, drag: &egui::Response) {
+        // A `None` frame used to silently retain the grab and resume from a
+        // far-away point on the next `Some`; clear and skip this frame's move
+        // instead.
+        let Some(synth_pos) = drag.interact_pointer_pos() else {
+            self.titlebar_drag = None;
+            return;
+        };
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let ppp = ctx.input(|i| i.pixels_per_point);
+
+        // On the first frame of a touch gesture, adopt the touch contact
+        // nearest the synthesized pointer as the one actually driving it;
+        // thereafter keep reading THAT contact's own position, not egui's
+        // synthesized pointer — a palm resting elsewhere can wobble the
+        // latter (see `touch_driving`'s doc comment). `touch_mode` gates this
+        // off entirely for a mouse/trackpad session.
+        let touch = if self.touch_mode {
+            self.titlebar_drag.as_ref().and_then(|d| d.touch).or_else(|| touch_driving(ctx, synth_pos))
+        } else {
+            None
+        };
+        let local = match touch {
+            Some(who) => match touch_update(ctx, who) {
+                (_, true) => {
+                    // The driving contact ended — clear and stop, regardless
+                    // of what egui's synthesized pointer thinks is going on.
+                    self.titlebar_drag = None;
+                    return;
+                }
+                (Some(p), false) => p,
+                // No event for this contact this frame: hold still rather
+                // than snap to the (possibly palm-driven) synthesized pointer.
+                (None, false) => return,
+            },
+            None => synth_pos,
+        };
+
+        // Re-pin on a scale-factor or maximize-state change: `grab` was
+        // measured in the OLD frame, so it's stale by a FACTOR (DPI) or by
+        // the size delta (restore) now. One frame of not-following is
+        // invisible; the alternative is a jump proportional to window
+        // position (DPI) or to the size delta (restore).
+        let needs_repin = match &self.titlebar_drag {
+            Some(d) => d.ppp != ppp || d.maximized != maximized,
+            None => true,
+        };
+        if needs_repin {
+            self.titlebar_drag = Some(TitleDrag { grab: local, ppp, maximized, touch });
+            return;
+        }
+        let d = self.titlebar_drag.as_mut().expect("just checked Some above");
+        d.touch = touch;
+
+        if maximized {
+            return; // repositioning a maximized window is meaningless
+        }
+        let Some(outer) = ctx.input(|i| i.viewport().outer_rect) else { return };
+        // Solve the window origin absolutely so the grab point stays under
+        // the pointer. Delta-accumulation (the old approach) measured
+        // pointer motion in window-local space, which flips sign as the
+        // window moves under it — a feedback loop that jittered. Reading the
+        // live outer rect each frame makes this idempotent instead.
+        let target = outer.min + (local - d.grab);
+        let stable_dt = ctx.input(|i| i.stable_dt);
+        let applied = clamp_drag_step(outer.min, target, stable_dt);
+        if applied != target {
+            // Clamp and RE-PIN, do not abort. Without the re-pin the window
+            // creeps toward the bogus target at the capped rate for many
+            // frames — the cap would convert a teleport into a slow slide,
+            // which looks worse (like the app is possessed). Aborting would
+            // drop the window mid-gesture on a false positive, a visible
+            // regression for a case that's supposed to work.
+            d.grab = local - (applied - outer.min);
+            // Temporary, debug-only: learn empirically whether
+            // MAX_DRAG_SPEED is right on real hardware before it ships
+            // silently (per the plan, this is a safety net whose threshold
+            // hasn't been hardware-validated yet).
+            #[cfg(debug_assertions)]
+            diag::log(
+                Area::Ui,
+                format!(
+                    "titlebar drag speed cap fired: wanted {:.0}pt/s, capped to {:.0}pt/s",
+                    (target - outer.min).length() / stable_dt.clamp(MIN_DRAG_DT, MAX_DRAG_DT),
+                    (applied - outer.min).length() / stable_dt.clamp(MIN_DRAG_DT, MAX_DRAG_DT),
+                ),
+            );
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(applied));
     }
 
     /// Shared close decision for both the custom ✕ and the OS close path
@@ -2749,10 +3168,12 @@ impl PianoApp {
     /// `process::exit`, which runs no destructors — so flush a pending debounced
     /// prefs save (F12) and finalize any in-progress recording (C1) first.
     fn perform_restart(&mut self) -> ! {
+        diag::log(Area::Ui, "perform_restart()");
         if self.prefs_save_due.take().is_some() {
             self.prefs.save();
         }
         self.input.recorder.shutdown();
+        diag::mark_clean_exit();
         update::restart()
     }
 
@@ -2859,11 +3280,8 @@ impl PianoApp {
 
             if resp.dragged() {
                 still_dragging = true;
-                // Seed the accumulated target from the live outer position +
-                // inner size on the first drag frame; thereafter apply deltas
-                // to our own target so a lagging reported rect can't drop or
-                // double-count movement.
-                let seed = self.resize_drag.or_else(|| {
+                let ppp = ctx.input(|i| i.pixels_per_point);
+                let live_seed = || {
                     ctx.input(|i| {
                         let vp = i.viewport();
                         match (vp.outer_rect, vp.inner_rect) {
@@ -2871,9 +3289,26 @@ impl PianoApp {
                             _ => None,
                         }
                     })
-                });
+                };
+                // Seed the accumulated target from the live outer position +
+                // inner size on the first drag frame; thereafter apply deltas
+                // to our own target so a lagging reported rect can't drop or
+                // double-count movement. Only reused when it's from the SAME
+                // handle at the SAME scale factor — otherwise this is either
+                // cross-handle bleed (a different handle's seed leaking in)
+                // or stale by a DPI factor, so re-seed from the live rect
+                // instead of continuing from either.
+                let seed = match &self.resize_drag {
+                    Some(s) if s.handle_idx == i && s.ppp == ppp => Some((s.pos, s.size)),
+                    _ => live_seed(),
+                };
                 if let Some((mut pos, mut size)) = seed {
-                    let d = resp.drag_delta();
+                    // `drag_delta()` is immune to grab staleness but not to a
+                    // contact swap (a palm taking over from the intended
+                    // finger) — cap it the same way the title-bar drag caps
+                    // its absolute step.
+                    let stable_dt = ctx.input(|i| i.stable_dt);
+                    let d = clamp_drag_vec(resp.drag_delta(), stable_dt);
                     let (west, east) = (
                         matches!(dir, D::NorthWest | D::SouthWest | D::West),
                         matches!(dir, D::NorthEast | D::SouthEast | D::East),
@@ -2905,7 +3340,7 @@ impl PianoApp {
                     if west || north {
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                     }
-                    self.resize_drag = Some((pos, size));
+                    self.resize_drag = Some(ResizeDrag { handle_idx: i, pos, size, ppp });
                 }
             }
         }
@@ -3011,6 +3446,30 @@ impl PianoApp {
         });
     }
 
+    /// The Help menu: the crash log (see diag.rs) and About, sharing the title
+    /// bar's menu bar with File and Edit.
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Help", |ui| {
+            if ui
+                .button("View diagnostics log…")
+                .on_hover_text("Recent breadcrumbs, panics, and native crashes, in one place")
+                .clicked()
+            {
+                ui.close_menu();
+                self.open_crash_report(None);
+            }
+            if ui.button("Open log folder").clicked() {
+                ui.close_menu();
+                diag::reveal_log_in_explorer();
+            }
+            ui.separator();
+            if ui.button("About open-piano").clicked() {
+                ui.close_menu();
+                self.show_about = true;
+            }
+        });
+    }
+
     /// Edit ▸ Preferences: every persisted tunable (see prefs.rs), grouped
     /// into sidebar-navigated tabs (one `prefs_*_section` method per page).
     /// Each widget applies its change live to the relevant consumer and, if
@@ -3072,6 +3531,7 @@ impl PianoApp {
                                 PrefsSection::RollBehavior => self.prefs_roll_behavior_section(ui),
                                 PrefsSection::AudioMic => self.prefs_audio_section(ui),
                                 PrefsSection::Metronome => self.prefs_metronome_section(ui),
+                                PrefsSection::Networking => self.prefs_networking_section(ui),
                                 PrefsSection::Advanced => self.prefs_advanced_section(ui),
                             };
                         });
@@ -3477,6 +3937,50 @@ impl PianoApp {
         changed
     }
 
+    /// The "Networking" tab: the persisted iroh identity and its reset.
+    /// Everything else network-related (invite code, Host/Join) lives in the
+    /// main window's Play-together row, not here.
+    fn prefs_networking_section(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.heading("Networking");
+        ui.label(
+            egui::RichText::new(
+                "Your invite code stays the same across restarts, so a peer who \
+                 wrote it down can always reach you again.",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Auto-reconnect at startup:");
+            if ui.checkbox(&mut self.prefs.auto_rejoin, "").changed() {
+                changed = true;
+            }
+        })
+        .response
+        .on_hover_text(
+            "Automatically restore the last Host/Join session when the app \
+             launches, instead of waiting for a click.",
+        );
+        ui.add_space(8.0);
+        if ui
+            .button("Reset my identity")
+            .on_hover_text(
+                "Generate a new invite code. Anyone holding your current code \
+                 will no longer be able to connect.",
+            )
+            .clicked()
+        {
+            self.prefs.endpoint_secret = None;
+            // Immediate, not debounced (matches `endpoint_secret`'s own
+            // save): the whole point is that the *next* Host/Join gets a
+            // different identity, so the old one must actually be gone from
+            // disk before that happens, not just pending.
+            self.prefs.save();
+        }
+        changed
+    }
+
     /// The "Advanced" tab (model / network). No longer behind a
     /// `CollapsingHeader` — having its own tab already gates visibility.
     fn prefs_advanced_section(&mut self, ui: &mut egui::Ui) -> bool {
@@ -3615,23 +4119,102 @@ impl PianoApp {
             });
     }
 
+    /// Open the crash-report window. `offset`: `Some(o)` shows the log from a
+    /// specific session's start (the crash chip's `[View log]`); `None` shows
+    /// the file's last 64 KiB (Help ▸ View diagnostics log, no specific crash
+    /// in hand).
+    fn open_crash_report(&mut self, offset: Option<u64>) {
+        self.crash_report_offset = match offset {
+            Some(o) => o,
+            None => {
+                let len = std::fs::metadata(diag::log_path()).map(|m| m.len()).unwrap_or(0);
+                len.saturating_sub(64 * 1024)
+            }
+        };
+        self.show_crash_report = true;
+    }
+
+    /// The crash-report window: a read-only tail of the diagnostics log (see
+    /// diag.rs), opened from the status-bar chip or Help ▸ View diagnostics
+    /// log. Read fresh each frame it's open — cheap (bounded to 64 KiB) and
+    /// simpler than caching a log that keeps growing while the window is up.
+    fn crash_report_window(&mut self, ctx: &egui::Context) {
+        if !self.show_crash_report {
+            return;
+        }
+        let text = diag::read_since(self.crash_report_offset, 64 * 1024);
+        egui::Window::new("Crash report")
+            .open(&mut self.show_crash_report)
+            .default_size([560.0, 420.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(text.clone());
+                    }
+                    if ui.button("Open log folder").clicked() {
+                        diag::reveal_log_in_explorer();
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.monospace(&text);
+                });
+            });
+    }
+
     /// Drain the network event channel: session status (invite code ready,
     /// connect/disconnect) plus the peer's packets (notes, color).
+    ///
+    /// Every net-thread death path routes through either a `NetEvent::Disconnected`
+    /// message (sent by `relay_session` on a peer-gone read error, or by
+    /// `net::NetThreadGuard` on a panic) or, failing that, this function
+    /// noticing the channel itself has closed — the net thread exited without
+    /// managing to send anything (e.g. it gave up before this session's peer
+    /// ever connected). Both paths call `clear_remote_keys()`, so a dead net
+    /// thread can never leave a remote key stuck lit or a peer synth voice
+    /// stuck sounding.
     fn pump_network(&mut self) {
         let mut events = Vec::new();
+        let mut thread_gone = false;
         if let Some(peer) = &self.peer {
-            while let Ok(event) = peer.events.try_recv() {
-                events.push(event);
+            loop {
+                match peer.events.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // The net thread exited without the UI ever asking it to
+                    // (a UI-initiated drop of `self.peer` would already have
+                    // taken this branch out of existence). `try_recv` can't
+                    // tell "no message right now" from "no thread left to
+                    // ever send one" — this arm is what tells them apart.
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        thread_gone = true;
+                        break;
+                    }
+                }
             }
         }
         for event in events {
             match event {
-                NetEvent::Ticket(code) => self.my_ticket = Some(code),
+                NetEvent::Ticket { short, full } => self.invite = Some(Invite { short, full }),
                 NetEvent::Status(s) => self.net_status = s,
                 NetEvent::Connected => {
                     // Fresh connection: remote state is unknown (this may be a
                     // reconnect mid-chord), and the peer needs our color.
                     self.peer_connected = true;
+                    // Session restore (4.3): only ever recorded on an actual
+                    // successful connection, never a typo or unreachable host —
+                    // `join_ticket` still holds the code from whenever it was
+                    // last submitted, including an automatic reconnect within
+                    // the same session (`relay_session` re-emits `Connected` on
+                    // every redial, not just the first). Debounced: this fires
+                    // on every reconnect, which an immediate `save()` would
+                    // turn into an fsync per blip.
+                    self.prefs.last_session_was_host = self.is_host;
+                    if !self.is_host {
+                        self.prefs.last_join_code = Some(self.join_ticket.trim().to_string());
+                    }
+                    self.prefs.last_join_at = Some(unix_now());
+                    self.save_prefs_soon();
                     // Anchor the shared separator coordinate at this moment on our
                     // roll clock (R13); forget any breaks we mirrored from a prior
                     // peer so removal reconciliation starts clean.
@@ -3642,6 +4225,12 @@ impl PianoApp {
                     self.metro_ctl_pending = None;
                     self.metro_table_dirty = false;
                     self.clear_remote_keys();
+                    // Discard any default-collision fallback from a *previous*
+                    // peer before re-evaluating against this one (see the
+                    // `Packet::Color` handler below) — otherwise a fallback
+                    // picked up against peer 1 would stick even if peer 2
+                    // doesn't collide with our true preference at all.
+                    self.local_color = self.prefs.local_color;
                     self.send_color();
                     self.send_name();
                     // Only the metronome authority (host) broadcasts the click
@@ -3761,15 +4350,25 @@ impl PianoApp {
                     self.remote_separators =
                         desired.into_iter().filter(|&d| d > 0.0 && d <= now).collect();
                 }
-                // Intentionally *not* applied to `remote_color`: every fresh
-                // install defaults `local_color` to the same red, so honoring
-                // an un-customized peer's announced color would render both
-                // sides identically and defeat the two-color visualization.
-                // The peer is pinned to `DEFAULT_REMOTE_COLOR` (blue) locally
-                // regardless of what they pick on their own screen. We still
-                // accept (and drop) the packet so the wire protocol is
-                // unchanged.
-                NetEvent::Packet(Packet::Color(_rgb)) => {}
+                // Apply the peer's real color so the same note renders
+                // identically on both screens (golden rule). The one
+                // deterministic exception: if we're the joiner and both sides
+                // are still at the untouched `DEFAULT_LOCAL_COLOR`, we alone
+                // switch to a distinguishable fallback and re-announce it —
+                // `is_host` is symmetric and known identically on both ends,
+                // so this can never race or diverge, and it never fires once
+                // `local_color` has actually changed (from this shift or a
+                // manual pick), so it can't re-trigger mid-session.
+                NetEvent::Packet(Packet::Color(rgb)) => {
+                    self.remote_color = rgb;
+                    if !self.is_host
+                        && self.local_color == DEFAULT_LOCAL_COLOR
+                        && rgb == DEFAULT_LOCAL_COLOR
+                    {
+                        self.local_color = DEFAULT_LOCAL_COLOR_FALLBACK;
+                        self.send_color();
+                    }
+                }
                 NetEvent::Packet(Packet::Name(name)) => self.remote_name = name,
                 NetEvent::Packet(Packet::MetroCtl { on, bpm }) => {
                     // Follower → host request: the authority adopts it as the new
@@ -3834,6 +4433,23 @@ impl PianoApp {
                 }
             }
         }
+        if thread_gone {
+            // The thread is gone for good (not a mid-session peer drop, which
+            // a host survives by re-listening — that's the `NetEvent::Disconnected`
+            // arm above). Tear down everything a fresh `NetEvent::Disconnected`
+            // already tears down, plus the session state that only makes
+            // sense while a thread actually exists to act on it.
+            self.peer_connected = false;
+            self.remote_separators.clear();
+            self.sep_anchor = 0.0;
+            self.metro_ctl_pending = None;
+            self.metro_table_dirty = false;
+            self.clear_remote_keys();
+            self.remote_name = DEFAULT_REMOTE_NAME.to_string();
+            self.invite = None;
+            self.peer = None;
+            self.net_status = format!("{} — session ended", self.net_status);
+        }
     }
 }
 
@@ -3854,6 +4470,31 @@ fn apply(keys: &mut [bool; KEY_COUNT], msg: NoteMsg) {
     }
 }
 
+/// Seconds since the Unix epoch, for `prefs.last_join_at` — clock-skew-proof
+/// in the one way that matters here (it survives a restart, unlike
+/// `Instant`), and only ever compared to another call of itself so a wrong
+/// wall clock just shifts both sides equally.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Coarse "how long ago" for the `↻ Rejoin` hover text — doesn't need to be
+/// precise, just legible at a glance.
+fn format_ago(secs: u64) -> String {
+    if secs < 90 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} h ago", secs / 3600)
+    } else {
+        format!("{} d ago", secs / 86_400)
+    }
+}
+
 impl eframe::App for PianoApp {
     /// Called once as the app shuts down (window closed / Alt+F4). A debounced
     /// prefs save may still be pending — a slider edited within the last
@@ -3863,6 +4504,7 @@ impl eframe::App for PianoApp {
         if self.prefs_save_due.take().is_some() {
             self.prefs.save();
         }
+        diag::mark_clean_exit();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -3933,6 +4575,21 @@ impl eframe::App for PianoApp {
         if ctx.input_mut(|i| i.consume_shortcut(&PREFS_SHORTCUT)) {
             self.show_prefs = true;
         }
+        // Debug-only test aids for diag.rs — see the shortcut consts' doc
+        // comment. Never compiled into a release build.
+        #[cfg(debug_assertions)]
+        if ctx.input_mut(|i| i.consume_shortcut(&DEBUG_PANIC_GUI_SHORTCUT)) {
+            panic!("debug test panic (GUI thread, Ctrl+Alt+Shift+F11)");
+        }
+        #[cfg(debug_assertions)]
+        if ctx.input_mut(|i| i.consume_shortcut(&DEBUG_PANIC_INFERENCE_SHORTCUT)) {
+            inference::DEBUG_TRIGGER_PANIC.store(true, std::sync::atomic::Ordering::Relaxed);
+            diag::log(
+                Area::Ui,
+                "debug test panic requested on the inference thread (Ctrl+Alt+Shift+F12); \
+                 it fires on that thread's next hop — needs the mic fallback active (no MIDI device connected)",
+            );
+        }
 
         // Track how long the pointer has held still. This drives the two-stage
         // "keyboard locked" tooltip during recording: a short label on hover that
@@ -3999,6 +4656,17 @@ impl eframe::App for PianoApp {
                 peer.send(Packet::Pedal { level: self.local_pedal });
             }
             self.last_pedal_sent = self.local_pedal;
+            // Keep `last_join_at` from reading hours-stale after a long
+            // session (it seeds both the `↻ Rejoin` display and the crash-
+            // exception window) without fsyncing prefs once a second — this
+            // heartbeat already runs at 1 Hz, so just rate-limit the refresh
+            // itself to once a minute using the timestamp's own age.
+            if self.peer_connected
+                && self.prefs.last_join_at.is_some_and(|t| unix_now().saturating_sub(t) >= 60)
+            {
+                self.prefs.last_join_at = Some(unix_now());
+                self.save_prefs_soon();
+            }
             // Manually-inserted segment breaks, so a Ctrl+click break shows on
             // both screens and a dropped one still converges (M2).
             self.broadcast_separators();
@@ -4120,6 +4788,28 @@ impl eframe::App for PianoApp {
                     ui.label(model);
                     ui.separator();
                     ui.label(&self.net_status);
+                    // Previous run never got to clean up after itself (crash,
+                    // hang, Task-Manager kill) — see diag.rs. Dismissible, and
+                    // never a modal: the app must stay playable regardless.
+                    if let Some((version, pid, offset)) =
+                        self.last_unclean.as_ref().map(|u| (u.version.clone(), u.pid, u.log_offset))
+                    {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(210, 100, 60), "⚠ previous run ended unexpectedly")
+                            .on_hover_text(format!("v{version} (pid {pid}) didn't exit normally last time"));
+                        if ui.small_button("View log").clicked() {
+                            self.open_crash_report(Some(offset));
+                        }
+                        // Plain ASCII, not "✕": that glyph is missing from
+                        // egui's default font on this setup and renders as a
+                        // tofu box (see `window_button`'s doc comment for the
+                        // established pattern — painted glyphs for the title
+                        // bar, plain ASCII here since a small text button
+                        // can't paint its own icon).
+                        if ui.small_button("X").on_hover_text("Dismiss").clicked() {
+                            self.last_unclean = None;
+                        }
+                    }
                     // Pending section break: the roll clock paused past the
                     // break threshold, so the next note starts a new section.
                     // Same chip affordance as the title bar's "● unsaved".
@@ -4165,6 +4855,7 @@ impl eframe::App for PianoApp {
         }
 
         self.about_window(ctx);
+        self.crash_report_window(ctx);
         self.preferences_window(ctx);
         self.unsaved_dialog(ctx);
         self.refine_range_window(ctx);

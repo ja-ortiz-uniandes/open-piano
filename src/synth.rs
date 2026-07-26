@@ -373,7 +373,7 @@ impl Synth {
             .name("synth-output".into())
             .spawn(move || {
                 if let Err(e) = output_loop(cmd_rx, stop_for_thread) {
-                    eprintln!("[synth] disabled: {e}");
+                    crate::diag::log(crate::diag::Area::Audio, format!("synth disabled: {e}"));
                 }
             })
             .expect("failed to spawn synth thread");
@@ -465,7 +465,7 @@ fn output_loop(
             Err(OutputError::Fatal(e)) => return Err(e),
             // Device/build/transient failure: back off briefly, then rebuild.
             Err(OutputError::Rebuildable(e)) => {
-                eprintln!("[synth] output stream failed: {e}; rebuilding");
+                crate::diag::log(crate::diag::Area::Audio, format!("output stream failed: {e}; rebuilding"));
                 for _ in 0..10 {
                     if stop.load(Ordering::Relaxed) {
                         return Ok(());
@@ -517,8 +517,10 @@ fn run_output_stream(
     // below, so a mid-session device error triggers a rebuild (R16).
     let failed = Arc::new(AtomicBool::new(false));
     let err_failed = Arc::clone(&failed);
+    // cpal's stream-error callback: fires once when the device dies, not per
+    // buffer — the documented exception to the realtime-logging rule.
     let err_fn = move |e| {
-        eprintln!("[synth] output stream error: {e}");
+        crate::diag::log_from_realtime_callback(crate::diag::Area::Audio, format!("output stream error: {e}"));
         err_failed.store(true, Ordering::Relaxed);
     };
 

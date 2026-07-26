@@ -71,6 +71,21 @@ jobs:
           Copy-Item README.md $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip" -Force
 
+      # Published as its own asset, NOT inside the zip: the auto-updater only
+      # ever swaps the exe, so a zipped PDB would go stale/mismatched after the
+      # first in-app update, and DbgHelp correctly refuses a mismatched PDB.
+      # User-reported crash addresses read as `open-piano.exe+0x1a2b3c` (see
+      # diag.rs); symbolize offline against this exact release's PDB.
+      #
+      # NOTE the source filename: rustc names debug artifacts after the crate
+      # name, which cannot contain hyphens, so it's `open_piano.pdb`
+      # (underscore) even though the binary itself is `open-piano.exe`
+      # (hyphen, matching [package].name) — confirmed against a local
+      # `cargo build --release`, not guessed.
+      - name: Stage debug symbols (PDB)
+        shell: pwsh
+        run: Copy-Item target/release/open_piano.pdb "open-piano-${{ github.ref_name }}-win-x64.pdb"
+
       # 0.x.x tags are still pre-1.0 previews: publish them as GitHub
       # pre-releases (never "Latest") and mark the title accordingly. Once we tag
       # v1.0.0+ this branch falls through to a normal latest release.
@@ -123,6 +138,7 @@ jobs:
           $args = @(
             "${{ github.ref_name }}",
             "open-piano-${{ github.ref_name }}-win-x64.zip",
+            "open-piano-${{ github.ref_name }}-win-x64.pdb",
             "--title", "${{ steps.flags.outputs.title }}",
             "--generate-notes"
           )

@@ -147,6 +147,38 @@ pub struct Prefs {
     /// The most recently opened score file; only consulted at startup when
     /// `reopen_last_file` is true. Cleared on explicit File ▸ Close.
     pub last_file_path: Option<PathBuf>,
+
+    // ---- Networking ----
+    /// This installation's iroh identity: an ed25519 secret key, 32 bytes as 64
+    /// lowercase hex chars. Generated on first Host/Join and reused forever, so
+    /// the `EndpointId` — and therefore the invite code the peer wrote down —
+    /// is the same string after a restart, a crash, or an auto-update.
+    ///
+    /// SECURITY: a private key in a plaintext, user-readable JSON file. Anyone
+    /// who can read preferences.json can impersonate this endpoint. Accepted
+    /// deliberately: it authenticates a piano-duet session and nothing else,
+    /// grants no access to the machine or any account, and the alternatives
+    /// (DPAPI / Credential Manager) cost a Windows-only FFI path and break the
+    /// copy-the-folder portability the rest of the app has. Never reuse this
+    /// key for anything with real authority. Edit ▸ Preferences ▸ Networking ▸
+    /// "Reset my identity" clears it.
+    pub endpoint_secret: Option<String>,
+    /// The invite code most recently *successfully* connected with — never set
+    /// on a typo or an unreachable host (see `pump_network`'s `Connected` arm
+    /// in `main.rs`). Backs the `↻ Rejoin` button and `auto_rejoin`.
+    pub last_join_code: Option<String>,
+    /// Unix timestamp (seconds) of that connection, refreshed at most once a
+    /// minute while it stays up. Drives both the `↻ Rejoin` button's "how long
+    /// ago" display and the crash-exception reconnect window.
+    pub last_join_at: Option<u64>,
+    /// Whether that last session was hosted (vs. joined) locally. `↻ Rejoin`
+    /// and `auto_rejoin` must replay the same role — a stable `EndpointId`
+    /// only helps mutual reconnect if the host side is actually listening
+    /// again, not dialing into nothing.
+    pub last_session_was_host: bool,
+    /// Automatically restore the last session at startup. Off by default —
+    /// this is an explicit opt-in, not a surprise reconnect.
+    pub auto_rejoin: bool,
 }
 
 // Defaults mirror the former compile-time constants in roll.rs / main.rs /
@@ -186,6 +218,11 @@ impl Default for Prefs {
             normal_window_size: None,
             reopen_last_file: false,
             last_file_path: None,
+            endpoint_secret: None,
+            last_join_code: None,
+            last_join_at: None,
+            last_session_was_host: false,
+            auto_rejoin: false,
         }
     }
 }
@@ -201,14 +238,20 @@ impl Prefs {
         };
         let mut prefs = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("[prefs] {} is unreadable ({e}); using defaults", path.display());
+                crate::diag::log(
+                    crate::diag::Area::Prefs,
+                    format!("{} is unreadable ({e}); using defaults", path.display()),
+                );
                 // Preserve the unparseable file as `.bak` before proceeding: the
                 // first preference edit `save()`s over the original, so without
                 // this a user who hand-edited one value loses every setting with
                 // no way to recover the file (R31).
                 let backup = path.with_extension("json.bak");
                 if let Err(e) = std::fs::rename(&path, &backup) {
-                    eprintln!("[prefs] could not back up corrupt prefs to {}: {e}", backup.display());
+                    crate::diag::log(
+                        crate::diag::Area::Prefs,
+                        format!("could not back up corrupt prefs to {}: {e}", backup.display()),
+                    );
                 }
                 Prefs::default()
             }),
@@ -291,6 +334,15 @@ impl Prefs {
         // Pedal deadzone is a CC delta (0..=127); anything above makes the pedal
         // lane permanently dead (F27).
         self.pedal_deadzone = self.pedal_deadzone.min(127);
+
+        // A hand-edited or truncated key must not be handed to
+        // `SecretKey::from_bytes` (or parsed inconsistently launch to launch).
+        // Drop it outright — a fresh identity generates lazily on next
+        // Host/Join — rather than leaving networking permanently broken with
+        // no self-healing.
+        if !self.endpoint_secret.as_deref().is_some_and(is_valid_hex32) {
+            self.endpoint_secret = None;
+        }
     }
 
     /// Save preferences atomically (temp file + rename). Errors are logged but
@@ -299,14 +351,14 @@ impl Prefs {
         let Some(path) = prefs_path() else { return };
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("[prefs] could not create {}: {e}", dir.display());
+                crate::diag::log(crate::diag::Area::Prefs, format!("could not create {}: {e}", dir.display()));
                 return;
             }
         }
         let json = match serde_json::to_string_pretty(self) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[prefs] serialize failed: {e}");
+                crate::diag::log(crate::diag::Area::Prefs, format!("serialize failed: {e}"));
                 return;
             }
         };
@@ -319,30 +371,71 @@ impl Prefs {
             Ok(mut f) => {
                 use std::io::Write as _;
                 if let Err(e) = f.write_all(json.as_bytes()).and_then(|()| f.sync_all()) {
-                    eprintln!("[prefs] write/sync failed: {e}");
+                    crate::diag::log(crate::diag::Area::Prefs, format!("write/sync failed: {e}"));
                     let _ = std::fs::remove_file(&tmp);
                     return;
                 }
             }
             Err(e) => {
-                eprintln!("[prefs] write failed: {e}");
+                crate::diag::log(crate::diag::Area::Prefs, format!("write failed: {e}"));
                 return;
             }
         }
         if let Err(e) = std::fs::rename(&tmp, &path) {
-            eprintln!("[prefs] rename failed: {e}");
+            crate::diag::log(crate::diag::Area::Prefs, format!("rename failed: {e}"));
             let _ = std::fs::remove_file(&tmp);
         }
     }
+
+    /// Bytes of the persisted iroh identity, if one has been generated yet.
+    /// `None` means no Host/Join has happened on this installation (or the
+    /// stored value was hostile and `sanitize` already dropped it) — the
+    /// caller (`main.rs`) is responsible for generating one via
+    /// `net::generate_secret` and persisting it with
+    /// [`set_endpoint_secret_bytes`](Self::set_endpoint_secret_bytes). Kept
+    /// iroh-free deliberately (`net.rs` does the `SecretKey` conversion).
+    pub fn endpoint_secret_bytes(&self) -> Option<[u8; 32]> {
+        self.endpoint_secret.as_deref().map(decode_hex32)
+    }
+
+    /// Store a freshly generated identity, hex encoded. The caller must
+    /// `save()` immediately afterward, not debounced — a crash before the
+    /// next debounced save would orphan an invite code already handed out
+    /// under this identity.
+    pub fn set_endpoint_secret_bytes(&mut self, bytes: [u8; 32]) {
+        self.endpoint_secret = Some(encode_hex32(&bytes));
+    }
 }
 
-/// `%LOCALAPPDATA%\open-piano\preferences.json` (falling back to the system temp
-/// dir if `LOCALAPPDATA` is unset), matching `bundle.rs`'s cache directory.
+/// `%LOCALAPPDATA%\open-piano\preferences.json` — `bundle::app_dir()` joined
+/// with the file name.
 fn prefs_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    Some(base.join("open-piano").join("preferences.json"))
+    Some(crate::bundle::app_dir().join("preferences.json"))
+}
+
+fn is_valid_hex32(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn encode_hex32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Decode a string `is_valid_hex32` already accepted (via `sanitize`) — every
+/// byte pair is guaranteed valid hex, so this can't fail.
+fn decode_hex32(s: &str) -> [u8; 32] {
+    let bytes = s.as_bytes();
+    std::array::from_fn(|i| {
+        let hi = (bytes[i * 2] as char).to_digit(16).unwrap_or(0) as u8;
+        let lo = (bytes[i * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
+        (hi << 4) | lo
+    })
 }
 
 #[cfg(test)]

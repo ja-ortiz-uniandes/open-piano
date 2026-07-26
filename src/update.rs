@@ -27,6 +27,8 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::diag::{self, Area};
+
 /// GitHub repo the releases are published to (see `.github/workflows/release.yml`).
 const REPO_OWNER: &str = "ja-ortiz-uniandes";
 const REPO_NAME: &str = "open-piano";
@@ -90,18 +92,33 @@ impl Updater {
             *s = UpdateState::Installing { version: version.clone() };
         }
         let state = Arc::clone(&self.state);
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("auto-update-install".into())
             .spawn(move || {
+                diag::log(Area::Update, format!("installing v{version}…"));
                 let next = match install_version(&version) {
-                    Ok(()) => UpdateState::Ready { version },
-                    Err(e) => UpdateState::Failed { reason: e.to_string() },
+                    Ok(()) => {
+                        diag::log(Area::Update, "install succeeded; ready to restart");
+                        UpdateState::Ready { version }
+                    }
+                    Err(e) => {
+                        diag::log(Area::Update, format!("install failed: {e}"));
+                        UpdateState::Failed { reason: e.to_string() }
+                    }
                 };
                 if let Ok(mut s) = state.lock() {
                     *s = next;
                 }
-            })
-            .expect("failed to spawn auto-update install thread");
+            });
+        // A transient OS resource failure spawning this thread must not crash
+        // the whole app (same treatment as `net.rs`'s spawn site) — surface it
+        // through the same `UpdateState` the UI already polls instead.
+        if let Err(e) = spawned {
+            diag::log(Area::Update, format!("failed to spawn install thread: {e}"));
+            if let Ok(mut s) = self.state.lock() {
+                *s = UpdateState::Failed { reason: e.to_string() };
+            }
+        }
     }
 }
 
@@ -112,20 +129,37 @@ impl Updater {
 pub fn start() -> Updater {
     let state = Arc::new(Mutex::new(UpdateState::Checking));
     {
-        let state = Arc::clone(&state);
-        thread::Builder::new()
+        let thread_state = Arc::clone(&state);
+        let spawned = thread::Builder::new()
             .name("auto-update".into())
             .spawn(move || {
                 let next = match check_update() {
-                    Ok(Some(version)) => UpdateState::Available { version },
-                    Ok(None) => UpdateState::UpToDate,
-                    Err(e) => UpdateState::Failed { reason: e.to_string() },
+                    Ok(Some(version)) => {
+                        diag::log(Area::Update, format!("update available: v{version}"));
+                        UpdateState::Available { version }
+                    }
+                    Ok(None) => {
+                        diag::log(Area::Update, "already up to date");
+                        UpdateState::UpToDate
+                    }
+                    Err(e) => {
+                        diag::log(Area::Update, format!("check failed: {e}"));
+                        UpdateState::Failed { reason: e.to_string() }
+                    }
                 };
-                if let Ok(mut s) = state.lock() {
+                if let Ok(mut s) = thread_state.lock() {
                     *s = next;
                 }
-            })
-            .expect("failed to spawn auto-update thread");
+            });
+        // See `install`'s matching comment: don't crash the app over a
+        // transient spawn failure, just surface it the same way a failed
+        // check already does.
+        if let Err(e) = spawned {
+            diag::log(Area::Update, format!("failed to spawn update-check thread: {e}"));
+            if let Ok(mut s) = state.lock() {
+                *s = UpdateState::Failed { reason: e.to_string() };
+            }
+        }
     }
     Updater { state }
 }
@@ -274,8 +308,12 @@ fn pick_update(
 /// the relaunch can't be set up we still exit — reopening by hand runs the new
 /// build all the same.
 pub fn restart() -> ! {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
+    match std::env::current_exe() {
+        Ok(exe) => match std::process::Command::new(&exe).spawn() {
+            Ok(_) => diag::log(Area::Update, "relaunched updated exe; exiting"),
+            Err(e) => diag::log(Area::Update, format!("relaunch spawn failed ({e}); exiting anyway")),
+        },
+        Err(e) => diag::log(Area::Update, format!("could not resolve current_exe ({e}); exiting anyway")),
     }
     std::process::exit(0);
 }

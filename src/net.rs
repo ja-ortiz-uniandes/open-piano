@@ -10,10 +10,18 @@
 //! The invite code is normally the host's bare [`EndpointId`] — 64 hex chars —
 //! and the joiner resolves the actual dial info (relay + addresses) through
 //! n0's discovery service, which the `N0` preset both publishes to and reads
-//! from. When the host can't reach a relay (offline / LAN-only), discovery
-//! would have nothing to serve, so it falls back to a full [`EndpointTicket`]
-//! (~4× longer) that carries the direct addresses inline. Joining accepts
-//! either form, which also keeps codes from older versions working.
+//! from. Both forms are always useful, not "short with a fallback": the full
+//! [`EndpointTicket`] (~4× longer) is available the instant the endpoint
+//! binds and is *strictly more dialable* (relay + direct addresses inline) —
+//! it's just ugly — while the short code is a UX nicety that needs discovery
+//! to have caught up. So the host publishes both, promotes the short one to
+//! primary once it's *verified* dialable (a self-resolve through the same
+//! discovery path a joiner would use), and keeps re-publishing on a heartbeat
+//! for as long as hosting continues — an idempotent whole-state snapshot, not
+//! a one-shot decision, per the wire-protocol convention in CLAUDE.md. A host
+//! that only reaches a relay at t = 30s therefore upgrades its own invite
+//! code in place instead of being stuck with the long one forever. Joining
+//! accepts either form, which also keeps codes from older versions working.
 //!
 //! Latency model is unchanged from the old raw-UDP transport: every [`Packet`]
 //! rides an *unreliable QUIC datagram*, sent immediately, no batching, no
@@ -31,7 +39,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use iroh::endpoint::presets;
@@ -40,37 +48,75 @@ use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::diag::{self, Area};
 use crate::note::Packet;
 
 /// Application-level protocol id required to match on both ends of a
 /// connection; bump the suffix if the wire format ever changes incompatibly.
 const ALPN: &[u8] = b"open-piano/0";
 
-/// How long the host waits for first relay contact before publishing the
-/// invite code anyway. Without a relay the code still carries the direct
-/// (LAN) addresses, so same-network play keeps working fully offline.
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the host waits for first relay contact before showing a
+/// provisional (long-ticket) invite code instead of a bare spinner. No longer
+/// a hard deadline: once online, the code upgrades in place (see
+/// `publish_invite_code`). A healthy connection handshakes in well under a
+/// second, so this state is normally never seen.
+const LAN_FALLBACK_DELAY: Duration = Duration::from_secs(5);
+/// Grace period after `online()` before promoting the short code when the
+/// host's own self-resolve (`confirm_published`) is inconclusive rather than
+/// a confirmed failure.
+const PUBLISH_SETTLE: Duration = Duration::from_millis(1500);
+/// Bound on how long the host's self-resolve check is allowed to take.
+const PUBLISH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
+/// How often the host re-publishes its invite code once settled — a
+/// heartbeat, not a one-shot, per CLAUDE.md's wire-protocol convention: it
+/// self-heals a dropped first send, and (just as importantly) is what keeps
+/// `publish_invite_code` alive so it can never "win" `run_host`'s `select!`
+/// on its own — only `accept_loop` noticing real shutdown ends the session.
+const TICKET_HEARTBEAT: Duration = Duration::from_secs(5);
 
-/// How many times a joiner dials before giving up, and the pause between
-/// tries. Retrying matters most for short (id-only) invite codes: the host
-/// publishes its relay address to n0's discovery service asynchronously, so a
-/// joiner who is very quick off the mark can look the id up before the record
-/// has propagated. A couple of spaced retries papers over that window.
-const JOIN_ATTEMPTS: u32 = 4;
-const JOIN_RETRY_PAUSE: Duration = Duration::from_secs(3);
+/// Joiner reconnect/retry schedule: pause *before* each dial, so the first
+/// attempt is immediate. The dense head (0, 1, 2 s) covers a discovery record
+/// that hasn't propagated yet; the longer tail covers a host that's slow to
+/// start — and, once past the initial connect, a host that's mid-restart or
+/// a Wi-Fi blip. `run_join` cycles this schedule *forever* (capping at the
+/// last, 30 s, entry) rather than giving up after one pass — a cap strands a
+/// joiner whose host took a coffee break, and its failure mode ("nothing
+/// happens, press Join again") is exactly the bug this loop exists to remove.
+/// Cancellable at every step: dropping the UI's `Peer` (a fresh Join click,
+/// or closing the app) closes `outgoing`, which every `select!` below races.
+const JOIN_BACKOFF: [Duration; 7] = [
+    Duration::from_secs(0),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+/// A session up at least this long counts as "real": the schedule resets to
+/// its dense head afterwards, so a peer who plays for an hour then drops gets
+/// an immediate 1 s retry rather than inheriting a 30 s pause from whatever
+/// the schedule was mid-way through before this session started.
+const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(20);
 
 /// Everything the net thread reports back to the UI, drained once per frame.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    /// Host only: the invite code is ready to be copied and sent to the peer.
-    Ticket(String),
+    /// Host only: the current invite code(s), re-sent whenever they improve
+    /// and periodically thereafter (see `TICKET_HEARTBEAT`) — a whole-state
+    /// snapshot, not a one-shot. `full` is available the moment we bind;
+    /// `short` arrives once we're online AND a self-resolve confirms
+    /// discovery can actually serve us.
+    Ticket { short: Option<String>, full: String },
     /// Human-readable progress / error line for the status bar.
     Status(String),
     /// A peer connection is live. The UI clears remote key state (unknown
     /// across a reconnect) and re-announces its color.
     Connected,
-    /// The peer connection dropped. A host keeps listening for a rejoin;
-    /// a joiner must press Join again.
+    /// The peer connection dropped. A host keeps listening for a rejoin; a
+    /// joiner keeps redialing on its own via `run_join`'s backoff loop —
+    /// pressing Join again is a hard reset (drops and rebuilds the session),
+    /// not the only way to reconnect.
     Disconnected,
     /// A decoded packet from the peer (note event, color, or metronome control).
     Packet(Packet),
@@ -104,15 +150,30 @@ impl Peer {
 }
 
 /// Start hosting: binds an endpoint, then emits `Ticket` with the invite code
-/// and waits for a peer. Keeps accepting across peer disconnects.
-pub fn host() -> Peer {
-    start(Role::Host)
+/// and waits for a peer. Keeps accepting across peer disconnects. `secret`
+/// pins the endpoint's identity (so its `EndpointId` — and therefore the
+/// invite code — survives a restart); `None` binds an ephemeral one-off
+/// identity instead (used by the test at the bottom of this file).
+pub fn host(secret: Option<[u8; 32]>) -> Peer {
+    start(Role::Host, secret)
 }
 
 /// Join a host from a pasted invite code (parsed and validated on the net
-/// thread; a bad code comes back as a `Status` event).
-pub fn join(ticket: String) -> Peer {
-    start(Role::Join(ticket))
+/// thread; a bad code comes back as a `Status` event). See [`host`] for
+/// `secret`.
+pub fn join(ticket: String, secret: Option<[u8; 32]>) -> Peer {
+    start(Role::Join(ticket), secret)
+}
+
+/// A fresh, random identity for [`host`]/[`join`]'s `secret` — call once and
+/// persist the result (`prefs::Prefs::set_endpoint_secret_bytes`) rather than
+/// generating on every launch, or the `EndpointId` (and the invite code built
+/// from it) changes every time. Deliberately `iroh::SecretKey::generate()`,
+/// not a hand-rolled RNG: it's zero extra dependencies (already transitive
+/// via iroh) and its trait-version compatibility with the rest of iroh's
+/// `rand`/`rand_core` graph is iroh's problem to keep solved, not ours.
+pub fn generate_secret() -> [u8; 32] {
+    iroh::SecretKey::generate().to_bytes()
 }
 
 enum Role {
@@ -120,26 +181,43 @@ enum Role {
     Join(String),
 }
 
-fn start(role: Role) -> Peer {
+fn start(role: Role, secret: Option<[u8; 32]>) -> Peer {
     let (event_tx, event_rx) = mpsc::channel::<NetEvent>();
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<Packet>();
 
-    thread::Builder::new()
-        .name("net".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    let _ = event_tx.send(NetEvent::Status(format!("Net init failed: {e}")));
-                    return;
-                }
-            };
-            rt.block_on(run(role, out_rx, event_tx));
-        })
-        .expect("failed to spawn net thread");
+    // Cloned before the closure captures `event_tx`: a failed `spawn()` drops
+    // the closure (and everything it captured) without ever running it, so
+    // this is the only sender left to report through (d3) — the GUI thread
+    // must not `.expect()` its way into a crash over a transient OS resource
+    // failure the same way the tokio-runtime-build failure two lines below
+    // is already handled as a `Status` event, not a panic.
+    let spawn_failed_tx = event_tx.clone();
+    let spawned = thread::Builder::new().name("net".into()).spawn(move || {
+        // First statement in the closure: reports a panic anywhere below
+        // instead of the net thread just vanishing with the UI never hearing
+        // from it again (d2). `Drop` runs during unwind.
+        let _guard = NetThreadGuard { events: event_tx.clone() };
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = event_tx.send(NetEvent::Status(format!("Net init failed: {e}")));
+                return;
+            }
+        };
+        rt.block_on(run(role, secret, out_rx, event_tx));
+    });
+
+    if let Err(e) = spawned {
+        diag::log(Area::Net, format!("failed to spawn net thread: {e}"));
+        let _ = spawn_failed_tx.send(NetEvent::Status(format!("Failed to start networking: {e}")));
+        // No thread will ever emit `Disconnected` for this session — say so
+        // ourselves so `pump_network`'s d1 teardown still runs and the UI
+        // doesn't hold a `Peer` that will never do anything (d4's invariant).
+        let _ = spawn_failed_tx.send(NetEvent::Disconnected);
+    }
 
     Peer {
         outgoing: out_tx,
@@ -147,23 +225,57 @@ fn start(role: Role) -> Peer {
     }
 }
 
+/// Reports a panicking net thread instead of it vanishing silently — without
+/// this, a panic mid-session looks identical to the thread just going quiet:
+/// no `Disconnected`, `peer_connected` stays `true`, and every remote key and
+/// peer synth voice would be stuck lit/sounding forever (the pre-0.2.0 bug).
+/// Held as the closure's first local so `Drop` (which runs during unwind)
+/// fires before the closure's own `Sender` capture is dropped, ensuring
+/// `pump_network`'s d1 teardown sees these messages ahead of the channel
+/// closing.
+struct NetThreadGuard {
+    events: Sender<NetEvent>,
+}
+
+impl Drop for NetThreadGuard {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            diag::log(Area::Net, "net thread panicked");
+            let _ = self.events.send(NetEvent::Disconnected);
+            let _ = self
+                .events
+                .send(NetEvent::Status("Networking crashed unexpectedly".into()));
+        }
+    }
+}
+
 /// Net-thread main. Any `Err` is a fatal setup problem already reported as a
 /// `Status` event; connection-level errors are handled inside and don't end
 /// the session (the host goes back to listening).
-async fn run(role: Role, mut outgoing: UnboundedReceiver<Packet>, events: Sender<NetEvent>) {
+async fn run(
+    role: Role,
+    secret: Option<[u8; 32]>,
+    mut outgoing: UnboundedReceiver<Packet>,
+    events: Sender<NetEvent>,
+) {
     let status = |s: String| {
         let _ = events.send(NetEvent::Status(s));
     };
 
     // Parse the invite code first (join only) so a typo fails fast, before
     // any network work. Short form (bare endpoint id) is tried first; the
-    // long form (full ticket: LAN-only hosts, older versions) second.
-    let target: Option<EndpointAddr> = match &role {
-        Role::Host => None,
+    // long form (full ticket: LAN-only hosts, older versions) second. A
+    // joiner who pasted a full ticket is already immune to every discovery
+    // issue below — `addr` carries relay + direct addresses inline, so
+    // `connect()` never touches discovery at all. `short_code` is threaded
+    // through to `run_join` purely so its terminal failure message can
+    // suggest the "same-network code" only when that's actually a next step.
+    let (target, short_code): (Option<EndpointAddr>, bool) = match &role {
+        Role::Host => (None, false),
         Role::Join(code) => match code.parse::<EndpointId>() {
-            Ok(id) => Some(id.into()),
+            Ok(id) => (Some(id.into()), true),
             Err(_) => match code.parse::<EndpointTicket>() {
-                Ok(t) => Some(t.endpoint_addr().clone()),
+                Ok(t) => (Some(t.endpoint_addr().clone()), false),
                 Err(e) => {
                     status(format!("Invalid invite code: {e}"));
                     return;
@@ -174,67 +286,146 @@ async fn run(role: Role, mut outgoing: UnboundedReceiver<Packet>, events: Sender
 
     status("Setting up p2p endpoint…".into());
     // The N0 preset = n0's public relay servers + endpoint discovery. This is
-    // what makes the whole thing zero-config across NATs.
-    let endpoint = match Endpoint::builder(presets::N0)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-    {
+    // what makes the whole thing zero-config across NATs. Pinning `secret_key`
+    // (when the caller has a persisted identity) is what keeps the resulting
+    // `EndpointId` — and therefore the invite code handed out for it — stable
+    // across restarts, crashes, and auto-updates; omitting it (the test at
+    // the bottom of this file does) binds a fresh one-off identity instead.
+    let mut builder = Endpoint::builder(presets::N0).alpns(vec![ALPN.to_vec()]);
+    if let Some(bytes) = secret {
+        builder = builder.secret_key(iroh::SecretKey::from_bytes(&bytes));
+    }
+    let endpoint = match builder.bind().await {
         Ok(ep) => ep,
         Err(e) => {
+            diag::log(Area::Net, format!("endpoint bind failed: {e}"));
             status(format!("Failed to start networking: {e}"));
             return;
         }
     };
+    diag::log(Area::Net, format!("endpoint bound: {}", endpoint.id().fmt_short()));
 
     match target {
         None => run_host(&endpoint, &mut outgoing, &events).await,
-        Some(addr) => run_join(&endpoint, addr, &mut outgoing, &events).await,
+        Some(addr) => run_join(&endpoint, addr, &mut outgoing, &events, short_code).await,
     }
 
     // Graceful close tells the peer immediately instead of leaving it to the
     // QUIC idle timeout.
+    diag::log(Area::Net, "closing endpoint");
     endpoint.close().await;
 }
 
+/// Run the invite-code publisher and the peer-accept loop concurrently, over
+/// borrowed references (no `tokio::spawn`, no `'static` bounds — matches the
+/// file's existing idiom). Whichever finishes first ends the session: in
+/// practice that's always `accept_loop` (UI dropped the `Peer` / endpoint
+/// closed) — `publish_invite_code` is built to never finish on its own (see
+/// its doc comment), so this is really "run `accept_loop`, with the
+/// publisher tagging along and getting dropped when it does."
 async fn run_host(
     endpoint: &Endpoint,
     outgoing: &mut UnboundedReceiver<Packet>,
     events: &Sender<NetEvent>,
 ) {
+    tokio::select! {
+        _ = publish_invite_code(endpoint, events) => {}
+        _ = accept_loop(endpoint, outgoing, events) => {}
+    }
+}
+
+/// Publish the invite code, upgrading it in place as reachability improves,
+/// then keep re-emitting it on `TICKET_HEARTBEAT` for as long as hosting
+/// continues. That heartbeat is doing double duty: it self-heals a dropped
+/// send (the wire-protocol convention in CLAUDE.md), and — just as
+/// importantly — it's an unbounded loop with no normal exit, which is what
+/// lets `run_host`'s `select!` above be a plain two-armed race: this task
+/// structurally cannot "win" it under normal operation, only get dropped when
+/// `accept_loop` notices the real shutdown signal.
+async fn publish_invite_code(endpoint: &Endpoint, events: &Sender<NetEvent>) {
     let status = |s: String| {
         let _ = events.send(NetEvent::Status(s));
     };
-
-    // Wait for relay contact, then hand out the short code (bare endpoint
-    // id): once we're online, discovery serves the joiner everything else.
-    // Offline/LAN-only hosts get no relay and no discovery, so after the
-    // timeout fall back to the long code with the direct addresses inline.
     status("Contacting relay…".into());
-    // Race the relay-contact wait against the UI dropping the session, so a
-    // "Host → close" during this up-to-15 s window shuts the net thread down
-    // promptly instead of lingering (L4).
-    let online = tokio::select! {
-        r = tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()) => r.is_ok(),
-        _ = discard_until_closed(outgoing) => return,
-    };
-    let code = if online {
-        endpoint.id().to_string()
-    } else {
-        status("No relay reachable — invite code will only work on this network".into());
-        EndpointTicket::from(endpoint.addr()).to_string()
-    };
-    if events.send(NetEvent::Ticket(code)).is_err() {
-        return; // UI dropped the session.
+
+    // Not a hard deadline (see `LAN_FALLBACK_DELAY`'s doc) — just when we
+    // stop showing a spinner and publish a *provisional* code so same-network
+    // play keeps working fully offline. A healthy connection handshakes in
+    // well under a second, so this branch is normally never taken.
+    let online = tokio::time::timeout(LAN_FALLBACK_DELAY, endpoint.online()).await.is_ok();
+    if !online {
+        diag::log(Area::Net, "no relay yet; publishing a provisional full ticket");
+        let full = EndpointTicket::from(endpoint.addr()).to_string();
+        if events.send(NetEvent::Ticket { short: None, full }).is_err() {
+            return; // UI dropped the session.
+        }
+        status("No relay yet — the code below only works on this network. Still trying…".into());
+        // Unbounded: it pends forever with no WAN, which is fine — see this
+        // function's own doc comment for why that's not a leak.
+        endpoint.online().await;
     }
 
-    // Accept loop: one peer at a time, but keep listening across disconnects
-    // so the same invite code lets the peer rejoin after a network blip.
+    diag::log(Area::Net, "relay online; confirming discovery can serve us");
+    if confirm_published(endpoint).await {
+        diag::log(Area::Net, "self-resolve confirmed; promoting the short invite code");
+    } else {
+        // Our own DNS resolution failing says nothing about the joiner's —
+        // this never blocks promotion, it just falls through to a settle
+        // timer instead of an immediate promotion.
+        tokio::time::sleep(PUBLISH_SETTLE).await;
+    }
+
+    let short = endpoint.id().to_string();
+    loop {
+        // Recomputed every heartbeat, not hoisted out of the loop: once
+        // online it carries the relay URL too (strictly better than the
+        // pre-online provisional ticket), and stays current if our direct
+        // addresses change later in the session.
+        let full = EndpointTicket::from(endpoint.addr()).to_string();
+        if events.send(NetEvent::Ticket { short: Some(short.clone()), full }).is_err() {
+            return; // UI dropped the session.
+        }
+        tokio::time::sleep(TICKET_HEARTBEAT).await;
+    }
+}
+
+/// The strongest available proof that our short code is dialable right now:
+/// resolve OUR OWN record through the exact discovery path a joiner would
+/// use. Never blocks promotion on failure (see caller) — this only decides
+/// whether promotion happens immediately or after `PUBLISH_SETTLE`.
+async fn confirm_published(endpoint: &Endpoint) -> bool {
+    let Ok(dns) = endpoint.dns_resolver() else {
+        return false;
+    };
+    // `presets::N0` picks the *staging* DNS origin only when iroh is built
+    // with the `test-utils` feature; this repo doesn't enable it, so PROD is
+    // correct here. A wrong origin would silently degrade to the settle timer
+    // above rather than break anything, so this is a safe default even if
+    // that ever changes.
+    let origin = iroh::dns::N0_DNS_ENDPOINT_ORIGIN_PROD;
+    let delays_ms = [250, 500, 1000, 2000];
+    let id = endpoint.id();
+    tokio::time::timeout(PUBLISH_CONFIRM_TIMEOUT, dns.lookup_endpoint_by_id_staggered(&id, origin, &delays_ms))
+        .await
+        .is_ok_and(|r| r.is_ok())
+}
+
+/// Accept loop: one peer at a time, but keep listening across disconnects so
+/// the same invite code lets the peer rejoin after a network blip. This is
+/// the sub-task whose completion actually ends `run_host` — see its doc
+/// comment.
+async fn accept_loop(endpoint: &Endpoint, outgoing: &mut UnboundedReceiver<Packet>, events: &Sender<NetEvent>) {
+    let status = |s: String| {
+        let _ = events.send(NetEvent::Status(s));
+    };
     loop {
         status("Waiting for peer to join… (send them the invite code)".into());
         let conn = tokio::select! {
             incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { return }; // endpoint closed
+                let Some(incoming) = incoming else {
+                    diag::log(Area::Net, "endpoint closed while accepting");
+                    return;
+                };
                 // Race the QUIC handshake itself against UI shutdown too: a slow,
                 // stalled, or malicious handshake would otherwise pin the net
                 // thread here — never noticing the UI dropped the `Peer` nor
@@ -243,6 +434,7 @@ async fn run_host(
                     res = incoming => match res {
                         Ok(conn) => conn,
                         Err(e) => {
+                            diag::log(Area::Net, format!("peer failed to connect: {e}"));
                             status(format!("Peer failed to connect: {e}"));
                             continue;
                         }
@@ -262,45 +454,87 @@ async fn run_host(
     }
 }
 
+/// `short_code`: whether the pasted code was a bare endpoint id (vs. a full
+/// ticket) — threaded through purely so the "still not reachable" hint can
+/// suggest the "same-network code" only when that's actually a next step (a
+/// joiner who pasted a full ticket is already immune to every discovery
+/// issue here; see `run`'s parse comment).
+///
+/// Runs until the UI drops the `Peer` — there is no permanent give-up state.
+/// Reuses the single `Endpoint` across every attempt (never rebinds): it owns
+/// the UDP socket, relay actor, discovery client, and magicsock per-peer path
+/// state, so rebuilding it would throw away discovered/hole-punched paths and
+/// turn a 2 s blip into a full cold start.
 async fn run_join(
     endpoint: &Endpoint,
     addr: EndpointAddr,
     outgoing: &mut UnboundedReceiver<Packet>,
     events: &Sender<NetEvent>,
+    short_code: bool,
 ) {
     let status = |s: String| {
         let _ = events.send(NetEvent::Status(s));
     };
 
-    for attempt in 1..=JOIN_ATTEMPTS {
-        if attempt == 1 {
-            status("Connecting to host…".into());
-        } else {
-            status(format!(
-                "Connecting to host… (attempt {attempt}/{JOIN_ATTEMPTS})"
-            ));
+    let mut backoff_idx = 0usize;
+    let mut ever_connected = false;
+    loop {
+        let pause = JOIN_BACKOFF[backoff_idx.min(JOIN_BACKOFF.len() - 1)];
+        if !pause.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(pause) => {}
+                _ = discard_until_closed(outgoing) => return,
+            }
         }
+        diag::log(Area::Net, format!("dialing host (backoff step {})", backoff_idx + 1));
+        status(if ever_connected {
+            "Reconnecting to host…".into()
+        } else {
+            "Connecting to host…".into()
+        });
         let result = tokio::select! {
             conn = endpoint.connect(addr.clone(), ALPN) => conn,
             _ = discard_until_closed(outgoing) => return,
         };
         match result {
             Ok(conn) => {
-                if relay_session(&conn, outgoing, events).await == SessionEnd::PeerGone {
-                    status("Disconnected — press Join to reconnect".into());
+                diag::log(Area::Net, format!("connected to peer {}", conn.remote_id().fmt_short()));
+                ever_connected = true;
+                let connected_at = Instant::now();
+                if relay_session(&conn, outgoing, events).await == SessionEnd::UiGone {
+                    return;
                 }
-                return;
+                // A session that stood up for a while counts as "real": reset
+                // to the dense head of the schedule rather than inheriting
+                // whatever pause the dial-retry schedule was mid-way through.
+                backoff_idx = if connected_at.elapsed() >= RECONNECT_RESET_AFTER {
+                    0
+                } else {
+                    backoff_idx.saturating_add(1)
+                };
+                status("Disconnected — reconnecting…".into());
             }
-            Err(e) if attempt < JOIN_ATTEMPTS => {
-                // Most likely the host's discovery record hasn't propagated
-                // yet (id-only code, host just started); pause and retry.
-                status(format!("Not reachable yet ({e}); retrying…"));
-                tokio::select! {
-                    _ = tokio::time::sleep(JOIN_RETRY_PAUSE) => {}
-                    _ = discard_until_closed(outgoing) => return,
+            Err(e) => {
+                diag::log(Area::Net, format!("dial failed ({e}); retrying after backoff"));
+                // A stale POSITIVE record (the host restarted or moved
+                // networks) is the only thing worth clearing here — negative
+                // answers are never cached in the first place (iroh-dns sets
+                // `negative_max_ttl = Duration::ZERO`), so this can't be
+                // "optimized away" on the negative-caching theory.
+                if let Ok(dns) = endpoint.dns_resolver() {
+                    dns.clear_cache();
                 }
+                // Once we've cycled past the dense head into the 30 s ceiling,
+                // add the actionable hint — a joiner stuck this long is the
+                // exact case it exists for — without ever fully giving up.
+                let hint = if short_code && backoff_idx >= JOIN_BACKOFF.len() - 1 {
+                    " If you're both on the same Wi-Fi, ask them for the \"same-network code\" instead."
+                } else {
+                    ""
+                };
+                status(format!("Not reachable yet ({e}); retrying…{hint}"));
+                backoff_idx = backoff_idx.saturating_add(1);
             }
-            Err(e) => status(format!("Could not reach host: {e}")),
         }
     }
 }
@@ -320,6 +554,7 @@ async fn relay_session(
     outgoing: &mut UnboundedReceiver<Packet>,
     events: &Sender<NetEvent>,
 ) -> SessionEnd {
+    diag::log(Area::Net, format!("session started with peer {}", conn.remote_id().fmt_short()));
     let _ = events.send(NetEvent::Connected);
     let _ = events.send(NetEvent::Status(format!(
         "Connected to peer {}",
@@ -362,6 +597,7 @@ async fn relay_session(
                     }
                 }
                 Err(e) => {
+                    diag::log(Area::Net, format!("session ended: peer disconnected ({e})"));
                     let _ = events.send(NetEvent::Disconnected);
                     let _ = events.send(NetEvent::Status(format!("Peer disconnected: {e}")));
                     return SessionEnd::PeerGone;
@@ -385,13 +621,13 @@ async fn relay_session(
                             }
                         }
                         Err(e) => {
-                            eprintln!("[net] datagram send failed: {e}");
-                            // Surface it to the UI (release builds have no
-                            // stderr), rate-limited to error-kind changes so a
-                            // sustained failure doesn't spam the status channel
-                            // (R9).
+                            // Surface it to the log and the UI (release builds
+                            // have no stderr), rate-limited to error-kind
+                            // changes so a sustained failure doesn't spam
+                            // either (R9).
                             let kind = e.to_string();
                             if last_send_err.as_deref() != Some(kind.as_str()) {
+                                diag::log(Area::Net, format!("datagram send failed: {kind}"));
                                 let _ = events.send(NetEvent::Status(format!(
                                     "Connected, but some data isn't syncing: {kind}"
                                 )));
@@ -442,18 +678,18 @@ mod tests {
 
     /// End-to-end over real iroh: host issues a ticket, a second endpoint
     /// joins with it, and note datagrams flow both ways. Needs a network
-    /// stack (loopback at minimum); with no internet the host falls back to
-    /// a direct-addresses-only ticket after `ONLINE_TIMEOUT`, so the test
-    /// still passes — just slower.
+    /// stack (loopback at minimum); with no internet the host stays on the
+    /// provisional full ticket (`short: None`) past `LAN_FALLBACK_DELAY`, so
+    /// the test still passes on whichever code is available — just slower.
     #[test]
     fn host_join_exchange_notes() {
-        let host = host();
+        let host = host(None);
         let code = wait_for(&host, "invite ticket", |ev| match ev {
-            NetEvent::Ticket(t) => Some(t.clone()),
+            NetEvent::Ticket { short, full } => Some(short.clone().unwrap_or_else(|| full.clone())),
             _ => None,
         });
 
-        let joiner = join(code);
+        let joiner = join(code, None);
         wait_for(&joiner, "joiner connect", |ev| matches!(ev, NetEvent::Connected).then_some(()));
         wait_for(&host, "host connect", |ev| matches!(ev, NetEvent::Connected).then_some(()));
 

@@ -243,6 +243,12 @@ fn supervise(
     // MIDI-only, never-loads-ORT) instance still depends on (R35).
     let mut last_runtime_touch = Instant::now();
     bundle::touch_runtime();
+    // Refresh this session's crash-marker mtime so the *next* launch's
+    // staleness scan (see diag.rs) treats a still-running instance as alive.
+    // Deliberately on this thread, not the GUI thread, which can block
+    // arbitrarily long on the blocking `rfd` file dialog.
+    let mut last_marker_heartbeat = Instant::now();
+    crate::diag::heartbeat();
 
     while !stop_all.load(Ordering::Relaxed) {
         let ports = midi::port_names();
@@ -252,7 +258,10 @@ fn supervise(
         //    Note Offs for a yanked cable).
         if let Active::Midi { name, .. } = &active {
             if !ports.iter().any(|p| p == name) {
-                eprintln!("[input] MIDI device '{name}' disconnected; switching to microphone");
+                crate::diag::log(
+                    crate::diag::Area::Input,
+                    format!("MIDI device '{name}' disconnected; switching to microphone"),
+                );
                 active = Active::None; // drops the connection -> closes the port
                 set_detecting(&status, &source);
                 epoch.fetch_add(1, Ordering::Relaxed);
@@ -266,7 +275,7 @@ fn supervise(
         //    Record the failure time so step 4 backs off instead of rebuilding
         //    cpal + reloading ONNX every poll for a permanently-dead mic (F4).
         if matches!(&active, Active::Mic(h) if h.failed()) {
-            eprintln!("[input] microphone backend died; will re-detect");
+            crate::diag::log(crate::diag::Area::Input, "microphone backend died; will re-detect");
             if let Active::Mic(h) = std::mem::replace(&mut active, Active::None) {
                 h.stop();
             }
@@ -324,7 +333,10 @@ fn supervise(
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[input] MIDI connect failed for '{want}' ({e}); trying next port");
+                        crate::diag::log(
+                            crate::diag::Area::Input,
+                            format!("MIDI connect failed for '{want}' ({e}); trying next port"),
+                        );
                         failed_midi.insert(want.clone(), Instant::now());
                     }
                 }
@@ -386,6 +398,13 @@ fn supervise(
         if last_runtime_touch.elapsed() >= RUNTIME_TOUCH_INTERVAL {
             bundle::touch_runtime();
             last_runtime_touch = Instant::now();
+        }
+
+        // Keep this session's crash marker looking alive (see diag.rs) so the
+        // next launch doesn't mistake a still-running instance for a crash.
+        if last_marker_heartbeat.elapsed() >= crate::diag::MARKER_HEARTBEAT {
+            crate::diag::heartbeat();
+            last_marker_heartbeat = Instant::now();
         }
 
         // Live poll interval (Preferences ▸ Advanced), floored so a tiny value

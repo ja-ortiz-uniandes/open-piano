@@ -18,10 +18,18 @@ Whatever appears on one side must appear on the other, identically. When you add
 anything that lights a key, draws a mark, or otherwise changes what's on that
 surface — live notes, the sustain lane, Ctrl+click-pinned keys, the metronome
 grid — it has to be broadcast to the peer and rendered the same on both screens.
-The only thing that legitimately differs across the two machines is *color*: each
-player sees themselves in their own color and the peer in the remote color (the
-"me = my color, you = the remote color" convention). If a feature shows up on
-only one side, that's a bug, not a local nicety.
+Colors sync too: each player's real chosen color renders identically on both
+screens (the peer's `Packet::Color` announcement is applied to `remote_color`,
+not discarded) — a note played by one side must look the same regardless of
+which screen you're looking at it on. The only deliberate asymmetry is a
+fallback: if both sides are still at the untouched default color (two fresh
+installs, neither has opened the color picker), the *joiner* alone switches to
+a distinguishable fallback color and re-announces it, so an un-customized pair
+doesn't render identically. This is computed the same way on both ends
+(`is_host` is symmetric and known identically by construction, so there's no
+race), never overrides a manual color choice, and never fires again once
+`local_color` differs from the default. If a feature shows up on only one
+side, that's a bug, not a local nicety.
 
 Prefer **idempotent whole-state snapshots** over incremental deltas for anything
 synced over the (unreliable-datagram) wire, and re-send on a heartbeat while the
@@ -62,15 +70,33 @@ pedal send-on-change for the established patterns).
 - **`net.rs`** — P2P over iroh (QUIC + NAT traversal). One side `host()`s and
   gets a one-string invite code; the other `join()`s with it — hole punching
   when possible, n0's public relays as fallback, so no port forwarding ever.
-  The code is normally the bare `EndpointId` (64 hex chars; dial info comes
-  from n0 discovery, which the `N0` preset publishes to), falling back to a
-  full `EndpointTicket` when the host is offline/LAN-only; join accepts both.
-  Each session runs a dedicated "net" thread with a
+  Both the short `EndpointId` (64 hex chars) and the full `EndpointTicket`
+  (relay + direct addresses inline, ~4× longer) are always useful, not
+  "short with a fallback": `full` is available the instant the endpoint
+  binds, `short` once a self-resolve confirms n0 discovery can actually serve
+  it — the host publishes both and re-publishes on a heartbeat for as long as
+  hosting continues, upgrading in place as reachability improves (see
+  `publish_invite_code`/`confirm_published`). The UI always offers `full` too,
+  as the "same-network code". Join accepts either form. Each session runs a
+  dedicated "net" thread with a
   current-thread tokio runtime; the UI receives `NetEvent`s (ticket, status,
   connect/disconnect, packets) on an mpsc channel and queues outgoing `Packet`s
   on an unbounded sender. Packets ride *unreliable QUIC datagrams* — the same
   fire-and-forget latency model (and identical wire bytes) as the original
-  raw-UDP transport.
+  raw-UDP transport. A joiner's `run_join` never permanently gives up: it
+  redials forever on `JOIN_BACKOFF` (capping at 30s), both for the initial
+  connect and for reconnecting after an established session drops — the only
+  way to stop it is the Cancel button or a fresh Join click (a hard reset:
+  drops and rebuilds the whole session). The endpoint's identity
+  (`iroh::SecretKey`) is persisted in `Prefs::endpoint_secret` and reused
+  across restarts (generated lazily on first Host/Join, via
+  `net::generate_secret`), so the invite code stays the same after a crash or
+  update; Edit ▸ Preferences ▸ Networking ▸ "Reset my identity" clears it. A
+  dropped net thread (panic, or a spawn failure) always reports through
+  `NetEvent::Disconnected` — either explicitly (`NetThreadGuard`'s `Drop`) or
+  implicitly (`pump_network` noticing the event channel itself has closed) —
+  so a dead thread can never leave the UI holding a zombie `Peer` or a stuck
+  remote key.
 - **`note.rs`** — `NoteMsg` (On/Off), MIDI helpers, and the **wire protocol**
   (`Packet`): note bytes `[0x90|0x80, note]`, color `[0xC0, r, g, b]`, metronome
   beat `[0xB0, ...]` and control `[0xB1, ...]`. The synced metronome (host is the
@@ -98,7 +124,15 @@ pedal send-on-change for the established patterns).
   `%LOCALAPPDATA%\open-piano\onnxruntime-<hash>.dll` (content-hash-named so
   concurrent old/new versions never clobber each other) and `ORT_DYLIB_PATH`
   points at it. Consequence: `python download_model.py` is a prerequisite for
-  **every** build, not just the mic path.
+  **every** build, not just the mic path. Also owns `app_dir()` — the shared
+  `%LOCALAPPDATA%\open-piano` directory `prefs.rs` and `diag.rs` write into too.
+- **`diag.rs`** — crash diagnostics: a write-through breadcrumb log
+  (`%LOCALAPPDATA%\open-piano\open-piano.log`), a panic hook, a native
+  (`SetUnhandledExceptionFilter`) handler for the crashes a panic hook can't
+  see (access violations, OOM aborts), and unclean-exit detection via a
+  per-pid marker file. `begin_session()` is the first statement in `main()`.
+  Release builds are `windows_subsystem = "windows"` with no console and no
+  OS crash dialogs, so this is the only record of a crash that exists.
 
 ## Threading model (important)
 
@@ -221,6 +255,34 @@ README.
   / in evaluation mode, **or rely on CI** — the GitHub Actions release workflow
   runs on GitHub's runners and is unaffected. Do **not** `cargo clean` on a SAC
   machine unless you can rebuild elsewhere.
+- **Diagnosing a report of "the app just closed"**: check `diag.rs`'s log first
+  (Help ▸ Open log folder, or the status-bar chip after an unclean exit) — it
+  has the panic/SEH record plus the breadcrumb trail leading up to it. If a
+  user reports a crash with no log captured (an old build, or the log itself
+  didn't survive), escalate manually:
+
+  ```powershell
+  # Step 1 — what Windows ALREADY recorded. Zero setup. Gives the faulting
+  # MODULE NAME (onnxruntime.dll vs open-piano.exe vs a GPU driver), its
+  # version, the exception code and offset. Often the whole answer.
+  Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000} -MaxEvents 50 |
+    Where-Object { $_.Message -match 'open-piano' } |
+    Format-List TimeCreated, Message
+  # Id=1002 is Application Hang, for freezes.
+
+  # Step 2 — full dumps for the NEXT occurrence (ELEVATED shell)
+  $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\open-piano.exe'
+  New-Item -Path $key -Force | Out-Null
+  New-ItemProperty -Path $key -Name DumpFolder -PropertyType ExpandString `
+    -Value "%LOCALAPPDATA%\open-piano\dumps" -Force | Out-Null
+  New-ItemProperty -Path $key -Name DumpCount -PropertyType DWord -Value 5 -Force | Out-Null
+  New-ItemProperty -Path $key -Name DumpType  -PropertyType DWord -Value 2 -Force | Out-Null  # 2=full
+  # Undo: Remove-Item $key -Recurse
+  ```
+
+  A release build's `open-piano.pdb` (published as its own GitHub Release
+  asset, not inside the zip — see `.github/workflows/release.yml`) symbolizes
+  addresses from either source against that exact version.
 
 ## Pending manual verification (v0.5.0)
 

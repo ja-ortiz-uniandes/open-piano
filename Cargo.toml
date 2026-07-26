@@ -1,6 +1,6 @@
 [package]
 name = "open-piano"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2021"
 description = "Real-time, networked, peer-to-peer acoustic piano visualizer"
 license = "MIT OR Apache-2.0"
@@ -68,3 +68,15 @@ winres = "0.1"
 [profile.dev]
 # Optimize the audio / pitch-detection math loops even in dev builds.
 opt-level = 1
+
+[profile.release]
+# Minimum CodeView info (function names + file:line) so a release panic's
+# backtrace and the native (SEH) crash handler's address are symbolizable
+# (see diag.rs). On MSVC every byte goes into a separate PDB, so the shipped
+# .exe is byte-identical in size; only link time grows and a
+# open-piano.pdb (~5-15 MB) appears beside it. Do not touch lto,
+# codegen-units, opt-level, strip, or overflow-checks here — the DSP loops in
+# inference.rs haven't been re-validated against those, and overflow-checks in
+# particular would add hot-path integer-overflow panics its index math relies
+# on being wrapping/truncating in practice.
+debug = "line-tables-only"

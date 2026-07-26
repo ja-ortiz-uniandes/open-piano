@@ -411,7 +411,7 @@ fn secs_since(t0: Instant, at: Instant) -> f64 {
 /// surfaced instead of only hitting a stderr that doesn't exist in release
 /// builds (`windows_subsystem = "windows"`) (R8).
 fn report_error(error: &Arc<Mutex<String>>, msg: String) {
-    eprintln!("[record] {msg}");
+    crate::diag::log(crate::diag::Area::Record, msg.clone());
     if let Ok(mut e) = error.lock() {
         *e = msg;
     }
@@ -429,7 +429,7 @@ fn writer_loop(
     overflowed: Arc<AtomicBool>,
 ) {
     let set_error = |msg: String| {
-        eprintln!("[record] {msg}");
+        crate::diag::log(crate::diag::Area::Record, msg.clone());
         if let Ok(mut e) = error.lock() {
             *e = msg;
         }
@@ -749,11 +749,9 @@ fn finalize(mut s: Session, error: &Arc<Mutex<String>>) {
     } else {
         0.0
     };
-    eprintln!(
-        "[record] session saved: {} ({} MIDI events, {:.1}s audio)",
-        s.dir.display(),
-        s.midi_count,
-        duration
+    crate::diag::log(
+        crate::diag::Area::Record,
+        format!("session saved: {} ({} MIDI events, {:.1}s audio)", s.dir.display(), s.midi_count, duration),
     );
 }
 

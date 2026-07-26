@@ -95,6 +95,14 @@ const ONSET_TRIG: f32 = 0.3;
 /// inference, so you don't have to play loud. Higher = louder model input.
 const NORM_TARGET_RMS: f32 = 0.1;
 
+/// Debug-only test aid for diag.rs: set from the GUI thread's
+/// `DEBUG_PANIC_INFERENCE_SHORTCUT` to force a real panic on this thread on
+/// its next hop, so the panic hook can be exercised here too, not just on the
+/// GUI thread. Only checked while this thread is actually running (the mic
+/// fallback, i.e. no MIDI device connected).
+#[cfg(debug_assertions)]
+pub static DEBUG_TRIGGER_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Detection thread entry point. Loads the model, then loops forever consuming
 /// resampled audio and emitting note transitions. Returns (ending the thread)
 /// only if the model fails to load or the audio channel closes.
@@ -133,6 +141,11 @@ pub fn run(
     let mut absent = [0u8; 128]; // consecutive hops below the off-threshold
 
     loop {
+        #[cfg(debug_assertions)]
+        if DEBUG_TRIGGER_PANIC.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            panic!("debug test panic (inference thread, Ctrl+Alt+Shift+F12)");
+        }
+
         // Block for at least one chunk, then drain everything queued so we
         // always analyse the freshest audio.
         let first = match raw_rx.recv() {
@@ -289,7 +302,7 @@ fn infer(session: &mut Session, audio: &[f32], norm_max_gain: f32, raw_rms: f32)
     let tensor = match Tensor::from_array((vec![1_i64, normalized.len() as i64, 1_i64], normalized)) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[inference] tensor build error: {e}");
+            crate::diag::log(crate::diag::Area::Inference, format!("tensor build error: {e}"));
             return Frames::default();
         }
     };
@@ -297,7 +310,7 @@ fn infer(session: &mut Session, audio: &[f32], norm_max_gain: f32, raw_rms: f32)
     let outputs = match session.run(ort::inputs![tensor]) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[inference] run error: {e}");
+            crate::diag::log(crate::diag::Area::Inference, format!("run error: {e}"));
             return Frames::default();
         }
     };
@@ -502,7 +515,7 @@ fn debug_log_outputs(
         MIDI_LOW as usize + nk,
         MIDI_LOW as usize + ok
     ));
-    eprintln!("[inference] {line}");
+    crate::diag::log(crate::diag::Area::Inference, line);
 }
 
 /// Simple stateful linear-interpolation resampler (device rate -> model rate).

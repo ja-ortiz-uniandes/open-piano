@@ -145,7 +145,7 @@ pub fn start_into(
                 stop_for_thread,
                 health_for_thread,
             ) {
-                eprintln!("[audio] fatal: {e}");
+                crate::diag::log(crate::diag::Area::Audio, format!("fatal: {e}"));
                 if let Ok(mut s) = st.lock() {
                     s.device = format!("Audio ERROR: {e}");
                 }
@@ -179,7 +179,7 @@ pub fn start_record_capture(recorder: Recorder) -> AudioHandle {
         .spawn(move || {
             let health = Arc::clone(&health_for_thread);
             if let Err(e) = record_capture_loop(recorder, stop_for_thread, health_for_thread) {
-                eprintln!("[record] capture fatal: {e}");
+                crate::diag::log(crate::diag::Area::Record, format!("capture fatal: {e}"));
                 health.store(HEALTH_FAILED, Ordering::Relaxed);
             }
         })
@@ -217,8 +217,10 @@ fn record_capture_loop(
     recorder.audio_format(sample_rate, channels as u16, dev_name);
 
     let err_health = Arc::clone(&health);
+    // cpal's stream-error callback: fires once when the device dies, not per
+    // buffer — the documented exception to the realtime-logging rule.
     let err_fn = move |e| {
-        eprintln!("[record] capture stream error: {e}");
+        crate::diag::log_from_realtime_callback(crate::diag::Area::Record, format!("capture stream error: {e}"));
         err_health.store(HEALTH_FAILED, Ordering::Relaxed);
     };
     let cfg = config.config();
@@ -310,8 +312,10 @@ fn capture_loop(
 
     // ---- Build the input stream. The callback only down-mixes + forwards. ----
     let err_health = Arc::clone(&health);
+    // cpal's stream-error callback: fires once when the device dies, not per
+    // buffer — the documented exception to the realtime-logging rule.
     let err_fn = move |e| {
-        eprintln!("[audio] stream error: {e}");
+        crate::diag::log_from_realtime_callback(crate::diag::Area::Audio, format!("stream error: {e}"));
         // A stream error means the device died (unplug, default-device switch):
         // the callback stops firing, so flag it so the supervisor restarts us
         // instead of leaving a silent zombie reporting healthy status.
