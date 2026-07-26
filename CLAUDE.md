@@ -253,3 +253,25 @@ Delete this section once it's been run through.
    **causal/streaming** model, export to ONNX, and replace the windowed model in
    `inference.rs` (deleting most of its hysteresis constants). This is the payoff
    that makes the mic path low-latency and accurate.
+
+## CodeGraph
+
+This repo is indexed by [CodeGraph](https://github.com/colbymchenry/codegraph) (a `.codegraph/` directory at the repo root — a SQLite knowledge graph of the codebase's symbols, edges, and files). Reach for it BEFORE grep/find or reading files when you need to understand or locate code:
+
+- **MCP tool** (when available): `codegraph_explore` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow.
+- **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
+
+The index is local to each machine (`.codegraph/` is gitignored except its own `.gitignore`) and goes stale as files change. A local git hook re-syncs it after every commit (see "Replication" below). If the hook isn't present, run `codegraph sync` manually, or `codegraph status` to check for drift.
+
+### Replication (new clone / new machine)
+
+CodeGraph's index and sync hook are **local-only** and not committed to git, so set this up once per clone:
+
+1. Install the CodeGraph CLI if needed (see the CodeGraph docs).
+2. From the repo root, run `codegraph init` to build the initial index.
+3. Add a local post-commit hook so the index stays current automatically:
+
+   ```sh
+   printf '#!/bin/sh\ncodegraph sync -q\n' > .git/hooks/post-commit
+   chmod +x .git/hooks/post-commit
+   ```
