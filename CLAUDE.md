@@ -208,6 +208,18 @@ strict semver doesn't apply yet:
 
 Bump `Cargo.toml`'s version to match before tagging.
 
+**CHANGELOG.md must be updated before tagging — this is not optional.** Add a
+`## [X.Y.Z] - YYYY-MM-DD` section (newest entry goes right after the header,
+above the previous top entry) written in the same voice as the existing
+entries: `### Added`/`### Changed`/`### Fixed` subsections, each bullet a
+bolded lead-in describing user-facing behavior (not implementation detail),
+ending with a `(file.rs, ...)` reference. Base it on the actual commits/diffs
+since the last tag, not just commit subjects. `.github/workflows/release.yml`
+extracts this section by tag name and **fails the release job** if it's
+missing or empty — the changelog is the release notes, not a nice-to-have
+written after the fact. Do this as part of the same commit/step that bumps
+`Cargo.toml`'s version, before creating the tag.
+
 **Tags**: always annotated and signed, with a real summary message — never a
 bare lightweight tag:
 

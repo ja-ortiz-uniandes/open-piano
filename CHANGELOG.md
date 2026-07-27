@@ -4,6 +4,315 @@ All notable changes to open-piano are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-26
+
+### Added
+
+- **Crash diagnostics.** A write-through breadcrumb log
+  (`%LOCALAPPDATA%\open-piano\open-piano.log`), a panic hook, and a native
+  (`SetUnhandledExceptionFilter`) handler catch the crashes a panic hook can't
+  see (access violations, OOM aborts), plus unclean-exit detection via a
+  per-pid marker file. Release builds have no console and no OS crash
+  dialogs, so "the app just closed" was previously undiagnosable — this is
+  now the record. Release builds also publish `open-piano.pdb` as its own
+  GitHub Release asset so a reported crash address can be symbolized against
+  the exact shipped version. (`src/diag.rs`, `.github/workflows/release.yml`)
+- **Persistent network identity and automatic reconnect.** The endpoint's
+  iroh identity is now generated once and persisted
+  (`Prefs::endpoint_secret`), so the invite code stays the same across
+  restarts, crashes, and auto-updates instead of changing every launch.
+  A joiner's redial now backs off (capping at 30 s) and never permanently
+  gives up — neither on the initial connect nor after an established session
+  drops. A "↻ Rejoin" button restores the last session's role and code, and
+  an opt-in "auto-reconnect" preference restores it automatically at
+  startup (also triggered by a crash-and-relaunch within 5 minutes). Edit ▸
+  Preferences ▸ Networking ▸ "Reset my identity" clears the persisted key.
+  (`src/net.rs`, `src/prefs.rs`, `src/main.rs`)
+- **Both invite-code forms are kept live simultaneously.** The host now
+  publishes the short code (once n0 discovery confirms it can serve it) and
+  the long, self-contained ticket concurrently from the moment the endpoint
+  binds, upgrading and re-publishing on a heartbeat for as long as hosting
+  continues, instead of only ever offering one fallback form. (`src/net.rs`)
+
+### Changed
+
+- **Peer color now actually syncs.** The peer's announced color
+  (`Packet::Color`) is applied to `remote_color` and rendered for real,
+  instead of being silently discarded in favor of a fixed placeholder — a
+  regression from v0.7.0 that meant the same note could render as a
+  different color on each player's screen. The one deliberate asymmetry: if
+  both sides are still at the untouched default color, the *joiner* alone
+  switches to a distinguishable fallback (amber) and re-announces it, so two
+  un-customized installs still render distinctly — computed identically on
+  both ends and never overriding a manual color choice. (`src/main.rs`)
+- **Touch-drag stability.** Title-bar and resize-handle dragging now follows
+  the actual touch contact point and clamps runaway speed instead of
+  occasionally teleporting the window, fixing artifacts on touch hardware
+  the app hadn't previously been exercised on. (`src/main.rs`)
+- **A dropped net thread can no longer leave a zombie session.** Whether it
+  panics or fails to spawn, it now always reports through
+  `NetEvent::Disconnected` (a drop guard, plus explicit handling when the
+  event channel itself closes), so the UI can never keep holding a stale
+  `Peer` handle or a permanently-stuck remote key. (`src/net.rs`)
+
+## [0.8.2] - 2026-07-22
+
+### Changed
+
+- **Looped segments now scroll seamlessly in the falling roll.** Looping a
+  segment (Listen or Learn mode) used to freeze the falling roll at the
+  segment's end through the silent breather, then snap it back to the start.
+  The panel now tracks a continuous view time that keeps advancing through
+  the pad instead of the frozen playhead, and draws the looping segment's
+  notes twice — once for real and once as a "ghost" copy one repeat-period
+  ahead — so the next pass is already falling into view as the current one
+  ends, and the wrap reads as continuous motion rather than a jump. Segment
+  lines become per-repeat restart lines while looping. The keyboard also
+  stays dark through the pad, so a note that ended exactly on the loop
+  boundary no longer stays lit through the whole breather. Evaluation mode
+  never loops, so it's unaffected. (`src/playback.rs`, `src/main.rs`)
+
+## [0.8.1] - 2026-07-19
+
+### Changed
+
+- **Auto-update no longer installs silently.** A newer release now only
+  surfaces as available; the download and exe swap happen exclusively after
+  an explicit "Install" click. `self_update` verifies nothing about the
+  downloaded payload beyond the TLS connection, so silently swapping the
+  exe at every launch meant anyone able to publish a GitHub release could
+  push arbitrary code to every installed copy with no user interaction.
+  (`src/update.rs`, `src/main.rs`)
+- **Persistent network problems are now visible.** A datagram send failure
+  used to only print to a console release builds don't have. The status
+  line now reports a sustained failure once (not every frame, and only when
+  the failure kind changes) and clears itself once sending recovers, instead
+  of silently showing "Connected" while some or all traffic has stopped
+  flowing. A stalled or malicious incoming handshake no longer pins the net
+  thread past a UI shutdown either. (`src/net.rs`)
+- **Metronome click-table sync no longer fights itself.** The host's
+  authoritative table now anchors to the connection itself and ignores
+  stale echoes while a local edit is in flight, so dragging a pitch/volume
+  slider can no longer be stomped by a heartbeat that hasn't caught up, and
+  a follower's edit request can't be silently reverted by the host's own
+  periodic re-broadcast.
+- **Recorder self-heals through more failure modes.** The WAV header, MIDI
+  log, and `meta.json` are now flushed on a roughly 1-second cadence (and
+  `meta.json` is written up front), so a kill mid-session leaves an
+  aligned, playable capture instead of a truncated one with no metadata.
+  Recording now also stops cleanly before hound's internal WAV byte counter
+  can wrap past 4 GiB (~5.8 h at 48 kHz) instead of corrupting the header,
+  and queued-but-unwritten audio is capped so a stalled disk can't grow
+  memory without bound. (`src/record.rs`)
+- **Preferences sanitize hostile or corrupted values on load.** A garbled
+  window size, echo hold-off, pedal deadzone, click frequency/level, or a
+  hand-edited/truncated network identity is now clamped or dropped to a safe
+  default at load instead of propagating NaNs or permanently breaking a
+  feature; an unparseable preferences file is backed up to `.json.bak`
+  before falling back to defaults, instead of being silently overwritten by
+  the next save. (`src/prefs.rs`, `src/note.rs`)
+- **Assorted playback/recording edge cases fixed**, found in a full-tree
+  review: notes are matched against the evaluation window before the expiry
+  sweep runs in the same frame (a same-frame hit no longer scores as a
+  miss), loaded notes are clamped to a minimum audible length, a quick
+  Stop→Record within one supervisor poll interval no longer merges two
+  separate takes into a single session directory, and a saved `.jsonl`'s
+  pedal/velocity values are sanitized before they're written rather than
+  after. (`src/playback.rs`, `src/score.rs`, `src/input.rs`, `src/record.rs`)
+
+## [0.8.0] - 2026-07-18
+
+A hardening pass resolving 30 of 31 findings from a full-tree code review
+(one, update-integrity via checksums, is deferred — tracked separately and
+partly addressed in v0.8.1's consent gate).
+
+### Changed
+
+- **Shared-surface sync hardened against packet loss and reordering.**
+  Manually-inserted segment breaks (Ctrl+click) are now reconciled against
+  the roll before every broadcast and dropped if their timestamp is in the
+  future rather than clamped-and-accepted, closing a bug where a lost ack
+  could cause a break to be resent once a second forever. The metronome's
+  per-beat pitch/volume table is now strictly host-authoritative (a
+  follower's edit is adopted and re-broadcast by the host, never sent
+  directly peer-to-peer), preventing the two sides from ever swapping or
+  oscillating tables, and its on/off state now rides the same heartbeat so a
+  dropped toggle self-heals. Note-related packets (including the `Live`/
+  `Held` whole-state snapshots) now carry a per-sender sequence number, so a
+  snapshot delivered out of order (a real risk during iroh's relay→direct
+  migration) can no longer resurrect an already-released note or extinguish
+  a fresh press. Persistent datagram send failures are now surfaced instead
+  of only logged. (`src/net.rs`, `src/note.rs`, `src/main.rs`)
+- **Input supervisor no longer thrashes on a flaky device.** A dying mic or
+  record-capture stream now cools down between restart attempts instead of
+  reloading the ONNX model on every ~1 s poll, and the ONNX session is only
+  built once the stream format actually validates. Enumerating MIDI ports
+  now keeps trying the rest of the list if one port fails to open, instead
+  of a bad port 0 starving a working port 1. (`src/audio.rs`, `src/input.rs`)
+- **Recorder hardened against crashes, huge sessions, and slow disks.** The
+  WAV header, MIDI log, and `meta.json` are flushed on a steady cadence so a
+  kill leaves an aligned session; recording stops cleanly before the WAV
+  format's internal size limit; the audio-start alignment anchor is refined
+  over the stream's first buffers instead of trusting a single, possibly
+  jittery, first callback; and queued-but-unwritten audio is now bounded so
+  a stalled disk can't grow memory indefinitely. (`src/record.rs`)
+- **Preferences saves are now durable and debounce-safe.** The temp file is
+  fsync'd before the atomic rename; window size, echo hold-off, and pedal
+  deadzone are sanitized on load; and a pending debounced save is flushed
+  before the app exits or restarts for an update, so a setting changed right
+  before closing is no longer silently lost. (`src/prefs.rs`, `src/bundle.rs`)
+- **Playback and scoring edge cases fixed.** Presses outside the 88-key
+  range are ignored by the scorer instead of panicking or under/overflowing;
+  pause-on-miss can now gate the final note of a take instead of letting it
+  slip through free-run; loaded MIDI/JSONL notes and pedal events are sorted
+  before use; Evaluation review can no longer be entered with no track
+  actually evaluated; and velocity/pedal values from a wire packet are
+  saturated to their valid range instead of silently wrapping.
+  (`src/playback.rs`, `src/score.rs`)
+- **Window chrome edge cases fixed.** The maximized flag is cleared before a
+  compact-mode resize (a maximized rect could otherwise get snapshotted as
+  the "restore to normal" size), "Restart now" from the update prompt now
+  goes through the same unsaved-roll confirmation as closing the window
+  instead of bypassing it, and the resize handles no longer overlap the
+  title-bar strip. (`src/main.rs`)
+
+## [0.7.3] - 2026-07-11
+
+### Fixed
+
+- **Ctrl-pinned key display is now memoryless.** Releasing Ctrl clears the
+  pinned-key set instead of merely hiding it, so a chord pinned during one
+  Ctrl-hold no longer resurfaces the next time Ctrl is pressed for something
+  unrelated — each hold now starts from a clean slate, like a
+  file-explorer-style Ctrl+click toggle rather than a persistent pin.
+  (`src/main.rs`)
+
+## [0.7.2] - 2026-07-11
+
+### Fixed
+
+- **Dragging the title bar to move the window no longer jitters.** The
+  full-width top-edge resize handle (added for touch support in v0.7.0) sat
+  above the title bar and intercepted move-drags that started near the top,
+  fighting the move logic frame to frame. That handle is removed; top
+  resizing stays available from the NW/NE corner handles, leaving the whole
+  title bar exclusively for window moves. (`src/main.rs`)
+
+## [0.7.1] - 2026-07-10
+
+### Fixed
+
+- **Window-move dragging is smooth and jitter-free.** v0.7.0's touch-friendly
+  rewrite drove the frameless window by accumulating `drag_delta()` onto a
+  running target, but that delta is measured in window-local coordinates —
+  as the window moved under the pointer, the local pointer position shifted
+  the opposite way, flipping the delta's sign the next frame and making the
+  window oscillate (with mouse as well as touch). The window's target
+  position is now solved absolutely each frame from the pointer's grab
+  offset, so a one-frame lag in the reported rect self-corrects instead of
+  compounding. (`src/main.rs`)
+- **Ctrl-held keys now hide the instant Ctrl is released.** Ctrl+click-pinned
+  keys were staying highlighted after the modifier came up; the render is
+  now gated on the modifier being currently down. (`src/main.rs`)
+
+## [0.7.0] - 2026-07-10
+
+### Added
+
+- **Live pedal indicator.** A thin sliver to the left of the keyboard (shown
+  in both normal and compact mode) renders both players' current
+  sustain-pedal depth, diagonally split the same way a simultaneous same-key
+  press is — visible even on mic input, so the peer's pedal use stays legible
+  when local input has no pedal signal at all. (`src/main.rs`)
+- **Ctrl+click to pin keys for display.** Ctrl+click lights a key in your own
+  color without playing it — a way to point at a chord while explaining
+  something — gated by the same recording/evaluation/playback lock as
+  mouse-play. Purely a local display aid: it never touches the synth, the
+  roll, or the peer. (`src/main.rs`)
+- **Touch-friendly window chrome.** Moving and resizing the frameless window
+  is now driven manually every frame from egui's drag deltas
+  (`ViewportCommand::OuterPosition`/`InnerSize`) instead of handing off to
+  Windows' native move/resize loop, which doesn't sustain a
+  touch-originated gesture — the cause of broken touch-move. The resize
+  handles also enlarge to a visible, grabbable affordance in actual tablet
+  use (detected from real touch events vs. mouse/trackpad), while staying
+  tight and invisible for a mouse/trackpad session. (`src/main.rs`)
+- **"Keep compact window on top" preference** (default on): while in compact
+  mode the window floats above other applications, reconciled live so
+  toggling it takes effect immediately without leaving compact mode.
+  (`src/prefs.rs`, `src/main.rs`)
+
+### Changed
+
+- **Two un-customized peers no longer render identically.** The peer's
+  announced color is no longer applied locally — the peer is always drawn
+  in a fixed default (blue) regardless of what it announces — because every
+  fresh install previously defaulted both sides to the same red, making a
+  simultaneous press indistinguishable from a single one. (Superseded by a
+  real per-peer color sync with a narrower fallback in v0.9.0.) (`src/main.rs`)
+- **Mic input is muted by default on a fresh install**, so a new install
+  doesn't start transcribing ambient audio before the user opts in.
+  (`src/prefs.rs`)
+
+## [0.6.1] - 2026-07-08
+
+### Added
+
+- **Drag-to-resize the keyboard.** The keyboard's top and bottom edges grow
+  a thin invisible drag handle; dragging resizes the keyboard as a fraction
+  of the central panel's height, persisted on release
+  (`prefs.keyboard_height_frac`). The bottom handle works whenever not in
+  compact mode; the top handle whenever the falling-notes panel is showing.
+  (`src/main.rs`, `src/prefs.rs`)
+
+### Changed
+
+- **Color picker reverted to the stock popup swatch.** v0.6.0's always-inline
+  hue/brightness/saturation picker permanently occupied space in the config
+  bar and Preferences; both entry points are back to the click-to-open
+  `color_edit_button_srgb` swatch. (`src/main.rs`)
+- **Pedal lane and deadzone are now always editable in Preferences**, not
+  only once a MIDI keyboard is connected, so they can be dialed in ahead of
+  time — with a note that they have no effect on mic input. The lane's own
+  MIDI-only render gate is unchanged. (`src/main.rs`)
+
+## [0.6.0] - 2026-07-08
+
+### Added
+
+- **Pause-on-miss (Evaluation mode).** An optional setting that freezes the
+  playhead at a missed note's tolerance-window edge until the note is
+  actually struck, instead of scoring it a miss and free-running past it.
+  The result card reports total frozen time and how many distinct freezes
+  occurred. (`src/playback.rs`)
+- **Tunable section breaks.** What was a single idle-pause/trailing-blank
+  pair is now a break threshold plus two independently configurable margins:
+  a tail kept after a section's last note, and a lead-in before the next
+  section's first note. A status-bar chip ("● section break on next
+  keypress") shows when a break is pending on the roll. (`src/roll.rs`,
+  `src/prefs.rs`, `src/main.rs`)
+- **Pedal sensitivity deadzone.** A new Preferences setting filters small
+  mid-travel CC64 jitter from analog pedals without losing half-pedal moves
+  or the fully-open/closed edges. (`src/main.rs`, `src/prefs.rs`)
+- **Tabbed Preferences.** The dialog is reorganized from one long scrolling
+  page into eight sidebar-navigated sections (Startup & window, Roll &
+  history, Appearance, Pedal, Roll behavior, Audio/mic, Metronome,
+  Advanced), and is now resizable and freely movable instead of pinned to
+  screen center. (`src/main.rs`)
+
+### Changed
+
+- **Compact mode remembers its restore size.** The last normal-size window
+  dimensions now persist (`prefs.normal_window_size`), so relaunching
+  straight into compact mode restores to the right size instead of a
+  mismatched default height; opening Preferences no longer force-expands a
+  compact window — the dialog simply floats over it. (`src/main.rs`,
+  `src/prefs.rs`)
+- **Default blank-paper margin shrinks from 20 s to 2 s** now that section
+  breaks trim the tail themselves — a pause longer than the (default 30 s)
+  break threshold now leaves a tidy 2-second tail rather than up to 20
+  seconds of dead paper. (`src/roll.rs`, `src/prefs.rs`)
+
 ## [0.5.0] - 2026-07-07
 
 ### Added
